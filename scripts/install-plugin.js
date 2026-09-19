@@ -98,12 +98,20 @@ say(`  插件源码      : ${PLUGIN_SRC}\n`);
 
 // ── --status：只读体检 ──
 if (STATUS || (!APPLY && !REVERT)) {
-  say(APPLY || REVERT ? "" : "【预演模式：下面的差异就是 --apply 会写的东西；现在什么都没写】\n");
   const st = report(readPkg());
-  if (!APPLY && !REVERT) {
-    say("\n  --apply 会做：");
+  const wantDep = "link:" + PLUGIN_SRC;
+  const already = st.dep === wantDep && st.inBundles && !!st.target
+    && path.resolve(st.target).toLowerCase() === path.resolve(PLUGIN_SRC).toLowerCase();
+
+  if (already) {
+    say("\n  ✓ 这个插件**已经装好了**，而且指向的就是本仓库。");
+    say("    生效条件：内核要重新读一次 profile —— 也就是重启一次客户端");
+    say("    （本脚本刻意不替你重启：AI 自己就跑在那个内核里）。");
+    say("    想撤掉：node scripts/install-plugin.js --revert");
+  } else if (!APPLY && !REVERT) {
+    say("\n  ✗ 现在**还没装**。--apply 会做：");
     say(`    ① 备份 ${pkgFile} → ${backupRoot}\\<时间戳>\\`);
-    say(`    ② dependencies["${PLUGIN_NAME}"] = "link:${PLUGIN_SRC}"`);
+    say(`    ② dependencies["${PLUGIN_NAME}"] = "${wantDep}"`);
     say(`    ③ dsh.profile.bundles 末尾追加 "${PLUGIN_NAME}"`);
     say(`    ④ 建目录联接 ${linkPath} → ${PLUGIN_SRC}`);
     say("  --revert 会做：从最近的备份恢复 package.json，并删掉那个联接。");
