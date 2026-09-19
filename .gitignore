@@ -26,6 +26,7 @@
 !/docs/
 !/tools/
 !/release-notes/
+!/plugin/
 
 # ── 目录放行之后，再排掉目录里具体不该公开的文件 ────────────────────────
 # 这几份是**本机专属**的迁移记录，含 C:\Users\<用户名>\... 字面路径
@@ -58,3 +59,12 @@
 **/kernel.json
 **/smoke-result.json
 **/window-state.json
+
+# ── 兜底的**唯一例外**：客户端插件必须自带它的 cordis.patch.yml ──────────
+# 上面 `**/cordis.patch.yml` 那条兜底是为了不把 DSH home / profile 里的配置提交进来；
+# 但插件包里的那一份是**bundle 声明的一部分** —— 没有它内核组合 profile 时直接失败：
+#     Error: dsh: profile bundle "…" declares no dsh.bundle in its package.json
+# （2026-09-21 由 scripts/plugin-check.js 第一次真跑抓到）。
+# 漏掉它的后果不是"少个文件"，而是**提交出去的是坏的插件**。
+# git 的规则：父目录被放行了，这里才能再把它捞回来 —— 所以 `!/plugin/` 必须先存在。
+!/plugin/**/cordis.patch.yml

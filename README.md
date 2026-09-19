@@ -174,12 +174,24 @@ npm run dist         # 出 NSIS 安装包 + 便携版
 │   ├── whale-path.json     官方鲸鱼几何（4 段子路径）
 │   └── inject/
 │       └── model-search.js 注入官方 UI 的模型搜索框 + 提供方胶囊
+├── plugin/
+│   └── dsh-multi-session/  客户端插件：多会话同时开工（大弹窗 + N 个输入框 + 一键发送）
+│       ├── lib/client.js   浏览器半边（手写 bundle，无需构建）
+│       ├── lib/index.js    宿主半边（空 apply —— 纯浏览器能力）
+│       ├── cordis.patch.yml bundle 声明（**缺它内核直接拒绝加载**）
+│       └── README.md       能力表 / 架构依据 / 装验退 / 踩过的坑
 ├── scripts/
 │   ├── check-kernel.js     内核可用性检查
 │   ├── make-icon.js        生成白底黑鲸鱼图标（多尺寸 PNG + 真 ICO）
 │   ├── verify-icon.js      逐像素验证图标（自带 PNG 解码，零依赖）
 │   ├── ensure-icon.js      打包前补齐并验证图标
-│   └── ui-check.js         CDP 真跑真看验证界面（loading / inject / reuse / probe）
+│   ├── ui-check.js         CDP 真跑真看验证界面（loading / inject / reuse / probe）
+│   ├── plugin-check.js     客户端插件的真跑验证（临时环境 + CDP + 磁盘交叉核对）
+│   ├── install-plugin.js   把插件装进 profile（可预演 / 可回滚 / **绝不重启内核**）
+│   ├── boot-peek.js        对正在跑的内核只读取一次引导载荷（看哪些插件真的被公告）
+│   ├── platform-modules.js 从官方前端产物里抠出"平台共享模块表"及其导出清单
+│   ├── slot-catalog.js     打印官方 61 个槽位的完整契约（注册选项/标准 props/最小示例）
+│   └── bundle-window.js    在压缩过的 bundle 里只看限定窗口（不把整行灌进上下文）
 ├── assets/                 图标（由 scripts/make-icon.js 生成）
 ├── runtime/                运行时数据（独立 DSH_HOME，不提交）
 ├── migration/              从社区版迁移数据的工具（不提交）
@@ -188,6 +200,33 @@ npm run dist         # 出 NSIS 安装包 + 便携版
 
 界面定制那一轮的完整记录（改了什么 / 为什么 / **怎么验证的** / 怎么退回去）见
 `docs/界面定制-2026-09-20.md`。
+多会话插件那一轮的记录见 `docs/多会话插件-2026-09-21.md`（插件自己的能力表见
+`plugin/dsh-multi-session/README.md`）。
+
+---
+
+## 多会话同时开工（客户端插件）
+
+主输入框右侧、发送键旁边多了一个「**多会话**」按钮。点开是一个大弹窗：
+默认 1 个输入框，点「新增会话」加行；每行是一条独立提示词（可各自选模型 / 工作区、
+可挂附件、可用 `/` 命令与 `@` 文件引用）；**右下角一键发送** ⇒ 一次建 N 个会话并行跑。
+
+它是**官方 Web 前端的客户端插件**，不是外壳的一部分，所以需要先装进 profile：
+
+```powershell
+npm run plugin:check       # 先真跑验证（临时环境，不碰你在用的 DSH_HOME）
+npm run plugin:status      # 只读：现在装没装、联接指向哪
+npm run plugin:install     # 落盘（自动备份 profile 的 package.json）
+npm run plugin:revert      # 回滚
+```
+
+**它不会重启内核** —— 装完要自己重启一次客户端（托盘 → 退出 → 重新打开）才生效。
+这一条是刻意的：那条命令跑下去之后用户就看不见 AI 了，所以不该由 AI 来按。
+
+**为什么要做成插件、以及"为什么不能直接复用官方那个输入框"**（四条各自足以致命的证据）
+写在 `plugin/dsh-multi-session/README.md`，那里也记着实施过程中踩到的真坑
+（插件包少了 `dsh.bundle` 声明内核直接拒绝启动、`onClick` 里未定义的 `ctx` 导致
+"按钮在但点不动且不报错"、不等附件上传完就提交会被宿主拒绝……）。
 
 ---
 
@@ -198,10 +237,15 @@ npm run verify:icon                 # 逐像素验证图标（白底/不透明/�
 node scripts/ui-check.js loading    # 加载页 + 抽屉 + 动作清单（临时环境，不碰你的 DSH_HOME）
 node scripts/ui-check.js inject     # 模型搜索框注入（临时环境 + 空端口）
 node scripts/ui-check.js reuse      # 复用已有内核的两条路径
+npm run plugin:check                # 多会话插件：临时环境里真开弹窗、真发 2 条、真去磁盘找证据
 ```
 
-四个模式都**不碰**你正在用的环境：`loading`/`inject` 用临时 userData + 空闲端口 3177，
+四个 `ui-check` 模式都**不碰**你正在用的环境：`loading`/`inject` 用临时 userData + 空闲端口 3177，
 `reuse` 自己起一个"外来内核"来造复用场景（跑完会收尾杀掉）。
+
+`plugin:check` 用的是**另一套**临时环境（`profiles/node_modules` 用目录联接只读借用，
+插件也用联接指向本仓库），并且**刻意不看插件自己的结果文案** ——
+它到临时 DSH_HOME 的磁盘上去找那两条提示词与附件字节，那才算证据。
 
 ---
 
