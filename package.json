@@ -66,7 +66,7 @@
         }
       ],
       "icon": "assets/icon.ico",
-      "artifactName": "${productName}-${version}-${arch}.${ext}"
+      "artifactName": "DSH-Integrated-${version}-${arch}.${ext}"
     },
     "nsis": {
       "oneClick": false,
@@ -80,7 +80,7 @@
       "uninstallerIcon": "assets/icon.ico"
     },
     "portable": {
-      "artifactName": "${productName}-${version}-portable-${arch}.${ext}"
+      "artifactName": "DSH-Integrated-${version}-portable-${arch}.${ext}"
     }
   }
 }
