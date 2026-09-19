@@ -78,12 +78,19 @@
 ```powershell
 # 1) 真跑验证（临时环境，不碰你在用的 DSH_HOME；会短暂弹一个窗口）
 npm run plugin:check
+node scripts/plugin-check.js --minimal   # 只用 dsh-base + dsh-web-app 起最小界面
+node scripts/plugin-check.js --keep      # 保留临时目录（排查用）
 
 # 2) 预演 / 落盘 / 查状态 / 回滚
 npm run plugin:status      # 只读：现在装没装、联接指向哪
 npm run plugin:install     # 落盘（先自动备份 profile 的 package.json）
 npm run plugin:revert      # 回滚：从备份恢复 + 删联接
 ```
+
+`plugin:check` **默认把你真实环境的 bundle 清单整个镜像过来**（第三方插件用目录联接从真实
+`profiles/web/node_modules` 借，连 `cordis.patch.yml` 补丁层也一起带上）——
+这样验证的是**你实际那套配置**，不是一个人造的最小环境。
+实测输出：9 个 bundle / 57 条启动图 entries / 模型下拉 42 项，全部 PASS。
 
 `plugin:install` 改的是 **profile**（默认 B 环境的 `profiles/web`）三处，缺一处都是
 "文件都在、界面什么都没有"：

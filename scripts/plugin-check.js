@@ -127,7 +127,7 @@ function junction(link, target) {
   }
 }
 
-function buildTempHome() {
+function buildTempHome(opts = {}) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const base = path.join(ROOT, "runtime", "plugin-check", stamp);
   const userData = path.join(base, "userdata");
@@ -138,9 +138,10 @@ function buildTempHome() {
   const roaming = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
   const realHome = path.join(roaming, "DSH Integrated", "dsh-home");
   const realShared = path.join(realHome, "profiles", "node_modules");
+  const realWeb = path.join(realHome, "profiles", "web");
   if (!fs.existsSync(realShared)) throw new Error(`找不到真实内核依赖树（只读借用）：${realShared}`);
 
-  fs.mkdirSync(web, { recursive: true });
+  fs.mkdirSync(path.join(web, "node_modules"), { recursive: true });
 
   // 工作区注册表（界面没工作区就会停在"选择一个工作区开始"，后面全做不下去）
   const wsSrc = path.join(realHome, "storages", "workspace.json");
@@ -153,12 +154,39 @@ function buildTempHome() {
   // 只借用内核依赖树（联接，只读使用）
   junction(path.join(profiles, "node_modules"), realShared);
 
-  // 临时 profile：只要 base + web-app + 我们的插件
+  // ── bundle 清单：默认**镜像真实环境那一套**，这样验证的就是用户的实际配置 ──
+  let bundles = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"];
+  let mirrored = [];
+  if (!opts.minimal) {
+    try {
+      const real = JSON.parse(fs.readFileSync(path.join(realWeb, "package.json"), "utf8"));
+      const list = (((real.dsh || {}).profile) || {}).bundles;
+      if (Array.isArray(list) && list.length) {
+        bundles = list.slice();
+        // 真实 profile 里那些第三方插件在 **web/node_modules** 下（不是共享层）⇒ 逐个联接过来
+        for (const name of list) {
+          if (name.startsWith("@deepseek-ai/")) continue;
+          const src = path.join(realWeb, "node_modules", ...name.split("/"));
+          if (!fs.existsSync(src)) continue;
+          const dst = path.join(web, "node_modules", ...name.split("/"));
+          junction(dst, src);
+          mirrored.push(name);
+        }
+        // 真实 profile 的补丁层（例如它 disable 了 crosshub）也要带上，否则配置不等价
+        const rp = path.join(realWeb, "cordis.patch.yml");
+        if (fs.existsSync(rp)) fs.copyFileSync(rp, path.join(web, "cordis.patch.yml"));
+      }
+    } catch (e) {
+      console.log(`  ⚠ 镜像真实 bundle 清单失败（${e.message}），退回最小清单`);
+    }
+  }
+
+  if (!bundles.includes(PLUGIN_NAME)) bundles.push(PLUGIN_NAME);
   fs.writeFileSync(path.join(web, "cordis.yml"), "[]\n", "utf8");
   fs.writeFileSync(path.join(web, "package.json"), JSON.stringify({
     name: "dsh-profile-web",
     private: true,
-    dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", PLUGIN_NAME], patchReload: "live" } },
+    dsh: { profile: { bundles, patchReload: "live" } },
   }, null, 2) + "\n", "utf8");
 
   // 插件：目录联接 ⇒ 跑的就是仓库里那份源码
@@ -172,7 +200,7 @@ function buildTempHome() {
     workspace: ROOT,
   }, null, 2), "utf8");
 
-  return { base, userData, home, web };
+  return { base, userData, home, web, bundles, mirrored };
 }
 
 function launch(userData) {
@@ -231,9 +259,11 @@ function findMarkerOnDisk(home, marker) {
     throw new Error(`插件源码不完整：缺 lib/client.js（${PLUGIN_DIR}）`);
   }
 
-  const env = buildTempHome();
+  const env = buildTempHome({ minimal: process.argv.includes("--minimal") });
   console.log(`  临时家   : ${env.home}`);
-  console.log(`  临时 profile bundles: dsh-base + dsh-web-app + ${PLUGIN_NAME}\n`);
+  console.log(`  临时 profile bundles (${env.bundles.length}): ${env.bundles.join(", ")}`);
+  if (env.mirrored.length) console.log(`  其中从真实环境联接过来的第三方插件: ${env.mirrored.join(", ")}`);
+  console.log("");
 
   const child = launch(env.userData);
   let target = null;
