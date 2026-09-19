@@ -25,6 +25,8 @@
     "pack": "node scripts/ensure-icon.js && electron-builder --win --dir",
     "dist": "node scripts/ensure-icon.js && electron-builder --win",
     "dist:portable": "node scripts/ensure-icon.js && electron-builder --win portable",
+    "release:bundle": "node scripts/make-release-bundle.js",
+    "release:check": "node scripts/make-release-bundle.js --check",
     "postinstall": "node scripts/check-kernel.js"
   },
   "devDependencies": {
