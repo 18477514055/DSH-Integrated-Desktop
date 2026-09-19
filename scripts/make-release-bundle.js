@@ -52,6 +52,20 @@ const NOTES_NAME = "RELEASE-NOTES.md";
 /** 扩展名白名单：`github/` 里只允许出现这些 */
 const ALLOWED_EXT = new Set([".exe", ".zip", ".md", ".txt"]);
 
+/**
+ * **没有扩展名**的文件，必须按文件名逐个放行。
+ * （首版审计把 `LICENSE` 判成了 FAIL —— 那是对的：与其把"空扩展名"一概放行，
+ *   不如要求无扩展名的文件显式登记，免得哪天混进个 `credentials` 之类的东西。）
+ */
+const ALLOWED_BARE = new Set(["LICENSE"]);
+
+/** 这个文件在 `github/` 里是否被允许（扩展名白名单 or 无扩展名显式登记） */
+function isAllowedName(rel) {
+  const ext = path.extname(rel).toLowerCase();
+  if (ext) return ALLOWED_EXT.has(ext);
+  return ALLOWED_BARE.has(path.basename(rel));
+}
+
 /** 路径特征黑名单（大小写不敏感，子串匹配） */
 const FORBIDDEN_PATH = [
   "credential", ".env", "token", "cookie", "session", "node_modules",
@@ -238,10 +252,10 @@ function audit() {
   }
   if (!pathBad) pass(`路径特征：${files.length} 个文件 × ${FORBIDDEN_PATH.length} 条黑名单，无命中`);
 
-  // ② 扩展名白名单
-  const extBad = files.filter((f) => !ALLOWED_EXT.has(path.extname(f).toLowerCase()));
+  // ② 扩展名白名单（无扩展名的按文件名显式登记）
+  const extBad = files.filter((f) => !isAllowedName(f));
   if (extBad.length) extBad.forEach((f) => fail(`扩展名不在白名单内: ${f}`));
-  else pass(`扩展名：全部落在 [${[...ALLOWED_EXT].join(" ")}] 内`);
+  else pass(`扩展名：全部落在 [${[...ALLOWED_EXT].join(" ")}] + [${[...ALLOWED_BARE].join(" ")}] 内`);
 
   // ③ 内容密钥模式（只扫文本类）
   let secBad = 0;
