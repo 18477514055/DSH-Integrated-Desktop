@@ -167,6 +167,7 @@ window.__ModuleLoader__.load({
       results: null,      // 发送后的结果清单（非 null 时弹窗显示结果而不是输入框）
       scope: { cwd: null, sessionId: null, workspaceId: null, workspaces: [] },   // 打开弹窗那一刻的上下文
       menu: null,         // 当前打开的斜杠/引用菜单 { rowKey, kind, token, items, active }
+      popover: null,      // 当前打开的下拉（模型/工作区）：{ rowKey, kind } —— 同屏只允许一个
       notice: null,
     };
     const listeners = new Set();
@@ -181,7 +182,7 @@ window.__ModuleLoader__.load({
      *   结果六个座位全没挂上）。所以这里把每一次注册的结果**记下来**，并挂到 window 上，
      *   让"没挂上"变成可查的事实而不是沉默。
      */
-    const diagnostics = { slots: {}, errors: [], clicks: 0, at: new Date().toISOString() };
+    const diagnostics = { slots: {}, errors: [], clicks: 0, sends: [], at: new Date().toISOString() };
 
     function recordSlot(id, ok, message) {
       diagnostics.slots[id] = ok ? { ok: true } : { ok: false, message: String(message || "") };
@@ -220,10 +221,10 @@ window.__ModuleLoader__.load({
     function resetRows() {
       set({
         rows: [newRow(state.scope.cwd, state.scope.workspaceId)],
-        results: null, menu: null, notice: null, sending: false,
+        results: null, menu: null, popover: null, notice: null, sending: false,
       });
     }
-    function closeModal() { set({ open: false, menu: null, notice: null }); }
+    function closeModal() { set({ open: false, menu: null, popover: null, notice: null }); }
 
     // ─────────────────────────────────────────────────────────────────────
     // 样式
@@ -266,6 +267,24 @@ window.__ModuleLoader__.load({
 .dshms-menu-item .mi-name{font-weight:600;white-space:nowrap}
 .dshms-menu-item .mi-hint{opacity:.6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dshms-menu-empty{padding:8px 9px;font-size:12px;opacity:.6}
+/* ── 模型下拉里的搜索框 / 提供方胶囊 / 分组标题 ─────────────────────────
+   与 src/inject/model-search.js 那套视觉同一语言（同样的圆角、同样的选中色 #4d6bfe），
+   这样"官方菜单里的搜索"和"我们弹窗里的搜索"看起来是同一个东西。 */
+.dshms-modelmenu{display:flex;flex-direction:column;padding:0;min-width:340px;max-width:560px}
+.dshms-searchwrap{padding:7px;border-bottom:1px solid var(--dsw-alias-border-l2,#36373b);flex:none}
+.dshms-search{width:100%;box-sizing:border-box;height:30px;padding:0 10px;font:inherit;font-size:12.5px;
+  color:inherit;background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.06));
+  border:1px solid transparent;border-radius:8px;outline:none}
+.dshms-search:focus{border-color:#4d6bfe;background:var(--dsw-alias-bg-layer-1,#1c1d21)}
+.dshms-search::placeholder{color:var(--dsw-alias-label-tertiary,#8c959f)}
+.dshms-pills{display:flex;flex-wrap:wrap;gap:6px;padding:7px;border-bottom:1px solid var(--dsw-alias-border-l2,#36373b);flex:none}
+.dshms-pill{font:inherit;font-size:12px;line-height:20px;padding:0 9px;border-radius:999px;
+  border:1px solid var(--dsw-alias-border-l2,#36373b);background:transparent;color:inherit;
+  opacity:.75;cursor:pointer;white-space:nowrap}
+.dshms-pill:hover{opacity:1;background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.06))}
+.dshms-pill[data-on="1"]{background:#4d6bfe;border-color:#4d6bfe;color:#fff;opacity:1}
+.dshms-menulist{max-height:290px;overflow:auto;padding:4px}
+.dshms-group{font-size:11px;font-weight:600;opacity:.55;padding:7px 9px 3px}
 .dshms-res{display:flex;flex-direction:column;gap:8px;font-size:13px}
 .dshms-res-row{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--dsw-alias-border-l2,#36373b);border-radius:9px;padding:9px 11px}
 .dshms-res-msg{opacity:.85;white-space:pre-wrap;word-break:break-word}
@@ -364,6 +383,49 @@ window.__ModuleLoader__.load({
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // 模型过滤器 —— **与 `src/inject/model-search.js` 同一套语义**
+    //
+    // 为什么强调"同一套"：那一段是给官方「选择模型」菜单加的搜索框与筛选胶囊，
+    // 这里要给它一个**行为一致**的孪生版本。两处如果各写各的，用户会在两个地方
+    // 遇到不同的筛选规则（例如"搜提供方名能不能整组显示"），那是无声的不一致。
+    // 照抄的语义（逐条对照注入那一版的 `apply()`）：
+    //   · 关键词命中**提供方名** ⇒ 该提供方整组显示（不是只显示组标题）
+    //   · 关键词命中模型名 / label / 描述 ⇒ 该行显示
+    //   · 提供方胶囊 = 精确筛选；**再点一次已选中的胶囊 = 取消**
+    //   · 胶囊只在**提供方多于一个**时出现（只有一个时它没意义、白占地方）
+    //   · 空态只在"确实加了筛选条件且一条不剩"时出现，并给一个「清空搜索与筛选」
+    //   · 胶囊上的数字是**该提供方的全部条数**（不受关键词影响）
+    // 唯一的差异（写在明处）：关键词的匹配面比那边多了一个 `description`
+    // （那边是 `title + textContent`，取不到描述），所以本版**略宽松**。
+    // ─────────────────────────────────────────────────────────────────────
+    function filterModels(models, query, group) {
+      const list = Array.isArray(models) ? models : [];
+      const q = String(query || "").trim().toLowerCase();
+      const providers = [];
+      const byName = new Map();
+      for (const m of list) {
+        const name = m.provider || "(未知来源)";
+        let p = byName.get(name);
+        if (!p) { p = { name, count: 0 }; byName.set(name, p); providers.push(p); }
+        p.count++;
+      }
+      const groups = [];
+      let shown = 0;
+      for (const p of providers) {
+        if (group && p.name !== group) continue;
+        const groupHit = !!q && p.name.toLowerCase().includes(q);
+        const items = [];
+        for (const m of list) {
+          if ((m.provider || "(未知来源)") !== p.name) continue;
+          const hay = ((m.label || "") + " " + m.model + " " + (m.description || "")).toLowerCase();
+          if (!q || groupHit || hay.includes(q)) { items.push(m); shown++; }
+        }
+        if (items.length) groups.push({ name: p.name, items });
+      }
+      return { total: list.length, providers, groups, shown };
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // `/` 命令目录 与 `@` 文件引用
     //
     // 同样"拿不到就不显示"，不编造。命令来源与引用来源都是官方服务；两者都需要一个
@@ -442,47 +504,77 @@ window.__ModuleLoader__.load({
       return '@"' + p + '"';
     }
 
+    /** 官方受理的图片媒体类型（`dsh-attachment/lib/types/types.d.ts:5`，别的类型在官方那里也抛错）。 */
+    const IMAGE_MEDIA_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+    /** 一个浏览器 File 是不是官方受理的图片；是就返回它的 mediaType。 */
+    function imageMediaTypeOf(file) {
+      const t = (file && file.type) || "";
+      return IMAGE_MEDIA_TYPES.indexOf(t) >= 0 ? t : null;
+    }
+
     /**
-     * 等文件附件后台上传完成。
-     *
-     * ★ 为什么必须等（2026-09-21 实测抓到的真错，原文）：
-     *     conversation.sendSession: one or more files have not finished uploading
-     *   官方契约：**"files upload on pick, not on send"**（`contract/slots.d.ts:37`）——
-     *   `createDrafts()` 一调用就在后台上传，而 `sendSession()` 要求它们已经传完。
-     *   官方输入框是靠"上传没完就把发送键禁掉"来规避的（`uploadsPending`），
-     *   而本插件是"一键发 N 行"，不能靠禁用，只能**在这里等**。
-     *
-     * 状态出处：`ConversationController.fileUploads: SnapshotStore<Record<draftId, DraftFileUpload>>`，
-     * 而 `DraftFileUpload = {status:'uploading',loaded,total?} | {status:'ready',receiptId,file} | {status:'error',message}`
-     * （`contract/slots.d.ts:38-51`）。图片**不会**出现在这个表里（图片在发送时才 base64 编码），所以只等 file 类。
+     * 原始文件字节的 base64。
+     * 与官方一致（`dsh-client-ui-conversation/lib/client.js` 的 `base64ImageOf`）：
+     * 走浏览器原生 FileReader 的 dataURL，**去掉 `data:…;base64,` 前缀**；
+     * 不做缩放、不重编码。大文件也这么传（体积上限在宿主侧，默认单图 20 MiB）。
      */
-    async function waitForUploads(conv, drafts, timeoutMs = 120000) {
-      const fileIds = drafts.filter((d) => d && d.kind === "file" && d.id !== undefined).map((d) => d.id);
-      if (!fileIds.length) return;
-      const store = conv.fileUploads;
-      if (!store || typeof store.getSnapshot !== "function") return;   // 拿不到状态就不硬等，让 sendSession 自己报错
-      const deadline = Date.now() + timeoutMs;
-      for (;;) {
-        const snap = store.getSnapshot() || {};
-        let pending = 0;
-        for (const id of fileIds) {
-          const st = snap[id];
-          if (!st) { pending++; continue; }
-          if (st.status === "error") throw new Error("附件上传失败：" + (st.message || "未知原因"));
-          if (st.status !== "ready") pending++;
+    function base64Of(file) {
+      return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => {
+          const url = String(r.result || "");
+          const i = url.indexOf(",");
+          if (i < 0) reject(new Error("读取图片失败：dataURL 形状不对"));
+          else resolve(url.slice(i + 1));
+        };
+        r.onerror = () => reject(r.error || new Error("读取图片失败"));
+        r.readAsDataURL(file);
+      });
+    }
+
+    /**
+     * 把一行的附件变成 `prompt()` 能吃的 wire parts。
+     *
+     * 两条规则（照官方做法，逐条有出处）：
+     *   · 图片 → `{ type:'image', mediaType, data, name? }`，`data` 是原始字节的 base64：
+     *     `dsh-attachment/lib/types/types.d.ts:74-82` 的 `EncodedImageAttachment`。
+     *   · 其它文件 → 先用 `ctx.fileUpload.upload(sessionId, file, name)` 换 `receiptId`，
+     *     再 `{ type:'file', receiptId }`。契约：`dsh-client-file-upload/lib/types/client/contract.d.ts:11-26`，
+     *     返回 `{ receiptId, file }`（`lib/types/types.d.ts:11-18`）。
+     *     ★ 凭据**只属于一个精确的 Session**（该包 README 的运行时不变式），所以要放在建完会话之后。
+     */
+    async function uploadParts(ctx, sessionId, files) {
+      const parts = [];
+      for (const f of files) {
+        const mediaType = imageMediaTypeOf(f);
+        if (mediaType !== null) {
+          const part = { type: "image", mediaType, data: await base64Of(f) };
+          if (f.name) part.name = f.name;
+          parts.push(part);
+          continue;
         }
-        if (pending === 0) return;
-        if (Date.now() > deadline) throw new Error(`等附件上传超时（还有 ${pending} 个没传完）`);
-        set({ notice: `正在等附件上传完成（还有 ${pending} 个）…` });
-        await new Promise((r) => setTimeout(r, 200));
+        const fu = ctx.fileUpload;
+        if (!fu || typeof fu.upload !== "function") {
+          throw new Error("这个内核没提供 fileUpload，非图片附件传不上去");
+        }
+        set({ notice: `正在上传附件 ${f.name}…` });
+        const res = await fu.upload(sessionId, f, f.name);
+        if (res && res.ok === false) throw new Error(`上传「${f.name}」失败：${errText(res.error)}`);
+        const v = res && res.ok !== undefined ? res.value : res;
+        if (!v || !v.receiptId) throw new Error(`上传「${f.name}」没有返回凭据（receiptId）`);
+        parts.push({ type: "file", receiptId: v.receiptId });
       }
+      return parts;
     }
 
     // ─────────────────────────────────────────────────────────────────────
     // 发送
     //
-    // 分层：能走官方完整路径就走；任何一环缺失/失败就退到更底层的 prompt()。
-    // 每一层都记进结果里（`via` 字段），这样"到底走通了哪条路"是可查的，而不是猜的。
+    // 一条路径，但每一步都"失败可归因"：建会话 →（选了模型才）选模型 → 附件变 wire parts
+    // → `prompt()` 提交。结果里逐行写明走了什么（`via`）与哪一步失败（`error`/`modelNote`）。
+    // 刻意**不用** `conversation.sendSession`：它是官方完整路径，但在"会话没有被跟随"时会
+    // await 乐观回显直到永不结算 ⇒ 按钮卡死（详见 ④ 那段注释里的实测证据）。
     // ─────────────────────────────────────────────────────────────────────
     async function submitOneRow(ctx, row, index) {
       const text = row.text;
@@ -531,58 +623,34 @@ window.__ModuleLoader__.load({
         return { index, key: row.key, sessionId, modelNote, error: "会话已创建，但拿不到它的会话面（binding 为空）" };
       }
 
-      // ④ 送出去：优先官方完整路径（含乐观回显 / 图片编码 / 文件凭据 / 结算）
-      //    `conversation.createDrafts` 与 `conversation.sendSession` 在 ConversationController
-      //    的类声明里有（不是 IConversation 接口面），所以用 typeof 探，探不到就换路子。
-      const conv = ctx.conversation;
+      // ④ 送出去。
+      //
+      // ★★ 为什么**不用** `conversation.sendSession`（它虽然是"官方完整路径"）—— 实测证据：
+      //    带附件那一行会让整个"一键发送"**永久卡住**：发送键一直显示"发送中…"，
+      //    而宿主其实早就受理并落盘了（磁盘上找得到提示词与附件字节）。
+      //    真因：`sendSession` 在**有附件**时会 `await` 乐观回显的"退休"（等持久事件或队列行出现），
+      //    而本插件的会话是刚建出来、**没有被跟随**（没有 live 事件流订阅）⇒ 那个 await 可能永不结算。
+      //    命令语义上这是"回显没确认"，不是"没发出去"，但界面上表现为**按钮卡死**，这是不可接受的。
+      //    ⇒ 改用完成语义**有界**的路径：自己把附件传成 wire parts，再 `face.prompt(...)`
+      //      （官方文档：prompt 的返回值是 "Receipt after one prompt enters the target Agent inbox"，
+      //       即"宿主受理"为止，不等回显、不等回合）。
+      //    代价：失去乐观回显（消息要等宿主的持久事件回来才出现在会话里）。这个交换是划算的。
+      //
+      // 附件变成 wire parts 的两条规则（照官方的做法，逐条有出处）：
+      //   · 图片 → `{ type:'image', mediaType, data, name? }`
+      //     `data` 是**原始文件字节的 base64**（官方就是 FileReader dataURL 去掉前缀，不做缩放）；
+      //     `mediaType` 只认 png/jpeg/webp/gif 四种，其余在官方那里也是抛错的。
+      //   · 其它文件 → 先 `ctx.fileUpload.upload(sessionId, file, name)` 拿凭据，再 `{ type:'file', receiptId }`
+      //     （上传凭据**只属于一个精确的 Session**，所以必须放在建完会话之后）。
+      //   · 顺序：**附件在前、文本在后**（官方原文 `[...attachments, ...[text]]`）。
       let via = null;
       try {
-        if (typeof conv.createDrafts === "function" && typeof conv.sendSession === "function") {
-          // 两个调用分开归因 —— 否则出错时分不清是"暂存附件"还是"提交"失败，
-          // 而这两者的修法完全不同（前者是附件管线的用法问题，后者是提交路径的问题）。
-          let drafts = [];
-          if (files.length) {
-            try {
-              drafts = conv.createDrafts(sessionId, files);
-            } catch (e) {
-              throw new Error("createDrafts 失败：" + errText(e));
-            }
-          }
-          const ids = drafts.map((d) => d && d.id).filter((x) => x !== undefined);
-          if (files.length && ids.length !== files.length) {
-            throw new Error(`createDrafts 返回了 ${drafts.length} 项但只有 ${ids.length} 项带 id`);
-          }
-          // ★ 必须等后台上传完成（见 waitForUploads 的注释：官方原文是
-          //   "one or more files have not finished uploading"）
-          try {
-            await waitForUploads(conv, drafts);
-          } catch (e) {
-            throw new Error("等附件上传失败：" + errText(e));
-          }
-          let outcome;
-          try {
-            outcome = await conv.sendSession(face, text, ids, "queue");
-          } catch (e) {
-            throw new Error("sendSession 抛出：" + errText(e));
-          }
-          if (outcome && outcome.kind === "error") throw new Error("sendSession 返回错误：" + errText(outcome.error));
-          if (outcome && outcome.ok === false) throw new Error("sendSession 返回错误：" + errText(outcome));
-          via = files.length ? `sendSession(带 ${ids.length} 个附件)` : "sendSession";
-          return { index, key: row.key, sessionId, modelNote, via };
-        }
-      } catch (e) {
-        // 落到 ⑤；把 ④ 的失败原因留下（诊断用）
-        modelNote = (modelNote ? modelNote + "；" : "") + "官方完整路径失败，已退到 prompt()：" + errText(e);
-      }
-
-      // ⑤ 退路：只能发文本（附件在这一层不支持 —— 明确说出来，不假装成功）
-      try {
-        if (files.length) {
-          throw new Error("这条路不支持附件（要附件请检查内核是否提供 conversation.sendSession）");
-        }
-        const res = await face.prompt([{ type: "text", text }], "queue");
+        const parts = files.length ? await uploadParts(ctx, sessionId, files) : [];
+        if (text && text.trim()) parts.push({ type: "text", text });
+        if (!parts.length) throw new Error("这一行既没有文本也没有有效附件");
+        const res = await face.prompt(parts, "queue");
         if (res && res.ok === false) throw new Error(errText(res.error));
-        via = "prompt()";
+        via = files.length ? `prompt(+${files.length} 个附件)` : "prompt";
         return { index, key: row.key, sessionId, modelNote, via };
       } catch (e) {
         return { index, key: row.key, sessionId, modelNote, error: errText(e) };
@@ -593,11 +661,28 @@ window.__ModuleLoader__.load({
       const rows = state.rows.slice();
       const sendable = rows.filter((r) => r.text.trim() || (r.files && r.files.length));
       if (!sendable.length) { set({ notice: "都是空的，先写点什么" }); return; }
-      set({ sending: true, notice: null, menu: null });
+      const ticket = { at: Date.now(), rows: rows.length, sendable: sendable.length, done: false, ok: 0, failed: 0, error: null };
+      diagnostics.sends.push(ticket);
+      set({ sending: true, notice: null, menu: null, popover: null });
 
-      // 并行发。每行的失败被自己吞掉并记进结果，绝不让一行拖垮其它行。
-      const settled = await Promise.all(sendable.map((row, i) => submitOneRow(ctx, row, i)));
-      set({ sending: false, results: settled });
+      try {
+        // 并行发。每行的失败被自己吞掉并记进结果，绝不让一行拖垮其它行。
+        const settled = await Promise.all(sendable.map((row, i) => submitOneRow(ctx, row, i)));
+        ticket.done = true;
+        ticket.ok = settled.filter((r) => !r.error && !r.skipped).length;
+        ticket.failed = settled.filter((r) => r.error).length;
+        // notice 一定要清掉：否则上一阶段的提示（例如"正在上传附件…"）会**残留**在结果视图上方，
+        // 本轮排查时它就把我引偏过一次（看到"正在等附件上传"以为还卡在那一步，其实早就过了）。
+        set({ sending: false, results: settled, notice: null });
+      } catch (e) {
+        // ★ 兜底：**任何**异常都不许把界面卡在"发送中…"（否则发送键从此点不动，用户以为还在跑）。
+        //   本轮实测出现过两次「磁盘上明明发出去了、界面却没切到结果视图」，原因未能完全定位
+        //   ⇒ 至少保证失败可见、状态一定被复位，并记进 diagnostics.sends
+        //     供 scripts/plugin-check.js 复现时定位（它能读 window.__dshMultiSession.diagnostics）。
+        ticket.done = true;
+        ticket.error = errText(e);
+        set({ sending: false, notice: "发送过程出错：" + errText(e) });
+      }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -713,7 +798,7 @@ window.__ModuleLoader__.load({
             const workspaceId = def ? def.workspaceId : null;
             const rows = state.rows.length ? state.rows : [newRow(sc.cwd, workspaceId)];
             set({
-              open: true, results: null, notice: null,
+              open: true, results: null, notice: null, popover: null,
               scope: { sessionId: sessionId || sc.sessionId || null, cwd: sc.cwd, workspaceId, workspaces },
               rows,
             });
@@ -732,10 +817,42 @@ window.__ModuleLoader__.load({
     // 组件：一行输入框
     // ─────────────────────────────────────────────────────────────────────
     function RowView(props) {
-      const { ctx, row, index, total, models, workspaces, onMenu } = props;
+      const { ctx, row, index, total, models, workspaces, popover } = props;
       const taRef = useRef(null);
-      const [showModels, setShowModels] = useState(false);
-      const [showCwd, setShowCwd] = useState(false);
+      const searchRef = useRef(null);
+
+      // 下拉（模型 / 工作区）：**状态提到 store 里**，不是本组件的 useState。
+      // 两个理由：① 同屏只允许一个下拉开着（各自 useState 的话两行可以同时开着）；
+      // ② 弹窗那层的 Esc 处理要能知道"现在有没有下拉开着"（否则按 Esc 会把整个弹窗关掉、
+      //    把所有已写内容一起丢掉 —— 这是本轮顺手修掉的一个真 bug）。
+      const showModels = !!(popover && popover.rowKey === row.key && popover.kind === "model");
+      const showCwd = !!(popover && popover.rowKey === row.key && popover.kind === "cwd");
+      const openPop = (kind) => {
+        const same = popover && popover.rowKey === row.key && popover.kind === kind;
+        set({ popover: same ? null : { rowKey: row.key, kind } });
+      };
+      const closePop = () => set({ popover: null });
+
+      // 模型筛选条件（关键词 + 提供方胶囊）与键盘选中项
+      const [modelQuery, setModelQuery] = useState("");
+      const [modelGroup, setModelGroup] = useState(null);
+      const [modelActive, setModelActive] = useState(0);
+      const clearModelFilter = () => { setModelQuery(""); setModelGroup(null); setModelActive(0); };
+
+      const filtered = useMemo(() => filterModels(models, modelQuery, modelGroup), [models, modelQuery, modelGroup]);
+      // 键盘可达项：第 0 项是「默认模型」，之后按分组顺序铺开（与显示顺序一致）
+      const navItems = useMemo(() => {
+        const out = [null];
+        for (const g of filtered.groups) for (const m of g.items) out.push(m);
+        return out;
+      }, [filtered]);
+
+      // 打开模型下拉就聚焦搜索框（官方菜单也是"能打字就能筛"）
+      useEffect(() => {
+        if (!showModels) return;
+        const el = searchRef.current;
+        if (el) { try { el.focus(); } catch { /* 拿不到焦点就算了 */ } }
+      }, [showModels]);
 
       // 自动增高
       useEffect(() => {
@@ -772,6 +889,31 @@ window.__ModuleLoader__.load({
         const files = Array.from(list || []).slice(0, MAX_FILES_PER_ROW - row.files.length);
         if (!files.length) return;
         setRow(row.key, { files: row.files.concat(files) });
+      };
+
+      const pickModel = (m) => {
+        setRow(row.key, { model: m });
+        closePop();
+        clearModelFilter();
+      };
+
+      // 模型下拉里的键盘操作：↑↓ 移动、Enter 选中、Esc **先清筛选条件**再关
+      // （最后这条与 src/inject/model-search.js 一致：那边也是"再按一次才关"）
+      const onModelKeyDown = (e) => {
+        const n = Math.max(navItems.length, 1);
+        if (e.key === "ArrowDown") { e.preventDefault(); setModelActive((i) => (i + 1) % n); return; }
+        if (e.key === "ArrowUp") { e.preventDefault(); setModelActive((i) => (i - 1 + n) % n); return; }
+        if (e.key === "Enter") {
+          e.preventDefault();
+          const m = navItems[modelActive];
+          if (m !== undefined) pickModel(m);
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          if (modelQuery || modelGroup) clearModelFilter();
+          else closePop();
+        }
       };
 
       const modelLabel = row.model ? row.model.label || row.model.model : "默认模型";
@@ -828,7 +970,7 @@ window.__ModuleLoader__.load({
             h(P.Button, {
               variant: "ghost", size: "sm", icon: h(P.IconFolderOpenOutline16, null),
               title: "这一行在哪个工作区开工",
-              onClick: () => setShowCwd((v) => !v),
+              onClick: () => openPop("cwd"),
               children: (function () {
                 const w = (workspaces || []).find((x) => x.workspaceId === row.workspaceId);
                 if (w) return w.title;
@@ -838,7 +980,7 @@ window.__ModuleLoader__.load({
             showCwd ? h("div", { className: "dshms-menu", style: { position: "absolute", bottom: "120%", left: 0 } },
               h("div", {
                 className: "dshms-menu-item", "data-active": !row.workspaceId ? "1" : "0",
-                onClick: () => { setRow(row.key, { workspaceId: null }); setShowCwd(false); },
+                onClick: () => { setRow(row.key, { workspaceId: null }); closePop(); },
               },
               h("span", { className: "mi-name" }, "默认工作区"),
               h("span", { className: "mi-hint" }, row.cwd ? baseName(row.cwd) : "交给内核决定")),
@@ -846,7 +988,7 @@ window.__ModuleLoader__.load({
                 className: "dshms-menu-item", key: i,
                 "data-active": row.workspaceId === w.workspaceId ? "1" : "0",
                 title: w.path,
-                onClick: () => { setRow(row.key, { workspaceId: w.workspaceId }); setShowCwd(false); },
+                onClick: () => { setRow(row.key, { workspaceId: w.workspaceId }); closePop(); },
               },
               h("span", { className: "mi-name" }, w.title),
               h("span", { className: "mi-hint" }, w.path))),
@@ -859,25 +1001,88 @@ window.__ModuleLoader__.load({
           h("span", { style: { position: "relative" } },
             h(P.Button, {
               variant: "ghost", size: "sm", icon: h(P.IconChevronDownOutline14, null),
-              title: "这一行用哪个模型（选中后：先建会话再选模型，最后才发）",
-              onClick: () => setShowModels((v) => !v),
+              title: "这一行用哪个模型（可搜索、可按来源筛选）",
+              onClick: () => openPop("model"),
               children: modelLabel,
             }),
-            showModels ? h("div", { className: "dshms-menu", style: { position: "absolute", bottom: "120%", left: 0 } },
-              h("div", {
-                className: "dshms-menu-item", "data-active": row.model === null ? "1" : "0",
-                onClick: () => { setRow(row.key, { model: null }); setShowModels(false); },
-              }, h("span", { className: "mi-name" }, "默认模型"), h("span", { className: "mi-hint" }, "不干预，用环境默认")),
-              models === null
-                ? h("div", { className: "dshms-menu-empty" }, "拿不到模型目录（这个内核没提供）—— 只能用默认模型")
-                : models.map((m, i) => h("div", {
-                    className: "dshms-menu-item", key: i,
-                    "data-active": row.model && row.model.model === m.model && row.model.provider === m.provider ? "1" : "0",
-                    onClick: () => { setRow(row.key, { model: m }); setShowModels(false); },
-                  },
-                  h("span", { className: "mi-name" }, m.label),
-                  h("span", { className: "mi-hint" }, m.provider + (m.efforts ? " · " + m.efforts.join("/") : "")),
-                )),
+            showModels ? h("div", { className: "dshms-menu dshms-modelmenu", style: { position: "absolute", bottom: "120%", left: 0 } },
+              // ── 搜索框（与官方菜单里那个同一套语义与视觉）──
+              h("div", { className: "dshms-searchwrap" },
+                h("input", {
+                  ref: searchRef,
+                  type: "search",
+                  className: "dshms-search",
+                  placeholder: "搜索模型或提供方…",
+                  spellCheck: false,
+                  autoComplete: "off",
+                  value: modelQuery,
+                  onChange: (e) => { setModelQuery(e.target.value); setModelActive(0); },
+                  onKeyDown: onModelKeyDown,
+                }),
+              ),
+
+              // ── 提供方筛选胶囊：只在提供方多于一个时出现 ──
+              filtered.providers.length > 1
+                ? h("div", { className: "dshms-pills" },
+                    h("button", {
+                      type: "button", className: "dshms-pill",
+                      "data-on": modelGroup === null ? "1" : "0",
+                      onClick: () => { setModelGroup(null); setModelActive(0); },
+                    }, `全部 ${filtered.total}`),
+                    filtered.providers.map((p) => h("button", {
+                      type: "button", className: "dshms-pill", key: p.name, title: p.name,
+                      "data-on": modelGroup === p.name ? "1" : "0",
+                      // 再点一次已选中的胶囊 = 取消（与官方菜单那边一致）
+                      onClick: () => { setModelGroup(modelGroup === p.name ? null : p.name); setModelActive(0); },
+                    }, `${p.name} ${p.count}`)),
+                  )
+                : null,
+
+              // ── 列表 ──
+              h("div", { className: "dshms-menulist" },
+                models === null
+                  ? h("div", { className: "dshms-menu-empty" }, "拿不到模型目录（这个内核没提供）—— 只能用默认模型")
+                  : (function () {
+                      const rows = [];
+                      let nav = 0;   // 与 navItems 同步前进：0 = 默认模型，其后按分组顺序
+                      rows.push(h("div", {
+                        className: "dshms-menu-item", key: "__default",
+                        "data-active": nav === modelActive ? "1" : (row.model === null ? "" : "0"),
+                        onMouseDown: (e) => e.preventDefault(),
+                        onClick: () => pickModel(null),
+                      },
+                      h("span", { className: "mi-name" }, "默认模型"),
+                      h("span", { className: "mi-hint" }, "不干预，用环境默认")));
+                      nav++;
+                      for (const g of filtered.groups) {
+                        rows.push(h("div", { className: "dshms-group", key: "g:" + g.name },
+                          `${g.name} (${g.items.length})`));
+                        for (const m of g.items) {
+                          const on = nav === modelActive ? "1"
+                            : (row.model && row.model.model === m.model && row.model.provider === m.provider ? "1" : "0");
+                          const idx = nav;
+                          rows.push(h("div", {
+                            className: "dshms-menu-item", key: g.name + "/" + m.model,
+                            "data-active": on,
+                            title: m.description || m.model,
+                            onMouseDown: (e) => e.preventDefault(),
+                            onMouseEnter: () => setModelActive(idx),
+                            onClick: () => pickModel(m),
+                          },
+                          h("span", { className: "mi-name" }, m.label),
+                          h("span", { className: "mi-hint" }, (m.efforts ? m.efforts.join("/") : m.model))));
+                          nav++;
+                        }
+                      }
+                      // 空态：只在"确实加了筛选条件且一条不剩"时出现（与官方菜单一致）
+                      if ((modelQuery || modelGroup) && filtered.shown === 0 && filtered.total > 0) {
+                        rows.push(h("div", { className: "dshms-menu-empty", key: "__empty" },
+                          h("span", null, `没有匹配的模型（共 ${filtered.total} 个）`),
+                          h("button", { type: "button", onClick: () => clearModelFilter() }, "清空搜索与筛选")));
+                      }
+                      return rows;
+                    })(),
+              ),
             ) : null,
           ),
 
@@ -923,17 +1128,31 @@ window.__ModuleLoader__.load({
         return () => { alive = false; };
       }, [st.open, st.scope.sessionId]);
 
-      // Esc 关闭
+      // Esc 的**优先顺序**（这条很重要，别改回去）：
+      //   ① 斜杠/引用菜单开着  → 交给 textarea 自己的 onKeyDown 处理（这里不动）
+      //   ② 有下拉开着（模型/工作区）→ **只关下拉**，不关弹窗
+      //   ③ 都没有            → 才关弹窗
+      // ★ ② 是这一轮修掉的真 bug：原来只判断 ①，于是模型下拉开着时按 Esc 会把**整个弹窗
+      //   关掉** —— 用户刚写好的 N 条提示词一起没了。
       useEffect(() => {
         if (!st.open) return;
-        const onKey = (e) => { if (e.key === "Escape" && !state.menu) { e.stopPropagation(); closeModal(); } };
+        const onKey = (e) => {
+          if (e.key !== "Escape") return;
+          if (state.menu) return;
+          if (state.popover) {
+            // 事件来自下拉**内部** ⇒ 让下拉自己走两级 Esc（先清筛选条件，再关下拉），
+            // 这样在搜索框里按 Esc 是"取消搜索"而不是"把下拉整个关掉"——与官方菜单一致。
+            if (e.target && typeof e.target.closest === "function" && e.target.closest(".dshms-menu")) return;
+            e.stopPropagation();
+            set({ popover: null });
+            return;
+          }
+          e.stopPropagation();
+          closeModal();
+        };
         document.addEventListener("keydown", onKey, true);
         return () => document.removeEventListener("keydown", onKey, true);
       }, [st.open]);
-
-      const onKey = (e) => {
-        if (e.key === "Escape" && !state.menu) closeModal();
-      };
 
       if (!st.open) return null;
 
@@ -957,7 +1176,7 @@ window.__ModuleLoader__.load({
             )),
           )
         : h(React.Fragment, null,
-            st.rows.map((row, i) => h(RowView, { key: row.key, ctx, row, index: i, total: st.rows.length, models: models === undefined ? null : models, workspaces: st.scope.workspaces })),
+            st.rows.map((row, i) => h(RowView, { key: row.key, ctx, row, index: i, total: st.rows.length, models: models === undefined ? null : models, workspaces: st.scope.workspaces, popover: st.popover })),
             st.rows.length < MAX_ROWS
               ? h("div", null, h(P.Button, {
                   variant: "outline", size: "sm", icon: h(P.IconPlusOutline16, null),
@@ -993,15 +1212,14 @@ window.__ModuleLoader__.load({
             ),
           );
 
-      // 用 primitives 的 Modal + headless：遮罩、Esc、portal 到 body 都用官方的，
-      // 内容完全自己画（这样才有"大弹窗"的自由度）。
-      return h(P.Modal, {
-        open: true,
-        onClose: () => closeModal(),
-        headless: true,
-        className: "dshms-panel-wrap",
-      },
-        h("div", { className: "dshms-mask", onKeyDown: onKey, tabIndex: -1 },
+      // ★ 刻意**不用**官方 primitives 的 `Modal` 包一层（第一版用了，实测踩坑）：
+      //   官方 `Modal` 自己在 `document` 上挂了 keydown 监听，按 Escape 就调它的 `onClose`。
+      //   于是"在搜索框里按 Esc"会沿着冒泡走到那个监听上，**把整个弹窗关掉、把已写好的
+      //   N 条提示词一起丢掉** —— 而我的捕获处理里那条"让下拉自己处理"的分支是不阻断事件的。
+      //   自己画遮罩就没有这个第二来源：Esc 只由我这一处决定（见上面 effect 里的三级优先顺序）。
+      //   覆盖能力不受影响：`.dshms-mask` 是 `position:fixed; inset:0; z-index:9999`。
+      //   另外遮罩**故意不响应点击关闭** —— 点空白就丢草稿太容易误触。
+      return h("div", { className: "dshms-mask", tabIndex: -1 },
           h("div", { className: "dshms-panel", role: "dialog", "aria-modal": "true", "aria-label": "多会话同时开工" },
             h("div", { className: "dshms-head" },
               h("h2", { className: "dshms-title" }, "多会话同时开工"),
@@ -1013,7 +1231,6 @@ window.__ModuleLoader__.load({
             h("div", { className: "dshms-body" }, body),
             h("div", { className: "dshms-foot" }, foot),
           ),
-        ),
       );
     }
 
@@ -1029,7 +1246,7 @@ window.__ModuleLoader__.load({
     //   `remote.commands` 与 `remote.fileReferences` 由官方自己 inject（dsh-client-ui-commands /
     //   dsh-client-ui-reference 的 inject 列表里逐字可见），所以不是猜的。
     const inject = [
-      "slots", "sessions", "conversation",
+      "slots", "sessions", "conversation", "fileUpload",
       "remote", "remote.session", "remote.commands", "remote.fileReferences",
     ];
 
@@ -1058,7 +1275,7 @@ window.__ModuleLoader__.load({
           open: () => {
             const sc = readScope(ctx);
             set({
-              open: true, results: null, notice: null,
+              open: true, results: null, notice: null, popover: null,
               scope: { sessionId: sc.sessionId, cwd: sc.cwd, workspaceId: state.scope.workspaceId, workspaces: state.scope.workspaces },
               rows: state.rows.length ? state.rows : [newRow(sc.cwd, state.scope.workspaceId)],
             });

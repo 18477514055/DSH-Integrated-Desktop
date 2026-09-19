@@ -49,16 +49,27 @@
 | 能力 | 实现方式 | 官方依据 | 验证情况 |
 |---|---|---|---|
 | 多行文本 | 自己的 `<textarea>`（自动增高） | 官方编辑器拿不到，见上 | ✅ 真跑 |
-| **模型选择**（每行各自选） | `ctx.remote.session.modelCatalog()` | **不需要 sessionId**（`types/catalog.d.ts:4` 明写 "without requiring a Session"） | ✅ 真跑：列出 5 项（含 reasoning 档位） |
+| **模型选择**（每行各自选）<br>**+ 搜索框 + 来源筛选胶囊 + 按来源分组** | `ctx.remote.session.modelCatalog()` | **不需要 sessionId**（`types/catalog.d.ts:4` 明写 "without requiring a Session"）；目录形状是 `groups[].models[]` | ✅ 真跑：42 个模型、4 颗胶囊（`全部 41 / deepseek-official 4 / workbuddy 16 / workbuddy-global 21`），搜 `deepse` → 9 条且条条命中 |
 | **`/` 命令菜单** | `ctx.remote.commands.list(sessionId)` | 位置参数、**必填 sessionId** | ✅ 真跑：6 条真实命令 |
 | **`@` 文件引用** | `ctx.remote.fileReferences.list(sessionId, query)` | 同上；提及语法照抄官方 `formatFileMention` | ✅ 真跑：8 条真实路径 |
-| **附件**（回形针 / 拖入？见下） | `ctx.conversation.createDrafts` + `sendSession` | 官方完整提交管线（乐观回显 / 图片 base64 / 文件凭据 / 结算） | ✅ 真跑：字节落到 `attachments/v1/files/…` |
+| **附件**（回形针） | 图片 → base64 成 `{type:'image',…}`；其它文件 → `ctx.fileUpload.upload()` 换 `receiptId` → `{type:'file',receiptId}` | 照官方的两条编码规则；上传凭据**只属于一个 Session** | ✅ 真跑：字节落到 `attachments/v1/files/…` |
 | **工作区**（每行各自选） | 标准 prop `useWorkspaces` + `create({workspaceId})` | 官方字段名是 `workspaceId`/`title`，**不是** `id`/`name` | ✅ 真跑：下拉有内容 |
 
-**发送走的是官方完整路径**：建会话 → （选了模型才）`selectModel` → `createDrafts` →
-**等后台上传完成** → `sendSession(face, text, ids, "queue")`。
-拿不到 `sendSession` 时会退回更底层的 `prompt([{type:'text',text}], 'queue')`，
-**并且在结果里写明走了哪条路**（`路径：sendSession` / `路径：prompt()`），不假装成功。
+**模型搜索/筛选与 `src/inject/model-search.js` 是同一套语义**（那套是给官方「选择模型」
+菜单做的）。照抄的规则：关键词命中**提供方名**则该提供方整组显示；胶囊再点一次=取消；
+胶囊只在提供方多于一个时出现；胶囊上的数字是该提供方的全部条数；空态文案
+「没有匹配的模型（共 N 个）」+「清空搜索与筛选」。
+唯一差异（写在明处）：匹配面多了一个 `description`，所以比那边**略宽松**。
+
+**发送路径：一条、且有界。** 建会话 → （选了模型才）`selectModel` →
+附件变 wire parts → `face.prompt(parts, "queue")`。
+结果里逐行写明走了什么（`路径：prompt` / `路径：prompt(+1 个附件)`），不假装成功。
+
+> ★ **为什么不用 `conversation.sendSession`**（它才是"官方完整路径"）：
+> 它带附件时会 `await` 乐观回显的"退休"，而本插件的会话是刚建出来、**没有被跟随**
+> （没有 live 事件流订阅）⇒ 那个 await 可能**永不结算**。
+> 实测症状：发送键**永久停在"发送中…"**，而宿主其实早就受理并落盘了。
+> 代价是失去乐观回显（消息要等宿主的持久事件回来才出现在会话里）—— 这个交换划算。
 
 ---
 
@@ -118,6 +129,9 @@ npm run plugin:revert      # 回滚：从备份恢复 + 删联接
 - **`/` 与 `@` 的作用域是"打开弹窗那一刻的当前会话"**（原因见上）。
   若你打开弹窗后切走会话，候选仍来自原来那个。
 - 附件目前只支持**回形针选取**（拖入与粘贴还没接）。
+- **Esc 是三级的**（刻意如此，为了别丢草稿）：第一下清搜索词 → 第二下清来源筛选 →
+  第三下才关下拉；**弹窗只在没有下拉/菜单开着时才关**，而且点遮罩空白**不关**。
+- 结果出来后不会自动跳到某个新会话（只列出会话 id）；新会话就在左侧列表里。
 
 ---
 
@@ -127,16 +141,20 @@ npm run plugin:revert      # 回滚：从备份恢复 + 删联接
 文件开头就是完整的设计说明与逐条出处，正文按这个顺序：
 
 ```
-常量 → 小工具 → 状态 store → 样式 → 模型目录 → 命令/引用 → 等待上传 → 发送
-     → 触发菜单 → 触发按钮组件 → 行组件 → 弹窗组件 → 插件本体（apply）
+常量 → 小工具 → 状态 store → 样式 → 模型目录 → 模型过滤器 → 命令/引用
+     → 附件变 wire parts → 发送 → 触发菜单 → 触发按钮组件 → 行组件 → 弹窗组件 → 插件本体（apply）
 ```
 
 几条**踩过的真坑**（都在源码注释里留了原文）：
 
-| 坑 | 表现 | 出处 |
+| 坑 | 表现 | 怎么抓到的 |
 |---|---|---|
-| 插件包只写 `dsh.client` 不写 `dsh.bundle` | 内核直接拒绝启动：`declares no dsh.bundle in its package.json` | 第一次真跑抓到 |
-| `onClick` 里用了未定义的 `ctx` | **按钮在、点了没反应、控制台不报错** | 靠"点击计数 + onClick 内 catch"抓出 |
+| 插件包只写 `dsh.client` 不写 `dsh.bundle` | 内核直接拒绝启动：`declares no dsh.bundle in its package.json` | 第一次真跑就抓到 |
+| `onClick` 里用了函数作用域里不存在的 `ctx` | **按钮在、点了没反应、控制台不报错** | 靠"点击计数 + onClick 内 catch"抓出 |
 | 继承槽位 owner 的 `disabled` | 当前会话忙碌时按钮变灰点不动（恰恰是最想用它的时候） | 同上 |
-| 不等附件后台上传就 `sendSession` | `conversation.sendSession: one or more files have not finished uploading` | 官方是禁用发送键，本插件必须等 |
-| 槽位注册失败被静默吞掉 | bundle 加载了、界面一个挂载点都没有且不报错 | `dsh-crosshub` 源码里的事故注释；本插件用 `diagnostics` 记录下来 |
+| 不等附件后台上传就 `sendSession` | `conversation.sendSession: one or more files have not finished uploading` | 把 `createDrafts` 与 `sendSession` 分开归因 |
+| **用 `sendSession` 提交带附件的内容** | 发送键**永久卡在"发送中…"**，而宿主早已受理落盘（磁盘上找得到提示词）—— 它的 promise 在等一个永不结算的回显退休 | 4 连跑时出现"1.5 秒成功 / 180 秒不出现"，靠 `diagnostics.sends` 的 `done:false` 定位 |
+| **用 `primitives.Modal` 当最外层** | 在搜索框里按 Esc 会**把整个弹窗关掉、丢掉所有已写内容** —— 官方 Modal 自己在 `document` 上挂了 Escape→`onClose` | 三段 Esc 断言把它逼了出来 |
+| 槽位注册失败被静默吞掉 | bundle 加载了、界面一个挂载点都没有且不报错 | `dsh-crosshub` 源码里的事故注释；本插件用 `diagnostics` 记录 |
+| 结果出来后**没清 `notice`** | 上一阶段的提示（"正在上传附件…"）残留在结果视图上方，**排查时把人引偏** | 本轮真发生：我一度以为还卡在上传那一步，而磁盘证明早已发出去 |
+| 验证脚本用固定 `sleep` 找按钮 | "页面在了但槽位还没渲染完"⇒ 假 FAIL（实测 4 连跑里出现 1 次） | 改成**轮询等按钮出现**（45 秒上限） |

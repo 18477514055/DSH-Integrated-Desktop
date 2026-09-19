@@ -293,13 +293,32 @@ function findMarkerOnDisk(home, marker) {
       check("页面里出现了插件注入的 <style data-plugin-css>", cssOk === true,
         "只有 apply() 执行到 installCss 才会出现（bundle 被下载不会）");
 
+      // ★ 先**等按钮出现**，不要睡固定时间就去找。
+      //   实测（4 连跑里的第 3 次）：页面已经在了，但 composer 槽位还没渲染完 ⇒
+      //   "按钮没找到"是**脚本的时序**问题，不是插件的故障（那一次后续全过、发送也成功）。
+      //   所以这里改成轮询等待，把"没渲染完"与"真的没挂上"分开。
+      const waitForTrigger = async (timeoutMs) => {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+          const ok = await cdpEval(ws, `(() => {
+            const all = Array.from(document.querySelectorAll('button'));
+            return all.some(b => (b.getAttribute('title')||'').includes('多会话同时开工') || (b.textContent||'').trim() === '多会话');
+          })()`);
+          if (ok === true) return true;
+          if (Date.now() > deadline) return false;
+          await sleep(600);
+        }
+      };
+      const triggerSeen = await waitForTrigger(45000);
+
       const btn = await cdpEval(ws, `(() => {
         const all = Array.from(document.querySelectorAll('button'));
         const hit = all.find(b => (b.getAttribute('title')||'').includes('多会话同时开工') || (b.textContent||'').trim() === '多会话');
         return JSON.stringify({ found: !!hit, text: hit ? (hit.textContent||'').trim() : '', title: hit ? hit.getAttribute('title') : '', cls: hit ? hit.className : '' });
       })()`);
       const b = JSON.parse(btn);
-      check("主输入框右侧出现了「多会话」触发按钮", b.found === true, b.found ? `按钮文字「${b.text}」 class=${b.cls}` : "没找到");
+      check("主输入框右侧出现了「多会话」触发按钮", triggerSeen === true && b.found === true,
+        b.found ? `按钮文字「${b.text}」 class=${b.cls}` : "等 45 秒也没出现");
 
       // 调试钩子 + 槽位注册结果（"没挂上"必须看得见，不能被静默吞掉）
       const hookRaw = await cdpEval(ws, `JSON.stringify(window.__dshMultiSession ? {
@@ -381,26 +400,137 @@ function findMarkerOnDisk(home, marker) {
       const after = await cdpEval(ws, `document.querySelectorAll('.dshms-row').length`);
       check("点一下「新增会话」变成 2 个输入框", after === 2, `现在 ${after} 个`);
 
-      // ── 模型下拉（模型目录是**不需要 sessionId** 的官方接口，所以建会话之前就该有内容）──
-      console.log("\n── 功能：每行各自的模型下拉 ──");
+      // ── 模型下拉：搜索框 + 来源胶囊 + 分组 + 空态 + Esc 两级语义 ──
+      console.log("\n── 功能：每行各自的模型下拉（搜索框 / 来源胶囊 / 分组）──");
       const modelOpen = await cdpEval(ws, `(() => {
         const row = document.querySelectorAll('.dshms-row')[0];
-        const btns = Array.from(row.querySelectorAll('button'));
-        const b = btns.find(x => (x.getAttribute('title')||'').includes('这一行用哪个模型'));
+        const b = Array.from(row.querySelectorAll('button')).find(x => (x.getAttribute('title')||'').includes('这一行用哪个模型'));
         if (!b) return 'no-model-button';
         b.click();
         return 'clicked';
       })()`);
       check("行内有模型选择按钮且点得动", modelOpen === "clicked", String(modelOpen));
-      await sleep(700);
-      const modelItems = await cdpEval(ws, `JSON.stringify(Array.from(document.querySelectorAll('.dshms-row')[0].querySelectorAll('.dshms-menu-item')).map(x=>x.textContent))`);
-      let mItems = [];
-      try { mItems = JSON.parse(modelItems); } catch { }
-      // 第一项固定是「默认模型」；后面是真实模型 ⇒ >=2 才算拿到了目录
-      check("模型下拉列出了真实模型目录（≥1 个模型 + 默认项）", mItems.length >= 2,
-        `${mItems.length} 项: ${mItems.slice(0, 4).join(" | ")}`);
-      await cdpEval(ws, `(() => { const row=document.querySelectorAll('.dshms-row')[0]; const b=Array.from(row.querySelectorAll('button')).find(x=>(x.getAttribute('title')||'').includes('这一行用哪个模型')); b && b.click(); return true; })()`);
-      await sleep(300);
+      await sleep(800);
+
+      const dumpModelMenu = `(() => {
+        const rows = document.querySelectorAll('.dshms-row');
+        const row = rows[0];
+        if (!row) return JSON.stringify({
+          rowsFound: 0,
+          store: window.__dshMultiSession ? { open: window.__dshMultiSession.state().open, popover: window.__dshMultiSession.state().popover, menu: window.__dshMultiSession.state().menu } : null
+        });
+        const search = row.querySelector('.dshms-search');
+        const pills = Array.from(row.querySelectorAll('.dshms-pill')).map(x => ({ text: x.textContent, on: x.getAttribute('data-on') }));
+        const items = Array.from(row.querySelectorAll('.dshms-menu-item')).map(x => x.textContent);
+        const names = Array.from(row.querySelectorAll('.dshms-menu-item .mi-name')).map(x => x.textContent);
+        const groups = Array.from(row.querySelectorAll('.dshms-group')).map(x => x.textContent);
+        const empty = row.querySelector('.dshms-menu-empty');
+        return JSON.stringify({
+          rowsFound: rows.length,
+          hasSearch: !!search, query: search ? search.value : null,
+          pills, items: items.length, names, groups,
+          empty: empty ? empty.textContent : null,
+          panelOpen: !!document.querySelector('.dshms-panel'),
+          store: window.__dshMultiSession ? { open: window.__dshMultiSession.state().open, popover: window.__dshMultiSession.state().popover } : null
+        });
+      })()`;
+
+      const mo = JSON.parse(await cdpEval(ws, dumpModelMenu));
+      check("模型下拉里有搜索框", mo.hasSearch === true, "");
+      check("模型下拉列出了真实模型目录（≥1 个模型 + 默认项）", mo.items >= 2, `${mo.items} 项`);
+      check("有来源筛选胶囊（全部 + 各来源，且带条数）", mo.pills.length >= 2,
+        `${mo.pills.length} 颗: ${mo.pills.slice(0, 5).map((p) => p.text).join(" | ")}`);
+      check("模型按来源分组显示", mo.groups.length >= 1, mo.groups.slice(0, 4).join(" | "));
+      const baselineItems = mo.items;
+
+      // 取第一个真实模型名的一段做搜索词（这样断言不依赖具体模型叫什么）
+      const firstModel = mo.names.length > 1 ? mo.names[1] : "";
+      const term = firstModel.slice(0, Math.max(3, Math.min(6, firstModel.length))).toLowerCase();
+      console.log(`  用搜索词 "${term}"（取自第一个模型名 ${JSON.stringify(firstModel)}）`);
+
+      const setSearch = (v) => cdpEval(ws, `(() => {
+        const el = document.querySelectorAll('.dshms-row')[0].querySelector('.dshms-search');
+        if (!el) return 'no-search';
+        const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value').set;
+        setter.call(el, ${JSON.stringify(v)});
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        return 'ok';
+      })()`);
+
+      await setSearch(term);
+      await sleep(500);
+      const mo2 = JSON.parse(await cdpEval(ws, dumpModelMenu));
+      const allHit = mo2.names.slice(1).every((n) => n.toLowerCase().includes(term));
+      check("搜索真的过滤了列表（条数变少）", mo2.items < baselineItems, `${baselineItems} → ${mo2.items} 项`);
+      check("留下的每一条都真的含搜索词（不是乱留）", mo2.names.length <= 1 || allHit,
+        mo2.names.slice(1, 5).join(" | "));
+
+      await setSearch("zzz-不可能匹配的模型-zzz");
+      await sleep(500);
+      const mo3 = JSON.parse(await cdpEval(ws, dumpModelMenu));
+      check("搜不到时给出空态提示", !!mo3.empty && mo3.empty.includes("没有匹配的模型"),
+        String(mo3.empty).slice(0, 80));
+      check("空态里有「清空搜索与筛选」", !!mo3.empty && mo3.empty.includes("清空搜索与筛选"), "");
+
+      // Esc 第一下：清筛选、下拉还在、弹窗还在
+      const esc1 = await cdpEval(ws, `(() => {
+        const row = document.querySelectorAll('.dshms-row')[0];
+        const el = row && row.querySelector('.dshms-search');
+        if (!el) return 'no-search-input';
+        el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        return 'sent';
+      })()`);
+      await sleep(500);
+      const mo4 = JSON.parse(await cdpEval(ws, dumpModelMenu));
+      if (mo4.rowsFound === 0) console.log("  !! Esc 之后弹窗不见了，store=" + JSON.stringify(mo4.store) + " esc=" + esc1);
+      check("Esc 第一下只清掉筛选条件，不关下拉、也不关弹窗",
+        mo4.rowsFound > 0 && mo4.hasSearch === true && !mo4.query && mo4.panelOpen === true && mo4.items >= baselineItems,
+        `esc=${esc1} rows=${mo4.rowsFound} query=${JSON.stringify(mo4.query)} 下拉在=${mo4.hasSearch} 弹窗在=${mo4.panelOpen} 项=${mo4.items}`);
+
+      // 点来源胶囊：只剩该来源（条数应与胶囊上的数字一致）
+      const pillRes = await cdpEval(ws, `(() => {
+        const pills = Array.from(document.querySelectorAll('.dshms-row')[0].querySelectorAll('.dshms-pill'));
+        const target = pills.find(p => !p.textContent.startsWith('全部'));
+        if (!target) return 'no-pill';
+        target.click();
+        return JSON.stringify({ label: target.textContent });
+      })()`);
+      await sleep(500);
+      const mo5 = JSON.parse(await cdpEval(ws, dumpModelMenu));
+      let pillCount = null;
+      if (pillRes !== "no-pill") {
+        const m = /(\d+)\s*$/.exec(JSON.parse(pillRes).label);
+        pillCount = m ? Number(m[1]) : null;
+      }
+      check("点来源胶囊后只剩该来源（条数 = 胶囊上的数字）",
+        pillCount !== null && (mo5.items - 1) === pillCount,
+        `胶囊=${pillRes} ⇒ 可见 ${mo5.items - 1} 个模型（「默认模型」那项不计）`);
+      const onPills = mo5.pills.filter((p) => p.on === "1").map((p) => p.text);
+      check("被选中的胶囊有高亮状态", onPills.length === 1, onPills.join(" | "));
+
+      // Esc 第二下：清掉来源筛选（下拉仍在）
+      const dispatchEsc = () => cdpEval(ws, `(() => {
+        const row = document.querySelectorAll('.dshms-row')[0];
+        const el = row && row.querySelector('.dshms-search');
+        if (el) el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        return true;
+      })()`);
+      await dispatchEsc();
+      await sleep(450);
+      const mo6 = JSON.parse(await cdpEval(ws, dumpModelMenu));
+      const anyOn = mo6.pills.filter((p) => p.on === "1").map((p) => p.text);
+      check("Esc 第二下清掉来源筛选（下拉仍在、弹窗仍在）",
+        mo6.rowsFound > 0 && mo6.hasSearch === true && mo6.panelOpen === true
+          && (anyOn.length === 0 || anyOn[0].startsWith("全部")),
+        `选中胶囊=${JSON.stringify(anyOn)} 下拉在=${mo6.hasSearch} 弹窗在=${mo6.panelOpen}`);
+
+      // Esc 第三下：才关掉下拉（弹窗仍在 —— 草稿不会丢）
+      await dispatchEsc();
+      await sleep(450);
+      const mo7 = JSON.parse(await cdpEval(ws, dumpModelMenu));
+      check("Esc 第三下关掉下拉，但**弹窗还在**（草稿不会丢）",
+        mo7.rowsFound > 0 && mo7.hasSearch === false && mo7.panelOpen === true,
+        `rows=${mo7.rowsFound} 下拉在=${mo7.hasSearch} 弹窗在=${mo7.panelOpen} store=${JSON.stringify(mo7.store)}`);
 
       // ── `/` 命令菜单 ──
       console.log("\n── 功能：`/` 命令菜单 ──");
@@ -490,22 +620,36 @@ function findMarkerOnDisk(home, marker) {
       })()`, 60000);
       check("有「一键发送」按钮且可点", sendRes === "clicked", String(sendRes));
 
-      // 等结果视图（最多 60 秒）
+      // 等结果视图。
+      // ★ 上限给到 180 秒，不是随便定的：插件里"等附件后台上传完成"的自身超时是 120 秒
+      //   （waitForUploads），实测上传偶尔会拖到几十秒 —— 原来只等 60 秒会出现
+      //   "磁盘上明明已经发出去了、结果视图却没等到"的假 FAIL（真的发生过一次）。
       let results = null;
-      const deadline = Date.now() + 60000;
+      let lastStore = null;
+      const t0 = Date.now();
+      const deadline = t0 + 180000;
       while (Date.now() < deadline) {
         await sleep(1500);
         const raw = await cdpEval(ws, `(() => {
           const rows = Array.from(document.querySelectorAll('.dshms-res-row'));
-          if (!rows.length) return null;
+          const st = window.__dshMultiSession ? window.__dshMultiSession.state() : null;
+          const store = st ? { open: st.open, sending: st.sending, results: Array.isArray(st.results) ? st.results.length : st.results, notice: st.notice, rows: st.rows.length, sends: window.__dshMultiSession.diagnostics.sends } : null;
+          if (!rows.length) return JSON.stringify({ none: true, store });
           return JSON.stringify({
             text: (document.querySelector('.dshms-res')||{}).textContent || '',
-            rows: rows.map(r => r.textContent)
+            rows: rows.map(r => r.textContent),
+            store
           });
         })()`);
-        if (raw) { results = JSON.parse(raw); break; }
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          lastStore = parsed.store;
+          if (!parsed.none) { results = parsed; break; }
+        }
       }
-      check("发送后弹窗切到了结果视图", results !== null, results ? results.text.slice(0, 120) : "60 秒内没出现结果");
+      const sendMs = Date.now() - t0;
+      check("发送后弹窗切到了结果视图", results !== null,
+        results ? `耗时 ${(sendMs / 1000).toFixed(1)} 秒` : `180 秒内没出现；等待期间最后状态 store=${JSON.stringify(lastStore)}`);
       if (results) {
         console.log("  结果视图（逐行完整）:");
         for (const r of results.rows) console.log("    · " + r);
