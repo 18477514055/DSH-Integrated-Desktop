@@ -1,0 +1,46 @@
+MIT License
+
+Copyright (c) 2026 陈黛华 / 18477514055 (https://github.com/18477514055)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+════════════════════════════════════════════════════════════════════════════
+第三方组件归因（本仓库**不包含**它们的代码，只在运行时调用或复用其图形）
+════════════════════════════════════════════════════════════════════════════
+
+1. DeepSeek Harness 内核 —— `@deepseek-ai/dsh`
+   版权：Copyright (c) 2026 DeepSeek
+   许可：MIT
+   来源：https://github.com/deepseek-ai/deepseek-harness
+   关系：本仓库是**外壳**，运行时由外部独立安装的内核提供服务。
+        本仓库**不含**任何内核代码，也**不修改**内核的任何文件
+        （内核可以独立升级，外壳不需要跟着改 —— 这是本项目的核心设计前提）。
+
+2. 鲸鱼图形 —— `src/whale-path.json`
+   版权：Copyright (c) 2026 DeepSeek
+   许可：随 `@deepseek-ai/dsh-web-frontend` 发布，MIT
+   来源：`@deepseek-ai/dsh-web-frontend/dist/favicon.svg` 中的 `<path d="…">`，
+        按 `M` 拆成 body/belly/eye/spout 四段（由 `scripts/gen-whale-path.js` 生成）。
+   用途：应用图标（白底黑鲸鱼）、托盘图标、启动加载页的大鲸鱼。
+
+3. Electron
+   版权：Copyright (c) Electron contributors；Copyright (c) 2013-2020 GitHub Inc.
+   许可：MIT
+   来源：https://github.com/electron/electron
+   关系：devDependency；打包产物内嵌 Electron 运行时（其许可随产物附带）。

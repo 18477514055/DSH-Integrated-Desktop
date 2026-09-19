@@ -1,0 +1,127 @@
+/* ============================================================================
+ * shell-ui.css —— 外壳自有页面（加载页 / 设置页）的共享样式
+ * ============================================================================
+ * 设计基调刻意与「白底黑鲸鱼」图标统一：白底、近黑文字、一点 DeepSeek 蓝做强调。
+ * 这两个页面是**外壳**的，不是内核 Web UI 的，所以不 import 任何官方样式，
+ * 免得内核升级把外观带跑。
+ */
+
+:root {
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --fg-dim: #57606a;
+  --fg-faint: #8c959f;
+  --line: #e6e8eb;
+  --line-soft: #f0f2f4;
+  --accent: #4d6bfe;
+  --accent-soft: #eef1ff;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --err: #cf222e;
+  --err-soft: #fff1f0;
+  --radius: 12px;
+  --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.65 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+body { display: flex; flex-direction: column; overflow: hidden; }
+button { font: inherit; color: inherit; }
+code, pre { font-family: var(--mono); }
+
+/* ── 鲸鱼 ───────────────────────────────────────────────────────────── */
+.whale { display: block; transform-origin: center; animation: whale-breathe 3.6s ease-in-out infinite; }
+.whale .w-bg { fill: #ffffff; }
+.whale .w-body { fill: #000000; }
+.whale .w-belly, .whale .w-eye, .whale .w-spout { fill: #ffffff; }
+@keyframes whale-breathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.035); } }
+@media (prefers-reduced-motion: reduce) { .whale { animation: none; } }
+
+/* ── 通用件 ─────────────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 14px; border: 1px solid var(--line); border-radius: 8px;
+  background: #fff; color: var(--fg); cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+.btn:hover:not(:disabled) { background: var(--line-soft); border-color: #d8dce0; }
+.btn:disabled { color: var(--fg-faint); cursor: default; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary:hover:not(:disabled) { background: #3f5ae8; border-color: #3f5ae8; }
+.btn-danger { color: var(--err); border-color: #f0c2c6; }
+.btn-danger:hover:not(:disabled) { background: var(--err-soft); }
+
+.spin {
+  width: 12px; height: 12px; border: 2px solid var(--line);
+  border-top-color: var(--accent); border-radius: 50%;
+  animation: spin .9s linear infinite; display: inline-block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── 动作列表（诊断与修复）──────────────────────────────────────────── */
+.actions { display: flex; flex-direction: column; gap: 8px; }
+.action {
+  display: block; width: 100%; text-align: left;
+  padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px;
+  background: #fff; cursor: pointer; transition: background .12s, border-color .12s;
+}
+.action:hover:not(:disabled) { background: var(--accent-soft); border-color: #c7d0ff; }
+.action:disabled { opacity: .5; cursor: default; }
+.action-top { display: flex; align-items: center; gap: 8px; }
+.action-label { font-weight: 600; }
+.action-desc { color: var(--fg-dim); font-size: 12.5px; margin-top: 3px; }
+.tag {
+  font-size: 11px; padding: 1px 7px; border-radius: 999px;
+  background: var(--err-soft); color: var(--err); border: 1px solid #f0c2c6;
+}
+.tag-run { background: var(--accent-soft); color: var(--accent); border-color: #c7d0ff; }
+.tag-info { background: var(--line-soft); color: var(--fg-dim); border-color: var(--line); }
+
+/* ── 输出面板 ───────────────────────────────────────────────────────── */
+.output { display: flex; flex-direction: column; min-height: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.output-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 7px 12px; background: var(--line-soft); border-bottom: 1px solid var(--line);
+  font-size: 12.5px; color: var(--fg-dim);
+}
+.output pre {
+  margin: 0; padding: 10px 12px; overflow: auto; flex: 1;
+  font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+  background: #fcfcfd; min-height: 80px; max-height: 100%;
+}
+.output .l-sys { color: var(--accent); }
+.output .l-err { color: var(--err); }
+.output .l-ok { color: var(--ok); }
+
+/* ── 结果条 ─────────────────────────────────────────────────────────── */
+.verdict { padding: 9px 12px; border-radius: 8px; font-size: 13px; display: none; }
+.verdict.show { display: block; }
+.verdict.ok { background: #eaf7ee; color: var(--ok); border: 1px solid #bfe3c9; }
+.verdict.bad { background: var(--err-soft); color: var(--err); border: 1px solid #f0c2c6; }
+.verdict.warn { background: #fff8e6; color: var(--warn); border: 1px solid #f2e0a8; }
+
+/* ── 模态确认 ───────────────────────────────────────────────────────── */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 2000;
+  background: rgba(16, 20, 26, .38);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.modal {
+  width: min(560px, 100%); background: #fff; border-radius: var(--radius);
+  box-shadow: 0 18px 48px rgba(16, 20, 26, .22); padding: 20px 22px 16px;
+}
+.modal-title { font-weight: 600; font-size: 15px; margin-bottom: 8px; }
+.modal-body { color: var(--fg-dim); white-space: pre-wrap; }
+.modal-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+

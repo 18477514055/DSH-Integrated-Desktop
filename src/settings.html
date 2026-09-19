@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>设置 · DSH 集成桌面端</title>
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:;">
+<link rel="stylesheet" href="shell-ui.css">
+<style>
+  header.top {
+    flex: none; display: flex; align-items: center; gap: 12px;
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+  }
+  header.top .whale { width: 30px; height: 30px; animation: none; }
+  header.top h1 { font-size: 15px; font-weight: 600; margin: 0; flex: 1; }
+  header.top .ver { color: var(--fg-faint); font-size: 12px; font-weight: 400; margin-left: 6px; }
+
+  main { flex: 1; min-height: 0; display: grid; grid-template-columns: 168px 1fr; }
+  nav {
+    border-right: 1px solid var(--line); padding: 14px 8px; background: #fcfcfd;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  nav button {
+    text-align: left; padding: 8px 12px; border: 0; border-radius: 8px;
+    background: transparent; cursor: pointer; color: var(--fg-dim);
+  }
+  nav button:hover { background: var(--line-soft); }
+  nav button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+
+  .panes { min-height: 0; overflow: auto; padding: 20px 22px 26px; }
+  .pane { display: none; }
+  .pane.on { display: block; }
+  .pane h2 { font-size: 14px; margin: 0 0 4px; }
+  .pane .hint { color: var(--fg-faint); font-size: 12.5px; margin: 0 0 16px; }
+
+  .row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 11px 0; border-bottom: 1px solid var(--line-soft);
+  }
+  .row:last-child { border-bottom: 0; }
+  .row .k { width: 150px; flex: none; color: var(--fg-dim); font-size: 13px; }
+  .row .v { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
+  .row .v input[type=text], .row .v input[type=number] {
+    flex: 1; min-width: 0; padding: 6px 10px; font: inherit;
+    border: 1px solid var(--line); border-radius: 8px; background: #fff;
+  }
+  .row .mono { font-family: var(--mono); font-size: 12px; word-break: break-all; color: #3d444d; }
+  .row .note { color: var(--fg-faint); font-size: 12px; }
+  label.sw { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+  label.sw input { width: 15px; height: 15px; accent-color: var(--accent); }
+
+  .diag-grid { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 14px; align-items: start; }
+  @media (max-width: 860px) { .diag-grid { grid-template-columns: 1fr; } }
+  .diag-grid .output { max-height: 56vh; position: sticky; top: 0; }
+  .about p { margin: 0 0 8px; color: var(--fg-dim); }
+  .about .kv { display: grid; grid-template-columns: 128px 1fr; gap: 4px 10px; font-size: 12.5px; margin: 12px 0 18px; }
+  .about .kv dt { color: var(--fg-faint); }
+  .about .kv dd { margin: 0; font-family: var(--mono); font-size: 12px; word-break: break-all; }
+  .saved { color: var(--ok); font-size: 12px; opacity: 0; transition: opacity .2s; }
+  .saved.on { opacity: 1; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <svg class="whale" viewBox="0 0 50 50" aria-hidden="true">
+    <rect class="w-bg" x="0" y="0" width="50" height="50"></rect>
+    <g class="w-g">
+      <path class="w-body"></path>
+      <path class="w-belly"></path>
+      <path class="w-eye"></path>
+      <path class="w-spout"></path>
+    </g>
+  </svg>
+  <h1>设置<span class="ver" id="ver"></span></h1>
+  <span class="saved" id="saved">已保存</span>
+  <button class="btn" id="btn-close">关闭</button>
+</header>
+
+<main>
+  <nav>
+    <button data-pane="general" class="on">常规</button>
+    <button data-pane="diag">诊断与修复</button>
+    <button data-pane="about">关于</button>
+  </nav>
+
+  <div class="panes">
+    <!-- ── 常规 ─────────────────────────────────────────────── -->
+    <section class="pane on" data-pane="general">
+      <h2>常规</h2>
+      <p class="hint">改这里不影响内核，只影响外壳自己的行为。</p>
+
+      <div class="row">
+        <div class="k">关闭窗口时</div>
+        <div class="v">
+          <label class="sw"><input type="checkbox" id="set-closeToTray"> 最小化到托盘（不退出）</label>
+        </div>
+      </div>
+      <div class="row">
+        <div class="k">内核端口</div>
+        <div class="v">
+          <input type="number" id="set-port" min="1024" max="65535" step="1" style="max-width:140px">
+          <span class="note">改完需要重启内核（设置 → 诊断与修复 → 重启内核）</span>
+        </div>
+      </div>
+      <div class="row">
+        <div class="k">内核档案</div>
+        <div class="v"><span class="mono" id="set-profile">—</span>
+          <span class="note">切档案请用「诊断与修复」里的纯净启动 / 退出纯净模式</span></div>
+      </div>
+      <div class="row">
+        <div class="k">工作目录</div>
+        <div class="v">
+          <input type="text" id="set-workspace" spellcheck="false">
+          <button class="btn" id="btn-pick-ws">浏览…</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="k">DSH_HOME</div>
+        <div class="v">
+          <span class="mono" id="set-dshhome">—</span>
+          <button class="btn" id="btn-open-home">打开</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="k">日志目录</div>
+        <div class="v">
+          <span class="mono" id="set-logdir">—</span>
+          <button class="btn" id="btn-open-logs">打开</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 诊断与修复 ───────────────────────────────────────── -->
+    <section class="pane" data-pane="diag">
+      <h2>诊断与修复</h2>
+      <p class="hint">
+        这里和加载页底部的抽屉是**同一份清单**（都来自主进程的动作白名单）。
+        标了「会中断」的会先弹确认 —— 它们会打断正在生成的回答。
+      </p>
+      <div class="diag-grid">
+        <div>
+          <div class="verdict" id="verdict"></div>
+          <div class="actions" id="actions" style="margin-top:10px"></div>
+        </div>
+        <div class="output">
+          <div class="output-head"><span>输出</span><button class="btn" id="btn-clear">清空</button></div>
+          <pre id="out"></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 关于 ─────────────────────────────────────────────── -->
+    <section class="pane" data-pane="about">
+      <div class="about">
+        <h2>关于</h2>
+        <p>DSH 集成桌面端 —— 把官方 DeepSeek Harness 内核装进原生 Electron 外壳。</p>
+        <p>外壳只负责窗口、托盘与进程管理，<b>不改内核的任何文件</b>；内核由外部独立管理，因此升级内核不需要动外壳。</p>
+        <dl class="kv" id="about-kv"></dl>
+        <button class="btn" id="btn-copy-diag">复制诊断信息</button>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script src="shell-ui.js"></script>
+<script src="settings.js"></script>
+</body>
+</html>
