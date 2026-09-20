@@ -430,6 +430,47 @@ function findMarkerOnDisk(home, marker) {
           hasSearch: !!search, query: search ? search.value : null,
           pills, items: items.length, names, groups,
           empty: empty ? empty.textContent : null,
+          // ★ 真正管"看得见"的度量（2026-09-20 用户实测暴露）：
+          //   裁切是**绘制期**的事，getBoundingClientRect() 拿到的是**未裁切**的几何
+          //   ⇒ 光比矩形证明不了可见。用 elementFromPoint 问一句"这一点上最上面的是谁"：
+          //   被祖先 overflow 裁掉、或被别的层盖住时，命中的会是**别的东西**。
+          //   （这正是用户报的"重启了也看不到搜索框"——DOM 里有、屏幕上没有。）
+          menuGeom: (function () {
+            const menu = row.querySelector('.dshms-modelmenu');
+            if (!menu) return null;
+            const cs = getComputedStyle(menu);
+            const mr = menu.getBoundingClientRect();
+            let visSearch = null, hitTag = null, searchRect = null, cx = null, cy = null;
+            let hitOuter = null, hitInPanel = null, hitCtx = null;
+            if (search) {
+              const r = search.getBoundingClientRect();
+              searchRect = { t: Math.round(r.top), l: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) };
+              cx = Math.round(r.left + r.width / 2); cy = Math.round(r.top + r.height / 2);
+              const inside = cx >= 0 && cy >= 0 && cx < innerWidth && cy < innerHeight;
+              const hit = inside ? document.elementFromPoint(cx, cy) : null;
+              hitTag = hit ? (String(hit.tagName) + '.' + String(hit.className || '')).slice(0, 70)
+                           : (inside ? 'null' : '点在视口外');
+              hitOuter = hit ? String(hit.outerHTML || '').slice(0, 160) : null;
+              hitInPanel = hit ? !!hit.closest('.dshms-panel') : null;
+              hitCtx = hit ? (function () {
+                const out = [];
+                let el = hit;
+                for (let i = 0; el && i < 8; i++, el = el.parentElement) {
+                  const s = getComputedStyle(el);
+                  out.push(String(el.tagName) + '.' + String(el.className || '').slice(0, 24)
+                    + '[z=' + s.zIndex + ',pos=' + s.position + ']');
+                }
+                return out;
+              })() : null;
+              visSearch = !!(hit && (hit === search || search.contains(hit) || hit.contains(search)));
+            }
+            return {
+              position: cs.position, boxSizing: cs.boxSizing,
+              top: Math.round(mr.top), bottom: Math.round(mr.bottom), h: Math.round(mr.height),
+              vh: innerHeight, vw: innerWidth, visSearch, hitTag, searchRect, cx, cy,
+              hitOuter, hitInPanel, hitCtx,
+            };
+          })(),
           panelOpen: !!document.querySelector('.dshms-panel'),
           store: window.__dshMultiSession ? { open: window.__dshMultiSession.state().open, popover: window.__dshMultiSession.state().popover } : null
         });
@@ -437,6 +478,17 @@ function findMarkerOnDisk(home, marker) {
 
       const mo = JSON.parse(await cdpEval(ws, dumpModelMenu));
       check("模型下拉里有搜索框", mo.hasSearch === true, "");
+      // ★ 这三条是"看得见"的断言 —— 见 dumpModelMenu 里 menuGeom 的注释。
+      //   旧写法（absolute + bottom:120% + 三层 overflow 祖先）会让第 2、3 条 FAIL。
+      check("模型下拉用 fixed 定位（不再被 overflow 祖先裁切）",
+        !!(mo.menuGeom && mo.menuGeom.position === "fixed"),
+        mo.menuGeom ? `${mo.menuGeom.position}  top=${mo.menuGeom.top} bottom=${mo.menuGeom.bottom} vh=${mo.menuGeom.vh}` : "拿不到几何");
+      check("搜索框真的画在屏幕上（该点上最上面就是它，没被裁也没被盖）",
+        !!(mo.menuGeom && mo.menuGeom.visSearch === true),
+        mo.menuGeom ? `命中=${mo.menuGeom.visSearch}  该点上最上面是 ${mo.menuGeom.hitTag} (在弹窗内=${mo.menuGeom.hitInPanel})\n        outerHTML: ${mo.menuGeom.hitOuter}\n        祖先链: ${(mo.menuGeom.hitCtx || []).join(" < ")}  搜索框矩形=${JSON.stringify(mo.menuGeom.searchRect)} 问的点=(${mo.menuGeom.cx},${mo.menuGeom.cy})` : "拿不到几何");
+      check("下拉完整落在视口内（没有一半在屏幕外）",
+        !!(mo.menuGeom && mo.menuGeom.top >= 0 && mo.menuGeom.bottom <= mo.menuGeom.vh),
+        mo.menuGeom ? `top=${mo.menuGeom.top} bottom=${mo.menuGeom.bottom} 高=${mo.menuGeom.h} 视口高=${mo.menuGeom.vh} box-sizing=${mo.menuGeom.boxSizing}` : "拿不到几何");
       check("模型下拉列出了真实模型目录（≥1 个模型 + 默认项）", mo.items >= 2, `${mo.items} 项`);
       check("有来源筛选胶囊（全部 + 各来源，且带条数）", mo.pills.length >= 2,
         `${mo.pills.length} 颗: ${mo.pills.slice(0, 5).map((p) => p.text).join(" | ")}`);

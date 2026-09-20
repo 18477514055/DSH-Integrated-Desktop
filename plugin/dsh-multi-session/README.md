@@ -158,3 +158,6 @@ npm run plugin:revert      # 回滚：从备份恢复 + 删联接
 | 槽位注册失败被静默吞掉 | bundle 加载了、界面一个挂载点都没有且不报错 | `dsh-crosshub` 源码里的事故注释；本插件用 `diagnostics` 记录 |
 | 结果出来后**没清 `notice`** | 上一阶段的提示（"正在上传附件…"）残留在结果视图上方，**排查时把人引偏** | 本轮真发生：我一度以为还卡在上传那一步，而磁盘证明早已发出去 |
 | 验证脚本用固定 `sleep` 找按钮 | "页面在了但槽位还没渲染完"⇒ 假 FAIL（实测 4 连跑里出现 1 次） | 改成**轮询等按钮出现**（45 秒上限） |
+| **把下拉菜单用 `absolute` 放进 `overflow` 容器** | 菜单**被从顶部裁掉**：DOM 里有搜索框、屏幕上没有（用户报"重启了也看不到"）。祖先链上有**三层** overflow：`.dshms-body`(auto) → `.dshms-row`(hidden) → `.dshms-panel`(hidden)，而菜单是**向上弹**的，搜索框正好在最顶部 | 用户实测；改成 `position:fixed` + 按钮的 `getBoundingClientRect()` 定位，见 `menuStyle()` |
+| 只用 `getBoundingClientRect()` 判"看得见" | **假 PASS**：它返回的是**未裁切**的几何 —— 元素被祖先裁掉也照样给出正常矩形 | 改用 `elementFromPoint()` 问"这一点上最上面的是谁"：被裁/被盖住时命中别的元素 |
+| 在 `plugin-check.js` 的**模板字符串里写 Markdown 反引号** | `SyntaxError: Unexpected identifier` —— 反引号把外层 Node 模板字面量**截断**了 | 本轮真踩：注释里的 `` `getBoundingClientRect()` `` 直接把脚本写坏。模板字符串内部**不许出现反引号** |

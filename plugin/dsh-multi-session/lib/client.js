@@ -62,6 +62,7 @@ window.__ModuleLoader__.load({
     "use strict";
 
     const React = require("react");
+    const ReactDOM = require("react-dom");
     const P = require("@deepseek-ai/dsh-client-ui-primitives");
     const h = React.createElement;
     const { useState, useEffect, useRef, useCallback, useMemo } = React;
@@ -231,7 +232,7 @@ window.__ModuleLoader__.load({
     // ─────────────────────────────────────────────────────────────────────
     const CSS = `
 .dshms-mask{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;background:rgba(0,0,0,.45)}
-.dshms-panel{width:min(1080px,94vw);max-height:88vh;display:flex;flex-direction:column;
+.dshms-panel{width:min(1320px,96vw);max-height:93vh;display:flex;flex-direction:column;
   background:var(--dsw-alias-bg-layer-1,#1c1d21);color:var(--dsw-alias-label-primary,#e8e8ea);
   border:1px solid var(--dsw-alias-border-l2,#36373b);border-radius:14px;
   box-shadow:0 18px 60px rgba(0,0,0,.45);overflow:hidden}
@@ -259,7 +260,10 @@ window.__ModuleLoader__.load({
 .dshms-hint{font-size:12px;opacity:.6}
 .dshms-err{color:var(--dsw-alias-state-error-primary,#ff6b6b);font-size:12px}
 .dshms-ok{color:var(--dsw-alias-state-success-primary,#4ade80);font-size:12px}
-.dshms-menu{position:absolute;z-index:70;min-width:260px;max-width:520px;max-height:260px;overflow:auto;
+/* 定位由内联 style 的 menuStyle() 给（默认 position:fixed —— 见那里的注释：
+   absolute 会被 .dshms-body / .dshms-row / .dshms-panel 三层的 overflow 裁掉，
+   模型菜单的搜索框在最顶部，首当其冲）。这里的 absolute 只是**兜底**。 */
+.dshms-menu{position:absolute;z-index:70;box-sizing:border-box;min-width:260px;max-width:520px;max-height:min(48vh,460px);overflow:auto;
   background:var(--dsw-alias-bg-layer-1,#1c1d21);border:1px solid var(--dsw-alias-border-l2,#36373b);
   border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.4);padding:4px}
 .dshms-menu-item{display:flex;align-items:baseline;gap:8px;padding:6px 9px;border-radius:7px;cursor:pointer;font-size:12.5px}
@@ -283,7 +287,7 @@ window.__ModuleLoader__.load({
   opacity:.75;cursor:pointer;white-space:nowrap}
 .dshms-pill:hover{opacity:1;background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.06))}
 .dshms-pill[data-on="1"]{background:#4d6bfe;border-color:#4d6bfe;color:#fff;opacity:1}
-.dshms-menulist{max-height:290px;overflow:auto;padding:4px}
+.dshms-menulist{max-height:min(46vh,440px);overflow:auto;padding:4px}
 .dshms-group{font-size:11px;font-weight:600;opacity:.55;padding:7px 9px 3px}
 .dshms-res{display:flex;flex-direction:column;gap:8px;font-size:13px}
 .dshms-res-row{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--dsw-alias-border-l2,#36373b);border-radius:9px;padding:9px 11px}
@@ -816,6 +820,39 @@ window.__ModuleLoader__.load({
     // ─────────────────────────────────────────────────────────────────────
     // 组件：一行输入框
     // ─────────────────────────────────────────────────────────────────────
+    /**
+     * 下拉菜单（工作区 / 模型）的定位。
+     *
+     * ★ 为什么用 `position:fixed` 而不是 `absolute`（2026-09-20 用户实测暴露的真 bug）：
+     *   原来的写法是 `absolute; bottom:120%`（向上弹），而祖先链上有**三层** overflow：
+     *   `.dshms-body`(auto) → `.dshms-row`(hidden) → `.dshms-panel`(hidden)
+     *   ⇒ 菜单超出部分被**从顶部裁掉**，而**模型菜单的搜索框正好在最顶部**，
+     *   症状就是用户说的"重启了也看不到搜索框、列表展不开、像被周围 UI 挡住"。
+     *   `fixed` 的包含块是视口，不受非 transform 祖先的 overflow 裁切
+     *   （祖先链上没有 transform —— 同层的 `.dshms-mask` 本来就是 `fixed;inset:0` 且显示正常，
+     *    所以视口坐标可靠）。
+     *   拿不到坐标时退回原来的 absolute（至少还能用）。
+     */
+    function menuStyle(anchor, kind) {
+      if (!anchor) return { position: "absolute", bottom: "120%", left: 0 };
+      const PAD = 8;
+      const wantW = kind === "model" ? 460 : 320;   // 与 CSS 的 min/max-width 对齐
+      const wantH = kind === "model" ? 440 : 300;
+      const vw = window.innerWidth || 1280;
+      const vh = window.innerHeight || 800;
+      const left = Math.max(PAD, Math.min(anchor.left, vw - wantW - PAD));
+      const roomBelow = vh - anchor.bottom - PAD;
+      const roomAbove = anchor.top - PAD;
+      // 下面放得下就往下弹，否则往上弹 —— 哪边宽敞用哪边，不再一律向上
+      const below = roomBelow >= Math.min(wantH, 240) || roomBelow >= roomAbove;
+      const maxHeight = Math.max(160, Math.min(wantH, below ? roomBelow : roomAbove));
+      return below
+        ? { position: "fixed", top: Math.round(anchor.bottom + 6), left: Math.round(left),
+            maxHeight: Math.round(maxHeight), zIndex: 80 }
+        : { position: "fixed", bottom: Math.round(vh - anchor.top + 6), left: Math.round(left),
+            maxHeight: Math.round(maxHeight), zIndex: 80 };
+    }
+
     function RowView(props) {
       const { ctx, row, index, total, models, workspaces, popover } = props;
       const taRef = useRef(null);
@@ -827,9 +864,15 @@ window.__ModuleLoader__.load({
       //    把所有已写内容一起丢掉 —— 这是本轮顺手修掉的一个真 bug）。
       const showModels = !!(popover && popover.rowKey === row.key && popover.kind === "model");
       const showCwd = !!(popover && popover.rowKey === row.key && popover.kind === "cwd");
-      const openPop = (kind) => {
+      const openPop = (kind, el) => {
         const same = popover && popover.rowKey === row.key && popover.kind === kind;
-        set({ popover: same ? null : { rowKey: row.key, kind } });
+        // ★ 记下按钮的**视口坐标**：下拉用 position:fixed 定位，靠它算位置
+        //   （为什么不能用 absolute，见 menuStyle 的注释）
+        const r = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+        set({ popover: same ? null : {
+          rowKey: row.key, kind,
+          anchor: r ? { top: r.top, bottom: r.bottom, left: r.left, right: r.right } : null,
+        } });
       };
       const closePop = () => set({ popover: null });
 
@@ -970,14 +1013,14 @@ window.__ModuleLoader__.load({
             h(P.Button, {
               variant: "ghost", size: "sm", icon: h(P.IconFolderOpenOutline16, null),
               title: "这一行在哪个工作区开工",
-              onClick: () => openPop("cwd"),
+              onClick: (e) => openPop("cwd", e.currentTarget),
               children: (function () {
                 const w = (workspaces || []).find((x) => x.workspaceId === row.workspaceId);
                 if (w) return w.title;
                 return row.cwd ? baseName(row.cwd) : "默认工作区";
               })(),
             }),
-            showCwd ? h("div", { className: "dshms-menu", style: { position: "absolute", bottom: "120%", left: 0 } },
+            showCwd ? h("div", { className: "dshms-menu", style: menuStyle(popover.anchor, "cwd") },
               h("div", {
                 className: "dshms-menu-item", "data-active": !row.workspaceId ? "1" : "0",
                 onClick: () => { setRow(row.key, { workspaceId: null }); closePop(); },
@@ -1002,10 +1045,10 @@ window.__ModuleLoader__.load({
             h(P.Button, {
               variant: "ghost", size: "sm", icon: h(P.IconChevronDownOutline14, null),
               title: "这一行用哪个模型（可搜索、可按来源筛选）",
-              onClick: () => openPop("model"),
+              onClick: (e) => openPop("model", e.currentTarget),
               children: modelLabel,
             }),
-            showModels ? h("div", { className: "dshms-menu dshms-modelmenu", style: { position: "absolute", bottom: "120%", left: 0 } },
+            showModels ? h("div", { className: "dshms-menu dshms-modelmenu", style: menuStyle(popover.anchor, "model") },
               // ── 搜索框（与官方菜单里那个同一套语义与视觉）──
               h("div", { className: "dshms-searchwrap" },
                 h("input", {
@@ -1219,7 +1262,16 @@ window.__ModuleLoader__.load({
       //   自己画遮罩就没有这个第二来源：Esc 只由我这一处决定（见上面 effect 里的三级优先顺序）。
       //   覆盖能力不受影响：`.dshms-mask` 是 `position:fixed; inset:0; z-index:9999`。
       //   另外遮罩**故意不响应点击关闭** —— 点空白就丢草稿太容易误触。
-      return h("div", { className: "dshms-mask", tabIndex: -1 },
+      //
+      // ★★ 为什么要 portal 到 `document.body`（2026-09-20 用户实测暴露的**第二个**真 bug）：
+      //   本插件注册在 `shell.overlay` 槽位，而**那一层是 z-index:20**
+      //   ⇒ 任何 z-index > 20 的官方 UI 都会**盖在我们弹窗上面**。实测抓到的活例：
+      //   官方那个"0.1 开发者预览"对话框是 `position:fixed; z-index:1000`，它正好压住
+      //   模型下拉的搜索框 —— 在搜索框中心做 `elementFromPoint` 命中的是它的 `<p>`，
+      //   而不是我们的 input。用户的原话就是"还会被周围的 UI 阻挡住"。
+      //   挂到 body 之后，遮罩直接在**根层叠上下文**里跟官方对话框比大小（9999 > 1000）；
+      //   而且 body 上没有 transform ⇒ 里面那些 `position:fixed` 下拉的坐标与视口严格一致。
+      const mask = h("div", { className: "dshms-mask", tabIndex: -1 },
           h("div", { className: "dshms-panel", role: "dialog", "aria-modal": "true", "aria-label": "多会话同时开工" },
             h("div", { className: "dshms-head" },
               h("h2", { className: "dshms-title" }, "多会话同时开工"),
@@ -1232,6 +1284,8 @@ window.__ModuleLoader__.load({
             h("div", { className: "dshms-foot" }, foot),
           ),
       );
+      // 理论上 `document.body` 一定在；真拿不到就退回原地渲染，至少还能用
+      return document.body ? ReactDOM.createPortal(mask, document.body) : mask;
     }
 
     // ─────────────────────────────────────────────────────────────────────
