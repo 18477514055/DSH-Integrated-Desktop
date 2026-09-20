@@ -28,6 +28,11 @@
  *   node scripts/install-plugin.js --status        # 只读：现在装没装、装的是哪个路径
  *   node scripts/install-plugin.js --apply --home "C:\别的\dsh-home"
  *
+ *   ★ 装**别的**插件（2026-09-20 泛化；默认仍是 dsh-multi-session，行为完全不变）：
+ *   node scripts/install-plugin.js --plugin dsh-mobile-remote --status
+ *   node scripts/install-plugin.js --plugin dsh-mobile-remote --apply
+ *   node scripts/install-plugin.js --plugin dsh-mobile-remote --revert
+ *
  * 退出码：0=成功  2=参数/环境问题  3=预检失败  4=落盘失败
  */
 const fs = require("node:fs");
@@ -35,13 +40,21 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
-const PLUGIN_NAME = "dsh-multi-session";
-const REPO = path.join(__dirname, "..");
-const PLUGIN_SRC = path.join(REPO, "plugin", PLUGIN_NAME);
-
 const argv = process.argv.slice(2);
 const has = (f) => argv.includes(f);
 const val = (f, d) => { const i = argv.indexOf(f); return i >= 0 && argv[i + 1] ? argv[i + 1] : d; };
+
+/**
+ * 插件名：默认仍是 dsh-multi-session（**向后兼容**，老的 `npm run plugin:*`
+ * 与既有调用行为一字不变）。
+ *
+ * 为什么允许 `--plugin`：本仓库现在有不止一个客户端插件，而"装一个插件要同时改三处"
+ * 对所有插件是同一套逻辑。复制一份脚本只会让两处以后分叉
+ * （项目 AGENTS.md 的规矩：装/验/退只走脚本，不手敲）。
+ */
+const PLUGIN_NAME = val("--plugin", "dsh-multi-session");
+const REPO = path.join(__dirname, "..");
+const PLUGIN_SRC = path.join(REPO, "plugin", PLUGIN_NAME);
 
 const APPLY = has("--apply");
 const REVERT = has("--revert");

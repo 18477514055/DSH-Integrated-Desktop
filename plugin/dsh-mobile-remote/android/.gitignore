@@ -1,0 +1,9 @@
+# Gradle / Android 生成物（**不要提交，也不要传给别人**）
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/

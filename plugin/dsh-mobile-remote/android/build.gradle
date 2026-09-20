@@ -1,0 +1,21 @@
+// ═══════════════════════════════════════════════════════════════════
+// 手机遥控 · Android 壳工程（根 build.gradle）
+//
+// 设计取向：**零第三方依赖**。
+//   · 不用 AppCompat / Material / Kotlin —— 只用 Android 平台自带的东西，
+//     这样任何一台装了 Android Studio 的机器都能直接编，
+//     不会卡在"下载某个库失败"上。
+//   · 因此 MainActivity 继承的是 `android.app.Activity`，主题用的是
+//     平台自带的 `Theme.DeviceDefault.NoActionBar`。
+//
+// ★ 版本对齐（2026-09-20 实测确定，不是抄来的）：
+//   本机 SDK 只装了 **platform android-37.0**（= Android 17）与 **build-tools 36.0.0**，
+//   而 **API 37 需要 AGP 9.x**。实测 AGP 的 POM 里 `gradle-api` 与自身同版本号
+//   （`com.android.tools.build:gradle:9.4.1` → 依赖 `gradle:9.4.1`），
+//   所以 AGP 与 Gradle **都取 9.4.1**，避免版本错配。
+//   （原先写的是 AGP 8.1.4 + compileSdk 34 —— 本机没有 android-34，会直接失败。）
+// ═══════════════════════════════════════════════════════════════════
+
+plugins {
+    id 'com.android.application' version '9.4.1' apply false
+}

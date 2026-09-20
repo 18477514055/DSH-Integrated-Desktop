@@ -68,3 +68,13 @@
 # 漏掉它的后果不是"少个文件"，而是**提交出去的是坏的插件**。
 # git 的规则：父目录被放行了，这里才能再把它捞回来 —— 所以 `!/plugin/` 必须先存在。
 !/plugin/**/cordis.patch.yml
+
+# ── 插件的 Android 工程：只收源码，**不收 Gradle 构建产物** ──────────────
+# `plugin/dsh-mobile-remote/android/` 里的 .gradle 缓存与 build/ 中间件约 4.1 MB，
+# 而且有 **232 字符深**的路径（超过 Windows 260 的经典上限，cpSync 真会失败）。
+# 这些都是**可再生的构建产物**，对人没有价值。
+# ★ 打包侧用 extraResources 的 filter 排掉的是同样三个目录 —— 两处必须一致，
+#   否则会出现"仓库里有、exe 里没有"（或反过来）的鬼打墙。
+**/android/.gradle/
+**/android/build/
+**/android/app/build/

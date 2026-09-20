@@ -1,7 +1,7 @@
 {
   "name": "dsh-integrated-desktop",
   "productName": "DSH Integrated",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "DSH 集成桌面端 —— 把官方 DeepSeek Harness 内核装进原生 Electron 外壳。外壳只负责窗口/托盘/原生体验与自有设置页，内核由外部独立管理，升级内核不需要动外壳。",
   "main": "src/main.js",
   "author": "陈黛华 / 18477514055 (https://github.com/18477514055)",
@@ -31,6 +31,7 @@
     "plugin:status": "node scripts/install-plugin.js --status",
     "plugin:install": "node scripts/install-plugin.js --apply",
     "plugin:revert": "node scripts/install-plugin.js --revert",
+    "provision:check": "node scripts/provision-check.js",
     "postinstall": "node scripts/check-kernel.js"
   },
   "devDependencies": {
@@ -47,7 +48,6 @@
     },
     "files": [
       "src/**/*",
-      "plugin/**/*",
       "assets/**/*",
       "!**/*.map",
       "!**/*.bak-*",
@@ -56,7 +56,20 @@
       "!tools/**/*.ps1",
       "!**/node_modules/**/*"
     ],
-    "extraResources": [],
+    "extraResources": [
+      {
+        "from": "plugin",
+        "to": "plugins",
+        "filter": [
+          "**/*",
+          "!_retired",
+          "!_retired/**",
+          "!**/.gradle/**",
+          "!**/android/build/**",
+          "!**/android/app/build/**"
+        ]
+      }
+    ],
     "win": {
       "target": [
         {

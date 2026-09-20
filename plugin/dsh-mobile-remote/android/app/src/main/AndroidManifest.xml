@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  手机遥控 · 应用清单
+
+  权限说明（只有两个，都写清了为什么）：
+  · INTERNET       —— 要连电脑的局域网服务
+  · ACCESS_NETWORK_STATE —— 用来判断"现在是不是连在 Wi-Fi 上"，
+                        以便在移动数据下给出明确提示（而不是干等超时）
+
+  ★ 刻意**不要**的权限：存储、相机、位置、通讯录、后台服务……
+    本壳只是一个 WebView，网页里选图片走的是系统文件选择器
+    （不需要读存储权限），所以上面两个就是全部。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/AppTheme">
+
+        <!--
+          ★ usesCleartextTraffic="true" 是**必需**的：
+            手机端页面走的是 http://192.168.x.x:3110（明文）。
+            Android 9(API 28) 起默认禁止明文流量，不开这个开关
+            整个 App 会连不上、且报错很含糊。
+            代价要讲清楚：局域网内流量不加密（本插件本来就没有 TLS）。
+        -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+              ★ 扫码直接唤起本 App 的通道：自定义 scheme `dshmr://`。
+                电脑端弹窗里会**同时**给两个二维码：
+                  · 上面那个是 http 地址 —— 任何手机相机都能扫，开浏览器（没装 App 也能用）
+                  · 下面那个是 dshmr:// —— 装了本 App 就扫这个，直接进 App
+                为什么不用 http 直接唤起 App：Android 的 App Links 要求
+                https + 域名校验，局域网 IP + http **做不到**（这不是配置问题，
+                是平台限制）；自定义 scheme 不需要任何校验，扫到即唤起。
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="dshmr" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

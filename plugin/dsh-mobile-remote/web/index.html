@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0f1115" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<link rel="manifest" href="/manifest.webmanifest" />
+<link rel="stylesheet" href="/styles.css" />
+<title>手机遥控 · DSH</title>
+</head>
+<body>
+
+<!-- ══════════ ① 配对 ══════════ -->
+<section id="pairView" class="view">
+  <div class="card">
+    <div class="brand">📱</div>
+    <h1>手机遥控</h1>
+    <p class="sub">扫电脑上的二维码即可，或手输 8 位配对码。</p>
+    <form id="pairForm">
+      <input id="codeInput" inputmode="latin" autocomplete="off" autocapitalize="characters"
+             spellcheck="false" maxlength="8" placeholder="配对码" />
+      <button type="submit" class="btn primary">连接</button>
+    </form>
+    <p id="pairMsg" class="msg"></p>
+    <p class="hint">配对码 60 秒内有效、用过即废。<br />连不上时先确认手机与电脑在同一个 Wi-Fi。</p>
+  </div>
+</section>
+
+<!-- ══════════ ② 会话列表 ══════════ -->
+<section id="listView" class="view hidden">
+  <header class="bar">
+    <h2>会话</h2>
+    <button id="newSessionBtn" class="icon" title="新建会话">＋</button>
+    <button id="refreshBtn" class="icon" title="刷新">⟳</button>
+    <button id="menuBtn" class="icon" title="更多">⋯</button>
+  </header>
+  <div class="filterbar">
+    <input id="searchInput" class="search" type="search" placeholder="搜标题 / 工作区…" />
+  </div>
+  <div id="sessionList" class="list"></div>
+  <p id="listMsg" class="msg center"></p>
+</section>
+
+<!-- ══════════ ③ 会话详情 ══════════ -->
+<section id="detailView" class="view hidden">
+  <header class="bar">
+    <button id="backBtn" class="icon" title="返回">‹</button>
+    <div class="titlebox">
+      <h2 id="detailTitle">会话</h2>
+      <span id="detailSub" class="sub2"></span>
+    </div>
+    <button id="modelBtn" class="icon" title="切换模型">⚙</button>
+    <button id="cancelBtn" class="icon danger" title="中断当前任务">■</button>
+  </header>
+
+  <!-- 审批条：有审批请求时才出现 -->
+  <div id="approvalBar" class="approval hidden">
+    <div class="approval-text">
+      <b id="approvalTool">工具</b>
+      <span id="approvalReason"></span>
+    </div>
+    <div class="approval-actions">
+      <button id="approveBtn" class="btn small ok">允许</button>
+      <button id="rejectBtn" class="btn small no">拒绝</button>
+    </div>
+  </div>
+
+  <div id="messages" class="messages"></div>
+
+  <!-- 待发送的图片预览 -->
+  <div id="attachBar" class="attachbar hidden"></div>
+
+  <form id="promptForm" class="composer">
+    <button type="button" id="imageBtn" class="icon" title="发图片">🖼</button>
+    <button type="button" id="historyBtn" class="icon" title="历史输入">🕘</button>
+    <textarea id="promptInput" rows="1" placeholder="发消息…（回车换行）"></textarea>
+    <button type="submit" class="btn primary" id="sendBtn">发送</button>
+  </form>
+  <input id="fileInput" type="file" accept="image/*" multiple hidden />
+</section>
+
+<!-- ══════════ 抽屉：模型 / 工作区 / 历史 / 菜单 ══════════ -->
+<div id="sheet" class="sheet hidden">
+  <div class="sheet-mask" data-close="1"></div>
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <h3 id="sheetTitle">标题</h3>
+      <button class="icon" data-close="1">✕</button>
+    </div>
+    <div id="sheetBody" class="sheet-body"></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  主题：刻意只用**平台自带**的 DeviceDefault。
+  为什么不用 Material/AppCompat：那会引入第三方依赖，破坏本工程
+  "任何装了 SDK 的机器都能直接编"的前提。
+  深色是为了和手机端页面（#0f1115）接得上，避免白闪。
+-->
+<resources>
+    <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">#0f1115</item>
+        <item name="android:statusBarColor">#0f1115</item>
+        <item name="android:navigationBarColor">#0f1115</item>
+    </style>
+</resources>

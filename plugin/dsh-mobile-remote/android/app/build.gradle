@@ -1,0 +1,36 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.dsh.mobileremote'
+
+    // ★ 本机只装了 android-37.0（实测 `platforms/` 下仅此一个），
+    //   所以 compileSdk 必须用 37 —— 写 34 会直接报"platform not found"。
+    compileSdk 37
+
+    defaultConfig {
+        applicationId "com.dsh.mobileremote"
+        minSdk 24            // Android 7.0：覆盖足够老的真机
+        targetSdk 37
+        versionCode 1
+        versionName "0.2.0"
+    }
+
+    buildTypes {
+        release {
+            // ★ 刻意不开混淆：这个壳只有几个类，混淆收益为零，
+            //   而一旦 WebView 的 JS 桥被改名，排查起来非常痛苦。
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        // 本机 JDK 是 25（Android Studio 自带 JBR），用 17 作目标级别最稳。
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// ★ 没有 dependencies 块 —— 本工程**零第三方依赖**，见根 build.gradle 的说明。

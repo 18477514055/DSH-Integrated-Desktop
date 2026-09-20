@@ -42,6 +42,7 @@ const os = require("node:os");
 
 const K = require("./kernel");
 const diagnostics = require("./diagnostics");
+const P = require("./plugins");
 const WHALE = require("./whale-path.json");
 
 // ── 最早期的错误捕获 ──────────────────────────────────────────────
@@ -161,6 +162,57 @@ function getDshHome() {
     userDataDir: app.getPath("userData"),
     useSystemDefault: settings.useSystemDshHome === true,
   });
+}
+
+// ── 内置插件（见 src/plugins.js 的完整说明）───────────────────────
+//
+// 用户装完 exe 就该能用 —— 不许他再敲命令装插件。这里在**内核启动前后**各做一次：
+//   · 启动前：profile 已存在（绝大多数情况）⇒ 装好再起内核，一步到位、零重启。
+//   · 启动后：全新机器上 profile 是内核刚建的 ⇒ 补装，然后重启一次内核让它生效。
+//
+// ★ 只有**打包版**默认开启。开发机（`npm start`）默认不动，免得把
+//   install-plugin.js 建的开发用联接（→ 仓库目录）悄悄改写掉。
+//   想验证打包行为：设 DSH_BUNDLED_PLUGINS=auto 即可强制打开。
+function bundledPluginsRoot() {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "plugins")
+    : path.join(__dirname, "..", "plugin");
+}
+
+function bundledPluginsEnabled() {
+  const env = String(process.env.DSH_BUNDLED_PLUGINS || "").toLowerCase();
+  if (env === "off" || env === "0" || env === "false") return false;
+  if (env === "auto" || env === "1" || env === "true") return true;
+  return app.isPackaged === true;
+}
+
+/**
+ * 跑一次内置插件落位。**只改磁盘，绝不重启内核**（重启由调用方决定）。
+ * 任何异常都吞掉并记日志 —— 内置插件失败不该让用户连客户端都打不开。
+ */
+function provisionPlugins(tag) {
+  if (!bundledPluginsEnabled()) {
+    log(`[内置插件/${tag}] 跳过（未打包且未显式开启）`);
+    return { ok: false, skipped: true, changed: [], pending: null, plugins: [], errors: [] };
+  }
+  try {
+    const r = P.provision({
+      dshHome: getDshHome(),
+      profile: settings.profile || "web",
+      srcRoot: bundledPluginsRoot(),
+      dev: !app.isPackaged,
+      appVersion: app.getVersion(),
+      log: (m) => log(`[内置插件/${tag}] ${m}`),
+    });
+    log(`[内置插件/${tag}] ok=${r.ok} pending=${r.pending || "-"} `
+      + `plugins=[${r.plugins.join(",")}] changed=[${r.changed.join(",")}] `
+      + `errors=[${r.errors.join(" | ")}]`);
+    return r;
+  } catch (e) {
+    const msg = (e && e.message) || String(e);
+    log(`[内置插件/${tag}] 异常（已忽略，不影响启动）: ${msg}`);
+    return { ok: false, changed: [], pending: null, plugins: [], errors: [msg] };
+  }
 }
 
 // ── 加载页（白底黑鲸鱼 + 进度条 + 诊断修复抽屉）────────────────────
@@ -1092,8 +1144,30 @@ async function bootstrap() {
 
   if (!SMOKE) { try { createTray(); } catch (e) { log("托盘创建失败:", e && e.message); } }
 
+  // ★ 内置插件（第一趟）：绝大多数情况下 profile 已经在了 —— 装好再起内核，
+  //   内核第一次读 profile 就能看到它们，**不需要任何重启**。
+  const preProvision = provisionPlugins("boot-pre");
+
   try {
     await ensureServer();
+
+    // ★ 内置插件（第二趟）：全新机器上 profile 是内核**刚刚创建**的，
+    //   第一趟只能报 pending="profile-missing"。这里补装，然后重启一次内核
+    //   让它重读 profile —— 用户装的第一个客户端，打开就该有插件。
+    //   只重启我们自己拉起的那一个；复用别人的内核时绝不打断（宁可他下次开才有）。
+    if (preProvision.pending === "profile-missing") {
+      const post = provisionPlugins("boot-post");
+      if (post.changed.length && serverOwned && !SMOKE) {
+        log(`内置插件首次就位（${post.changed.join(",")}），重启一次内核使其生效…`);
+        showStatus({
+          title: "正在装载内置插件…", stage: "重启内核…", stageKey: "config",
+          failed: false, detail: "", percent: 0,
+        });
+        stopOwnedKernel();
+        await ensureServer({ reuse: false });
+      }
+    }
+
     // ★ 修复：SMOKE 模式也必须先 loadURL(serverUrl) 再 runSmoke()。
     //   之前直接 runSmoke()，而窗口此时还停在外壳状态页，
     //   于是 did-finish-load 时 window.__DSH_BOOT__ 是 undefined，

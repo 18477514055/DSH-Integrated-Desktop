@@ -188,6 +188,7 @@ npm run dist         # 出 NSIS 安装包 + 便携版
 │   ├── ui-check.js         CDP 真跑真看验证界面（loading / inject / reuse / probe）
 │   ├── plugin-check.js     客户端插件的真跑验证（临时环境 + CDP + 磁盘交叉核对）
 │   ├── install-plugin.js   把插件装进 profile（可预演 / 可回滚 / **绝不重启内核**）
+│   ├── provision-check.js  ★ 内置插件落位逻辑的真跑验收（临时 DSH_HOME / 40 条断言）
 │   ├── boot-peek.js        对正在跑的内核只读取一次引导载荷（看哪些插件真的被公告）
 │   ├── platform-modules.js 从官方前端产物里抠出"平台共享模块表"及其导出清单
 │   ├── slot-catalog.js     打印官方 61 个槽位的完整契约（注册选项/标准 props/最小示例）
@@ -211,16 +212,29 @@ npm run dist         # 出 NSIS 安装包 + 便携版
 默认 1 个输入框，点「新增会话」加行；每行是一条独立提示词（可各自选模型 / 工作区、
 可挂附件、可用 `/` 命令与 `@` 文件引用）；**右下角一键发送** ⇒ 一次建 N 个会话并行跑。
 
-它是**官方 Web 前端的客户端插件**，不是外壳的一部分，所以需要先装进 profile：
+它是**官方 Web 前端的客户端插件**，不是外壳的一部分。
+
+> ### ★ 0.2.2 起它是「内置」的 —— 装完打开就有，**不需要任何人敲命令**
+>
+> 机制见 `AGENTS.md` §7：插件作为**真实目录**随包放在
+> `<安装目录>\resources\plugins\`（不再塞进 `app.asar`），外壳启动时自动落位到
+> `<DSH_HOME>\plugins\`，并把 profile 的**三处契约**一次写对（`dependencies` 里的
+> `link:`、`dsh.profile.bundles`、`node_modules` 目录联接）。
+> `link:` 指向**用户数据目录**，所以应用升级/卸载都不会留死链。
+> 全新机器上 profile 是内核第一次跑才建的 ⇒ 会自动"装好 → 重启一次内核 → 出界面"，
+> 用户只看到加载页多停一两秒。
+
+下面这些命令是**开发机**上用的（打包版默认不接管，免得把开发用联接悄悄改写掉）：
 
 ```powershell
-npm run plugin:check       # 先真跑验证（临时环境，不碰你在用的 DSH_HOME）
-npm run plugin:status      # 只读：现在装没装、联接指向哪
-npm run plugin:install     # 落盘（自动备份 profile 的 package.json）
-npm run plugin:revert      # 回滚
+npm run provision:check     # ★ 内置落位逻辑的真跑验收（临时 DSH_HOME，40 条断言）
+npm run plugin:check        # 真跑验证插件功能（临时环境，不碰你在用的 DSH_HOME）
+npm run plugin:status       # 只读：现在装没装、联接指向哪
+npm run plugin:install      # 开发用：把 profile 联接到**本仓库**（改源码即时生效）
+npm run plugin:revert       # 回滚
 ```
 
-**它不会重启内核** —— 装完要自己重启一次客户端（托盘 → 退出 → 重新打开）才生效。
+**它们都不会重启内核** —— 装完要自己重启一次客户端（托盘 → 退出 → 重新打开）才生效。
 这一条是刻意的：那条命令跑下去之后用户就看不见 AI 了，所以不该由 AI 来按。
 
 **为什么要做成插件、以及"为什么不能直接复用官方那个输入框"**（四条各自足以致命的证据）
@@ -238,6 +252,7 @@ node scripts/ui-check.js loading    # 加载页 + 抽屉 + 动作清单（临时
 node scripts/ui-check.js inject     # 模型搜索框注入（临时环境 + 空端口）
 node scripts/ui-check.js reuse      # 复用已有内核的两条路径
 npm run plugin:check                # 多会话插件：临时环境里真开弹窗、真发 2 条、真去磁盘找证据
+npm run provision:check             # 内置插件落位：临时 DSH_HOME 里验三处契约 / 幂等 / 不越界 / 自愈
 ```
 
 四个 `ui-check` 模式都**不碰**你正在用的环境：`loading`/`inject` 用临时 userData + 空闲端口 3177，
