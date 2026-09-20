@@ -27,6 +27,7 @@
     "dist:portable": "node scripts/ensure-icon.js && electron-builder --win portable",
     "release:bundle": "node scripts/make-release-bundle.js",
     "release:check": "node scripts/make-release-bundle.js --check",
+    "release:publish": "python scripts/publish-release.py",
     "plugin:check": "node scripts/plugin-check.js",
     "plugin:status": "node scripts/install-plugin.js --status",
     "plugin:install": "node scripts/install-plugin.js --apply",

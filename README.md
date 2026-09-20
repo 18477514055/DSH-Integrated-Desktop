@@ -188,11 +188,12 @@ npm run dist         # 出 NSIS 安装包 + 便携版
 │   ├── ui-check.js         CDP 真跑真看验证界面（loading / inject / reuse / probe）
 │   ├── plugin-check.js     客户端插件的真跑验证（临时环境 + CDP + 磁盘交叉核对）
 │   ├── install-plugin.js   把插件装进 profile（可预演 / 可回滚 / **绝不重启内核**）
-│   ├── provision-check.js  ★ 内置插件落位逻辑的真跑验收（临时 DSH_HOME / 40 条断言）
+│   ├── provision-check.js  ★ 内置插件落位逻辑的真跑验收（临时 DSH_HOME / 50 条断言）
 │   ├── boot-peek.js        对正在跑的内核只读取一次引导载荷（看哪些插件真的被公告）
 │   ├── platform-modules.js 从官方前端产物里抠出"平台共享模块表"及其导出清单
 │   ├── slot-catalog.js     打印官方 61 个槽位的完整契约（注册选项/标准 props/最小示例）
-│   └── bundle-window.js    在压缩过的 bundle 里只看限定窗口（不把整行灌进上下文）
+│   ├── bundle-window.js    在压缩过的 bundle 里只看限定窗口（不把整行灌进上下文）
+│   └── publish-release.py  ★ 发布 Release（GitHub API + curl 流式上传；**别用 gh release create**）
 ├── assets/                 图标（由 scripts/make-icon.js 生成）
 ├── runtime/                运行时数据（独立 DSH_HOME，不提交）
 ├── migration/              从社区版迁移数据的工具（不提交）
@@ -271,7 +272,19 @@ npm run dist              # 1) 先打包（会顺带生成并逐像素验证图�
 git add -A && git commit  # 2) 提交 —— 工作区不干净时第 3 步会拒绝
 npm run release:bundle    # 3) 生成 github/ 并逐文件审计
 npm run release:check     #    任何时候都可以只审计现有 github/，不重新生成
+
+# 4) 发布（顺序不能换：tag 打在**远端 HEAD** 上，必须先 push）
+git push origin main
+$env:GITHUB_TOKEN = (gh auth token).Trim()
+npm run release:publish   # 建 Release + 传附件 + 回读
 ```
+
+> ⚠️ **不要用 `gh release create`**（2026-09-20 实测）：本机 `gh` 是通的
+> （`gh api rate_limit` 0.9 秒），但 `gh release create` 跑了 **20 分钟连 Release 都没建出来**，
+> 进程活着、无输出、无报错。`publish-release.py` 改用 GitHub API + **`curl.exe` 流式上传**
+> （第一版用 `urllib` 单次 POST 传 88 MB 会**卡死在代理上**：CPU 1 秒、内存 2 MB、连接不动），
+> 并带"低速自动放弃"守卫与单文件重试。
+> **发布后仍然必须把附件下载回来重算 sha256** —— 不看任何脚本自述。
 
 `github/` 里只有这些：两个安装包、`RELEASE-NOTES.md`、`LICENSE`、
 `SHA256SUMS.txt`、`source/<版本>-source.zip`。
