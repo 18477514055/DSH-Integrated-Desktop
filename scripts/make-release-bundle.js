@@ -185,7 +185,7 @@ function folderReadme(head) {
 | \`DSH-Integrated-${VERSION}-x64.exe\` | GitHub Release 附件 |
 | \`DSH-Integrated-${VERSION}-portable-x64.exe\` | GitHub Release 附件 |
 | \`source/DSH-Integrated-${VERSION}-source.zip\` | 可选：Release 附件（源码包） |
-| \`RELEASE-NOTES.md\` | Release 正文（\`gh release create --notes-file\`） |
+| \`RELEASE-NOTES.md\` | Release 正文（\`publish-release.py\` 会读它当正文） |
 | \`LICENSE\` | 许可 |
 | \`${SUM_NAME}\` | 上面所有文件的 SHA256 |
 
@@ -206,14 +206,21 @@ function folderReadme(head) {
 # 1) 先生成并审计（工作区必须已提交，否则脚本会拒绝）
 node scripts/make-release-bundle.js
 
-# 2) 建立 Release 并挂附件
-gh release create v${VERSION} \`
-  "github\\DSH-Integrated-${VERSION}-x64.exe" \`
-  "github\\DSH-Integrated-${VERSION}-portable-x64.exe" \`
-  --repo 18477514055/DSH-Integrated-Desktop \`
-  --title "DSH 集成桌面端 ${VERSION}" \`
-  --notes-file "github\\${NOTES_NAME}"
+# 2) ★ 必须先 push —— Release 的 tag 打在**远端 HEAD** 上，不是本地 HEAD
+git push origin main
+
+# 3) 建 Release 并传附件（GitHub API + curl 流式上传）
+$env:GITHUB_TOKEN = (gh auth token).Trim()
+python scripts/publish-release.py
 \`\`\`
+
+> ⚠️ **不要用 \`gh release create\`**（2026-09-20 实测）：本机 \`gh\` 是通的
+> （\`gh api rate_limit\` 0.9 秒返回），但 \`gh release create\` 跑了 **20 分钟连 Release
+> 都没建出来**，进程活着、无输出、无报错。\`publish-release.py\` 走 GitHub API 建 Release，
+> 大文件改用 **\`curl.exe --data-binary @文件\` 流式上传**（\`urllib\` 单次 POST 传 88 MB
+> 会卡死在代理上：CPU 1 秒、内存 2 MB、连接不动），并带"低速自动放弃"守卫与单文件重试。
+>
+> **发布后必须把附件下载回来重算 sha256** —— 不看任何脚本自述。
 
 ## 怎么自查
 
