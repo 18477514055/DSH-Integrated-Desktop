@@ -43,6 +43,7 @@ const os = require("node:os");
 const K = require("./kernel");
 const diagnostics = require("./diagnostics");
 const P = require("./plugins");
+const SITES = require("./sites");
 const WHALE = require("./whale-path.json");
 
 // ── 最早期的错误捕获 ──────────────────────────────────────────────
@@ -89,6 +90,8 @@ const HOST = "127.0.0.1";
 // ── 运行状态 ──────────────────────────────────────────────────────
 let mainWindow = null;
 let settingsWindow = null;
+/** 外部网站视图宿主（本机 DSH / DeepSeek 网页版 / 开放平台 三页切换），见 src/sites.js */
+let siteHost = null;
 let tray = null;
 let kernelProc = null;
 let serverUrl = null;
@@ -385,34 +388,61 @@ function createWindow() {
     if (/^https?:/.test(url)) shell.openExternal(url);
   });
 
-  // 每次官方 UI 加载完成就注入"模型搜索框"（见 src/inject/model-search.js）。
+  // 每次官方 UI 加载完成就注入（模型搜索框 + 页面切换把手，见 src/inject/）。
   // 失败不影响任何东西：注入脚本自己会安静退出。
   mainWindow.webContents.on("did-finish-load", () => {
     const u = mainWindow.webContents.getURL();
     if (isShellPageUrl(u)) return;      // 外壳自己的页面不注入
-    if (NO_INJECT) { log("已按 --no-inject 跳过模型搜索框注入"); return; }
-    injectModelSearch();
+    injectLocalUi();
+    // 注入是异步的：稍等一下再把"当前在哪一页"推给把手，否则它不知道高亮谁
+    setTimeout(() => { try { if (siteHost) siteHost.broadcast(); } catch { /* 忽略 */ } }, 400);
   });
 
-  // 快捷键（无菜单栏，替代原生菜单）
-  mainWindow.webContents.on("before-input-event", (e, input) => {
-    if (input.type !== "keyDown") return;
-    const ctrl = input.control || input.meta;
-    const key = String(input.key).toLowerCase();
-    if (ctrl && input.shift && key === "i") { mainWindow.webContents.toggleDevTools(); e.preventDefault(); }
-    else if (ctrl && key === "r") { mainWindow.webContents.reload(); e.preventDefault(); }
-    else if (input.key === "F5") { mainWindow.webContents.reload(); e.preventDefault(); }
-    else if (ctrl && input.shift && key === "o") { if (serverUrl) shell.openExternal(serverUrl); e.preventDefault(); }
-    else if (ctrl && key === ",") { openSettingsWindow(); e.preventDefault(); }
+  // 快捷键（无菜单栏，替代原生菜单）。站点视图是**另一个 webContents**，
+  // 所以抽成函数、两边都挂 —— 否则进了网站就按不出 Ctrl+1 回不来。
+  attachShortcuts(mainWindow.webContents);
+
+  // ── 三页切换：建外部网站视图宿主（见 src/sites.js）─────────────
+  //   视图是**独立一层**：切到网站时铺满内容区、盖住本机页面
+  //   （本机页面继续活着 —— 内核不断线、会话照跑）；切回来只是隐藏，
+  //   网站页面**不销毁** ⇒ 来回切不丢滚动位置与登录态。
+  if (siteHost) { try { siteHost.destroy(); } catch { /* 旧窗口正在拆 */ } }
+  siteHost = SITES.createSiteHost({
+    mainWindow,
+    preloadPath: path.join(__dirname, "preload.js"),
+    log,
+    // 当前页变了 ⇒ 托盘勾选要跟着变
+    onChanged: () => { try { rebuildTrayMenu(); } catch { /* 托盘还没建好 */ } },
+    onViewCreated: (wc) => {
+      // ★ 外部站点也必须注入把手、也必须挂快捷键：
+      //   否则用户进网站之后就没有出口了（托盘是最后一道保险，但不该是唯一出路）
+      wc.on("did-finish-load", () => {
+        injectInto("pages", wc, "页面切换把手（站点）");
+        setTimeout(() => { try { if (siteHost) siteHost.broadcast(); } catch { /* 忽略 */ } }, 400);
+      });
+      wc.on("did-fail-load", () => {
+        // 站点没加载成功时也尽力注入：否则用户面对一个报错页、却没有任何切换入口
+        injectInto("pages", wc, "页面切换把手（站点加载失败）");
+      });
+      attachShortcuts(wc);
+    },
   });
 
   mainWindow.on("close", (e) => {
     if (settings.closeToTray && !quitting && !SMOKE) { e.preventDefault(); mainWindow.hide(); return; }
     saveBounds();
   });
-  mainWindow.on("closed", () => { mainWindow = null; });
+  mainWindow.on("closed", () => {
+    try { if (siteHost) siteHost.destroy(); } catch { /* 忽略 */ }
+    siteHost = null;
+    mainWindow = null;
+  });
   mainWindow.on("move", saveBounds);
-  mainWindow.on("resize", saveBounds);
+  mainWindow.on("resize", () => {
+    saveBounds();
+    // 窗口尺寸变了要把网站视图跟着铺满，否则右边/下边会露出一块本机页面
+    try { if (siteHost) siteHost.resize(); } catch { /* 忽略 */ }
+  });
 }
 
 // ── 图标 ──────────────────────────────────────────────────────────
@@ -427,22 +457,116 @@ function trayIconPath() {
   return fs.existsSync(p) ? p : iconPath();
 }
 
-// ── 模型搜索框注入 ────────────────────────────────────────────────
-const INJECT_FILE = path.join(__dirname, "inject", "model-search.js");
-let injectSource = null;
-function injectModelSearch() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  try {
-    if (injectSource === null) {
-      injectSource = fs.readFileSync(INJECT_FILE, "utf8");   // 读一次就缓存
+// ── 页面注入（模型搜索框 + 页面切换把手）──────────────────────────
+//
+// 两份脚本都是「读一次就缓存 → 页面加载完成后 executeJavaScript」，失败只记日志：
+// 注入挂掉不该影响页面本身（最坏是少个功能，官方界面照常用）。
+const INJECT_FILES = {
+  model: path.join(__dirname, "inject", "model-search.js"),
+  pages: path.join(__dirname, "inject", "page-switch.js"),
+};
+const injectSources = {};
+
+function injectSourceOf(key) {
+  if (injectSources[key] === undefined) {
+    try {
+      injectSources[key] = fs.readFileSync(INJECT_FILES[key], "utf8");
+    } catch (e) {
+      log(`读不到注入脚本 ${key}（跳过）:`, (e && e.message) || e);
+      injectSources[key] = "";
     }
-  } catch (e) {
-    log("读不到注入脚本，跳过:", (e && e.message) || e);
-    injectSource = "";
   }
-  if (!injectSource) return;
-  mainWindow.webContents.executeJavaScript(injectSource, true)
-    .catch((e) => log("模型搜索框注入失败（不影响使用）:", (e && e.message) || e));
+  return injectSources[key];
+}
+
+/** 往任意 webContents 注入一份脚本。 */
+function injectInto(key, wc, note) {
+  if (!wc || wc.isDestroyed()) return;
+  const src = injectSourceOf(key);
+  if (!src) return;
+  wc.executeJavaScript(src, true)
+    .catch((e) => log(`${note}注入失败（不影响使用）:`, (e && e.message) || e));
+}
+
+/**
+ * 本机官方 UI 的注入。
+ *
+ * ★ `--no-inject` 只关**模型搜索框**（它就是为"模型搜索框出问题不想改代码"准备的开关）；
+ *   **页面切换把手一定会注入** —— 它是用户从 DeepSeek 网站回到本机界面的路，
+ *   关掉它等于把人锁在网站页里（虽然托盘与 Ctrl+1 还能救，但没必要冒这个险）。
+ */
+function injectLocalUi() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (NO_INJECT) log("已按 --no-inject 跳过模型搜索框注入");
+  else injectInto("model", mainWindow.webContents, "模型搜索框");
+  injectInto("pages", mainWindow.webContents, "页面切换把手");
+}
+
+// ── 快捷键（无菜单栏，替代原生菜单）──────────────────────────────
+/**
+ * 给一个 webContents 挂快捷键。
+ *
+ * ★ 必须对**每个** webContents 各挂一次：`before-input-event` 是 per-webContents 的，
+ *   主窗口那一份管不到站点视图 ⇒ 进了 DeepSeek 网站就按不出 Ctrl+1 回不来。
+ */
+function attachShortcuts(wc) {
+  wc.on("before-input-event", (e, input) => {
+    if (input.type !== "keyDown") return;
+    const ctrl = input.control || input.meta;
+    const key = String(input.key).toLowerCase();
+    if (ctrl && input.shift && key === "i") { wc.toggleDevTools(); e.preventDefault(); }
+    else if (ctrl && key === "r") { wc.reload(); e.preventDefault(); }
+    else if (input.key === "F5") { wc.reload(); e.preventDefault(); }
+    else if (ctrl && input.shift && key === "o") { if (serverUrl) shell.openExternal(serverUrl); e.preventDefault(); }
+    else if (ctrl && key === ",") { openSettingsWindow(); e.preventDefault(); }
+    else if (ctrl && /^[123]$/.test(key)) {
+      // Ctrl+1/2/3 = 本机 DSH / DeepSeek 网页版 / DeepSeek 开放平台
+      const ids = SITES.PAGES.map((p) => p.id);
+      const id = ids[Number(key) - 1];
+      if (id) { switchPage(id); e.preventDefault(); }
+    }
+  });
+}
+
+// ── 页面切换：本机 DSH / DeepSeek 网页版 / DeepSeek 开放平台 ──────
+function pageState() {
+  const active = siteHost ? siteHost.active() : SITES.LOCAL_ID;
+  return {
+    active,
+    pages: SITES.PAGES.map((p) => ({ id: p.id, label: p.label, hint: p.hint })),
+  };
+}
+
+/** 切页。任何异常都吞掉并记日志 —— 切页失败不该让外壳崩掉。 */
+function switchPage(id) {
+  if (!siteHost) return { ok: false, id: SITES.LOCAL_ID, reason: "窗口还没建好" };
+  try {
+    const r = siteHost.show(String(id));
+    if (!r.ok) log(`切页失败：${r.reason || "未知原因"}`);
+    return r;
+  } catch (e) {
+    const msg = (e && e.message) || String(e);
+    log(`切页异常：${msg}`);
+    return { ok: false, id: siteHost.active(), reason: msg };
+  }
+}
+
+/**
+ * 页面切换 IPC 的来源判定。
+ *
+ * ⚠️ 与 `assertShellSender` **刻意不同**：那一组只放行外壳自有页面；
+ *    而切换把手是注入在**官方 UI 与两个外部站点**里的，这里必须放行它们。
+ *    安全边界靠"取值写死"而不是靠来源：`switchPage` → `sites.js` 的 `pageById`
+ *    只认 PAGES 里那三个 id ⇒ 第三方站点即使拿到这个通道，
+ *    也只能在这三页之间切，**不能执行命令、不能读写文件**。
+ */
+function assertPageSender(event) {
+  if (!siteHost) throw new Error("拒绝：窗口还没建好");
+  const sender = event.sender;
+  if (!siteHost.allWebContents().some((wc) => wc === sender)) {
+    throw new Error("拒绝：不是本应用的页面");
+  }
+  return true;
 }
 
 // ── 内核生命周期 ──────────────────────────────────────────────────
@@ -846,17 +970,26 @@ function startHealthWatch() {
 }
 
 // ── 托盘 ──────────────────────────────────────────────────────────
-function createTray() {
-  // ★ 托盘用 tray.png（白底黑鲸鱼，缩放 0.94，填得比应用图标满）；
-  //   同目录的 tray@2x.png 会被 Electron 在 200% 缩放下自动选用。
-  const p = trayIconPath();
-  const img = p ? nativeImage.createFromPath(p) : nativeImage.createEmpty();
-  const fallback = nativeImage.createFromDataURL(
-    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==");
-  tray = new Tray(img.isEmpty() ? fallback : img);
-  tray.setToolTip("DSH Integrated");
-  tray.setContextMenu(Menu.buildFromTemplate([
+/**
+ * 托盘菜单模板。
+ * ★ 抽成函数是为了**当前页变化时能重建** —— radio 的勾选要跟着走。
+ */
+function trayTemplate() {
+  const active = siteHost ? siteHost.active() : SITES.LOCAL_ID;
+  return [
     { label: "显示 / 隐藏", click: toggleWindow },
+    {
+      label: "页面",
+      submenu: SITES.PAGES.map((p, i) => ({
+        label: p.label,
+        type: "radio",
+        checked: active === p.id,
+        // ★ 这里只是**显示**提示：托盘菜单的 accelerator 不注册全局快捷键，
+        //   真正生效的是 attachShortcuts 里的 before-input-event
+        accelerator: `Ctrl+${i + 1}`,
+        click: () => switchPage(p.id),
+      })),
+    },
     { label: "设置…", accelerator: "Ctrl+,", click: () => openSettingsWindow() },
     { label: "在浏览器中打开", enabled: !!serverUrl, click: () => serverUrl && shell.openExternal(serverUrl) },
     { type: "separator" },
@@ -873,6 +1006,7 @@ function createTray() {
           `内核版本 : ${kernelInfo.version || "未知"}`,
           `档案     : ${settings.profile || "web"}`,
           `DSH_HOME : ${getDshHome()}`,
+          `当前页面 : ${active === SITES.LOCAL_ID ? "本机 DSH" : active}`,
           "",
           "外壳只负责窗口、托盘与进程管理，不改内核的任何文件。",
         ].join("\n"),
@@ -881,7 +1015,26 @@ function createTray() {
     },
     { type: "separator" },
     { label: "退出", click: () => { quitting = true; app.quit(); } },
-  ]));
+  ];
+}
+
+/** 重建托盘菜单（当前页变了要更新勾选）。托盘还没建好时安静跳过。 */
+function rebuildTrayMenu() {
+  if (!tray) return;
+  try { tray.setContextMenu(Menu.buildFromTemplate(trayTemplate())); }
+  catch (e) { log("重建托盘菜单失败:", (e && e.message) || e); }
+}
+
+function createTray() {
+  // ★ 托盘用 tray.png（白底黑鲸鱼，缩放 0.94，填得比应用图标满）；
+  //   同目录的 tray@2x.png 会被 Electron 在 200% 缩放下自动选用。
+  const p = trayIconPath();
+  const img = p ? nativeImage.createFromPath(p) : nativeImage.createEmpty();
+  const fallback = nativeImage.createFromDataURL(
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==");
+  tray = new Tray(img.isEmpty() ? fallback : img);
+  tray.setToolTip("DSH Integrated");
+  rebuildTrayMenu();
   tray.on("click", toggleWindow);
 }
 
@@ -1106,6 +1259,20 @@ function registerIpc() {
       });
     if (r.canceled || !r.filePaths || !r.filePaths.length) return { ok: false, message: "已取消" };
     return { ok: true, path: r.filePaths[0] };
+  });
+
+  // ── 页面切换：本机 DSH / DeepSeek 网页版 / DeepSeek 开放平台 ──
+  //
+  // ⚠️ 这两个**不用** `assertShellSender` —— 切换把手注入在官方 UI 与两个外部站点里，
+  //    来源判定见 `assertPageSender` 的注释（安全边界靠 id 写死，不靠来源）。
+  ipcMain.handle("dsh:page:list", (e) => {
+    assertPageSender(e);
+    return pageState();
+  });
+
+  ipcMain.handle("dsh:page:switch", (e, id) => {
+    assertPageSender(e);
+    return switchPage(id);
   });
 }
 

@@ -152,11 +152,16 @@ npm run dist         # 出 NSIS 安装包 + 便携版
 
 | 键 | 作用 |
 |---|---|
+| **`Ctrl+1` / `Ctrl+2` / `Ctrl+3`** | **切页：本机 DSH / DeepSeek 网页版 / DeepSeek 开放平台**（见「三页切换」） |
+| `Ctrl+,` | 打开设置 |
 | `Ctrl+Shift+I` | 开发者工具 |
-| `Ctrl+R` / `F5` | 重载页面 |
+| `Ctrl+R` / `F5` | 重载当前页 |
 | `Ctrl+Shift+O` | 在系统浏览器打开 |
 
-关闭窗口默认驻留托盘；托盘右键可退出或看关于信息。
+关闭窗口默认驻留托盘；托盘右键可退出、切页或看关于信息。
+
+> ★ 这些键对**每个页面各挂一次**（`before-input-event` 是 per-webContents 的）——
+> 只挂在主窗口上的话，切到 DeepSeek 网站之后 `Ctrl+1` 就回不来了。
 
 ---
 
@@ -166,6 +171,8 @@ npm run dist         # 出 NSIS 安装包 + 便携版
 ├── src/
 │   ├── main.js             Electron 主进程（窗口 / 托盘 / 生命周期 / IPC / 注入）
 │   ├── kernel.js           内核发现、启动、探活、自愈
+│   ├── sites.js            三页切换的视图层（WebContentsView 覆盖 + PAGES 单一出处）
+│   ├── plugins.js          内置插件落位（随包分发 → 首次启动装进 profile）
 │   ├── preload.js          外壳页面 ↔ 主进程的唯一通道（只暴露动作 id）
 │   ├── diagnostics.js      「诊断与修复」动作白名单与执行器（主进程侧）
 │   ├── status-page.html/js 启动加载页（白底黑鲸鱼 + 里程碑进度 + 诊断抽屉）
@@ -173,7 +180,8 @@ npm run dist         # 出 NSIS 安装包 + 便携版
 │   ├── shell-ui.css/js     两个外壳页面共享的样式与页面逻辑
 │   ├── whale-path.json     官方鲸鱼几何（4 段子路径）
 │   └── inject/
-│       └── model-search.js 注入官方 UI 的模型搜索框 + 提供方胶囊
+│       ├── model-search.js 注入官方 UI 的模型搜索框 + 提供方胶囊
+│       └── page-switch.js  注入到页面里的「切换页面」把手（贴右侧边缘）
 ├── plugin/
 │   └── dsh-multi-session/  客户端插件：多会话同时开工（大弹窗 + N 个输入框 + 一键发送）
 │       ├── lib/client.js   浏览器半边（手写 bundle，无需构建）
@@ -245,6 +253,36 @@ npm run plugin:revert       # 回滚
 
 ---
 
+## 三页切换：本机 DSH / DeepSeek 网页版 / DeepSeek 开放平台
+
+窗口**右侧边缘**有一条细把手（默认 20px，悬停展开），点一下弹出三页清单，点哪页切哪页，
+当前页打 ✓。另外两个入口是**托盘右键 → 页面**与 **Ctrl+1/2/3**。
+
+| 页面 | 是什么 |
+|---|---|
+| 本机 DSH | 这个客户端本身（本机内核的官方界面） |
+| DeepSeek 网页版 | <https://chat.deepseek.com/> |
+| DeepSeek 开放平台 | <https://platform.deepseek.com/> |
+
+**几个刻意的取舍**：
+
+- **切走不停机**：网站是以**一层独立视图**盖在窗口上的，本机界面在下面继续活着 ——
+  内核不断线、会话照跑（看一眼网页不会打断长回答）。
+- **切回不重载**：站点页面只隐藏、**不销毁** ⇒ 不丢滚动位置、不丢登录态。
+- **站点页里也有把手**：否则进去之后就没有出口（托盘是保险，但不该是唯一出路）。
+- **登录态存在应用自己的数据目录里**，登录一次就记住。
+
+**为什么必须进外壳**（而不是做成插件）：插件跑在官方前端的 React 树里，只有**网页**的能力；
+而"把第三方站点装进同一个窗口"要 Electron 的**视图层**（`WebContentsView`）。
+**`<iframe>` 也不行** —— 两个站点都带 `X-Frame-Options` / `frame-ancestors`，会被直接拒绝，
+而且 iframe 里的登录态与主页面互相割裂。
+
+**安全边界**：切页通道允许**官方 UI 与两个外部站点**调用（把手就注入在那里），
+边界靠**取值写死** —— 只认 `dsh` / `chat` / `platform` 三个 id，别的一律拒。
+即使第三方站点的脚本拿到这个通道，也只能在这三页之间切，不能执行命令、不能读写文件。
+
+---
+
 ## 界面自检
 
 ```powershell
@@ -252,6 +290,7 @@ npm run verify:icon                 # 逐像素验证图标（白底/不透明/�
 node scripts/ui-check.js loading    # 加载页 + 抽屉 + 动作清单（临时环境，不碰你的 DSH_HOME）
 node scripts/ui-check.js inject     # 模型搜索框注入（临时环境 + 空端口）
 node scripts/ui-check.js reuse      # 复用已有内核的两条路径
+node scripts/ui-check.js pages      # ★ 三页切换：真点把手、真切页、真回读主进程状态（15 项断言）
 npm run plugin:check                # 多会话插件：临时环境里真开弹窗、真发 2 条、真去磁盘找证据
 npm run provision:check             # 内置插件落位：临时 DSH_HOME 里验三处契约 / 幂等 / 不越界 / 自愈
 ```

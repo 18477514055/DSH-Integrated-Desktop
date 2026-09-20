@@ -599,14 +599,168 @@ async function probeUi(tmpDir) {
   }
 }
 
+// ── 模式五：三页切换（本机 DSH / DeepSeek 网页版 / 开放平台）──────
+//
+// 验的是**真行为**，不是"代码看起来对"：
+//   · 把手真的画在 DOM 里、面板真的能展开、三页标签真的是中文；
+//   · `switchPage()` **真的改了主进程的状态**（切完再读一次 `pages()` 看 active）；
+//   · **非法 id 真的被拒**（安全边界：只有三个固定页，第三方站点拿到通道也越不了界）。
+async function verifyPages(tmpDir) {
+  const PORT = 3178;
+  const { child } = launch("pages", tmpDir, PORT, { seedWorkspace: true });
+  const ws = { url: null };
+  try {
+    const target = await waitForPage((t) => t.url.startsWith(`http://127.0.0.1:${PORT}/`), 120000);
+    ws.url = target.webSocketDebuggerUrl;
+    console.log(`  已连上官方界面: ${target.url.split("?")[0]}`);
+
+    const probe = `(() => {
+      const h = document.querySelector('[data-dsh-page-switch="handle"]');
+      const p = document.querySelector('[data-dsh-page-switch="panel"]');
+      const rows = p ? Array.from(p.querySelectorAll('[data-page-id]')).map(e => ({
+        id: e.getAttribute('data-page-id'), text: (e.textContent || '').replace(/\\s+/g, ' ').trim()
+      })) : [];
+      return JSON.stringify({
+        handle: !!h,
+        panel: !!p,
+        panelDisplay: p ? getComputedStyle(p).display : null,
+        rows,
+        api: !!(window.dshShell && typeof window.dshShell.switchPage === 'function'
+                && typeof window.dshShell.pages === 'function'),
+      });
+    })()`;
+
+    // 注入是 did-finish-load 之后异步做的，给它几秒
+    let st = null;
+    for (let i = 0; i < 40; i++) {
+      st = JSON.parse(await cdpEval(ws.url, probe));
+      if (st.handle && st.api && st.rows.length) break;
+      await sleep(500);
+    }
+
+    check("页面切换把手真的画进了 DOM", st.handle);
+    check("把手拿到了受限通道 window.dshShell", st.api);
+    check("面板默认是收起的", st.panel && st.panelDisplay === "none", `display=${st.panelDisplay}`);
+    check("面板里正好三页且 id 顺序正确",
+      st.rows.map((r) => r.id).join(",") === "dsh,chat,platform", st.rows.map((r) => r.id).join(","));
+    check("三页标签是中文（不是空 / 不是 id）",
+      st.rows.length === 3 && st.rows.every((r) => /[\u4e00-\u9fa5]/.test(r.text)),
+      JSON.stringify(st.rows.map((r) => r.text)));
+    check("当前页（本机 DSH）被标了 ✓", /✓/.test(st.rows[0].text), JSON.stringify(st.rows[0].text));
+
+    // 点把手 → 面板展开。
+    // ★ 点完**立刻**读一次内联样式，稍后再读一次 computed ——
+    //   这两次能区分「压根没开」和「开了又被谁关掉」，不然只能瞎猜。
+    const clickAndRead = `(() => {
+      const h = document.querySelector('[data-dsh-page-switch="handle"]');
+      const p = document.querySelector('[data-dsh-page-switch="panel"]');
+      const out = {
+        roots: document.querySelectorAll('[data-dsh-page-switch="root"]').length,
+        handles: document.querySelectorAll('[data-dsh-page-switch="handle"]').length,
+        panels: document.querySelectorAll('[data-dsh-page-switch="panel"]').length,
+        hook: !!window.__dshPageSwitch,
+        inlineBefore: p ? p.style.display : null,
+      };
+      try { h.click(); } catch (e) { out.clickErr = String(e && e.message); }
+      out.afterClick = p ? p.style.display : null;
+      // ★ 再挂一个**全新**的监听器再点一次：能区分"事件根本没到元素"和"我那个监听器没生效"
+      try {
+        var fired = 0;
+        h.addEventListener("click", function () { fired += 1; });
+        h.click();
+        out.extraListenerFired = fired;
+      } catch (e) { out.extraErr = String(e && e.message); }
+      // ★ 绕过事件，直接调钩子：能区分「事件没到」和「函数本身坏」
+      try { window.__dshPageSwitch.open(); } catch (e) { out.openErr = String(e && e.message); }
+      out.afterHookOpen = p ? p.style.display : null;
+      return JSON.stringify(out);
+    })()`;
+    const clickRes = JSON.parse(await cdpEval(ws.url, clickAndRead));
+    console.log(`  点击诊断: ${JSON.stringify(clickRes)}`);
+    await sleep(400);
+    const opened = JSON.parse(await cdpEval(ws.url, probe));
+    check("点一下把手能展开面板（别看代码，看 display）",
+      opened.panelDisplay === "block",
+      `display=${opened.panelDisplay}（点后=${clickRes.afterClick}，钩子后=${clickRes.afterHookOpen}）`);
+
+    // 真的切到「开放平台」，再读回主进程状态
+    const r1 = await cdpEval(ws.url, `window.dshShell.switchPage('platform').then(r => JSON.stringify(r))`);
+    check("switchPage('platform') 返回 ok", /"ok":true/.test(r1), String(r1));
+    const s1 = await cdpEval(ws.url, `window.dshShell.pages().then(s => JSON.stringify(s))`);
+    check("主进程状态**真的**变成 platform（不是只有按钮变了）",
+      /"active":"platform"/.test(s1), String(s1).slice(0, 140));
+
+    // ★ 安全边界：合法取值只有三个 id，别的一律拒
+    const bad = await cdpEval(ws.url, `window.dshShell.switchPage('evil').then(r => JSON.stringify(r))`);
+    check("非法页面 id 被拒（越不出这三页）", /"ok":false/.test(bad), String(bad));
+    const bad2 = await cdpEval(ws.url, `window.dshShell.switchPage('../../etc').then(r => JSON.stringify(r))`);
+    check("畸形 id 也被拒", /"ok":false/.test(bad2), String(bad2));
+
+    // 切回本机
+    const r2 = await cdpEval(ws.url, `window.dshShell.switchPage('dsh').then(r => JSON.stringify(r))`);
+    check("能切回本机 DSH", /"ok":true/.test(r2), String(r2));
+    const s2 = await cdpEval(ws.url, `window.dshShell.pages().then(s => JSON.stringify(s))`);
+    check("状态回到 dsh", /"active":"dsh"/.test(s2), String(s2).slice(0, 140));
+
+    // ── 站点视图里也要有把手（否则进去就出不来）──
+    // 这一段依赖真能连上 platform.deepseek.com；连不上就明确报 SKIP，不当成 PASS。
+    console.log("  等站点视图的页面出现（要联网，连不上会标 SKIP）…");
+    let siteTarget = null;
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      try {
+        const ts = await listTargets();
+        siteTarget = ts.find((t) => t.type === "page" && /deepseek\.com/.test(t.url || ""));
+        if (siteTarget) break;
+      } catch { /* CDP 抖动 */ }
+      await sleep(1000);
+    }
+    if (!siteTarget) {
+      console.log("  SKIP  站点视图未加载（多半是网络/代理不通）—— 这一条没验到，不算通过");
+    } else {
+      console.log(`  站点视图已加载: ${siteTarget.url.slice(0, 60)}`);
+      // ★ 站点常会**重定向**（实测 platform.deepseek.com → /sign_in），注入会跟着
+      //   新的 did-finish-load 走。所以轮询等它稳下来，**不能睡固定几秒就下结论**
+      //   （第一版就是这么误报成 FAIL 的）。
+      const siteProbeExpr = `(() => {
+        return JSON.stringify({
+          readyState: document.readyState,
+          href: location.href.slice(0, 80),
+          handle: !!document.querySelector('[data-dsh-page-switch="handle"]'),
+          root: !!document.querySelector('[data-dsh-page-switch="root"]'),
+          hook: !!window.__dshPageSwitch,
+          api: !!(window.dshShell && typeof window.dshShell.switchPage === 'function'),
+        });
+      })()`;
+      let sp = null;
+      const siteDeadline = Date.now() + 25000;
+      while (Date.now() < siteDeadline) {
+        try {
+          const ts2 = await listTargets();
+          const t2 = ts2.find((t) => t.type === "page" && /deepseek\.com/.test(t.url || ""));
+          if (t2) {
+            sp = JSON.parse(await cdpEval(t2.webSocketDebuggerUrl, siteProbeExpr, 20000));
+            if (sp.handle) break;
+          }
+        } catch (e) { /* 重定向过程中 CDP 会抖，重来 */ }
+        await sleep(1500);
+      }
+      console.log(`  站点页诊断: ${JSON.stringify(sp)}`);
+      check("站点页面里也注入了切换把手（进去有出口）", !!(sp && sp.handle), JSON.stringify(sp));
+    }
+  } finally {
+    await stopApp(child);
+  }
+}
+
 // ── 主流程 ────────────────────────────────────────────────────────
 (async () => {
   if (typeof WebSocket === "undefined") {
     console.error("这个 node 没有全局 WebSocket，无法走 CDP（需要 Node 22+）");
     process.exit(1);
   }
-  if (MODE !== "loading" && MODE !== "inject" && MODE !== "probe" && MODE !== "reuse") {
-    console.error("用法: node scripts/ui-check.js <loading|inject|probe|reuse>");
+  if (!["loading", "inject", "probe", "reuse", "pages"].includes(MODE)) {
+    console.error("用法: node scripts/ui-check.js <loading|inject|probe|reuse|pages>");
     process.exit(1);
   }
 
@@ -620,7 +774,8 @@ async function probeUi(tmpDir) {
     await (MODE === "loading" ? verifyLoading(tmpDir)
       : MODE === "probe" ? probeUi(tmpDir)
         : MODE === "reuse" ? verifyReuse(tmpDir)
-          : verifyInject(tmpDir));
+          : MODE === "pages" ? verifyPages(tmpDir)
+            : verifyInject(tmpDir));
   } catch (e) {
     console.error(`\n[ui-check] 无法完成检查: ${(e && e.stack) || e}`);
     failures.push("执行异常: " + ((e && e.message) || e));

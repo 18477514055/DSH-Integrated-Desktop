@@ -64,4 +64,20 @@ contextBridge.exposeInMainWorld("dshShell", {
 
   // ── 只读环境信息（关于页/诊断信息用） ────────────────────────
   getEnv: () => ipcRenderer.invoke("dsh:env"),
+
+  // ── 页面切换：本机 DSH / DeepSeek 网页版 / DeepSeek 开放平台 ──
+  //
+  // ★ 这一组与上面所有通道**不一样**：它必须允许**官方 UI 页面与两个外部站点**调用，
+  //   因为切换把手是注入到那些页面里去的（见 src/inject/page-switch.js），
+  //   而 `assertShellSender` 只放行外壳自有页面。
+  //   安全边界靠"取值写死"来保证：主进程只认三个固定 id
+  //   （`dsh` / `chat` / `platform`，见 src/sites.js 的 PAGES）。
+  //   所以即使第三方网站的脚本也拿到这个通道，它最多只能在这三页之间切，
+  //   既不能执行命令、也不能读写文件。
+  /** 页面清单 + 当前在哪一页：{ active, pages:[{id,label,hint}] } */
+  pages: () => ipcRenderer.invoke("dsh:page:list"),
+  /** 切到某一页。返回 { ok, id, reason? }。 */
+  switchPage: (id) => ipcRenderer.invoke("dsh:page:switch", String(id)),
+  /** 主进程主动推的页面变化：{ active, pages:[…] } */
+  onPageState: (cb) => subscribe("dsh:page:state", cb),
 });
