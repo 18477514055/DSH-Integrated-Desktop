@@ -345,4 +345,4 @@ if (failures.length) {
   process.exit(1);
 }
 console.log("[bundle] 全部通过 ✅ 这个目录可以直接上传。");
-console.log(CHECK_ONLY ? "" : `        下一步：见 github/${README_NAME} 里的 gh release 命令。`);
+console.log(CHECK_ONLY ? "" : `        下一步：见 github/${README_NAME} —— 先 git push，再 python scripts/publish-release.py。`);
