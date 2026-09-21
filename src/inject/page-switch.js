@@ -131,6 +131,32 @@
     listEl = mk("div", { padding: "6px" });
     panel.appendChild(listEl);
 
+    // ── 最后一栏：外壳设置 ──
+    // 用户原话：「每次都只有加载的时候才能点外壳设置是不行的，有时候已经进去了也要改外壳设置」
+    // ⇒ 放进这个面板，本机页面与两个网站页里都点得到。
+    //   （托盘右键的「设置…」与 Ctrl+, 仍然在，是备选入口。）
+    if (typeof shell.openShellSettings === "function") {
+      var foot = mk("div", { borderTop: "1px solid rgba(148,163,184,0.2)", padding: "6px" });
+      var setRow = mk("div", {
+        display: "flex", alignItems: "center", gap: "8px",
+        padding: "8px 10px", borderRadius: "8px", cursor: "pointer", color: "#cbd5e1",
+      });
+      setRow.setAttribute("data-dsh-action", "shell-settings");
+      setRow.appendChild(mk("span", {
+        width: "14px", textAlign: "center", color: "#94a3b8", flex: "0 0 auto",
+      }, "⚙"));
+      setRow.appendChild(mk("span", { whiteSpace: "nowrap" }, "外壳设置…"));
+      setRow.addEventListener("mouseenter", function () { setRow.style.background = "rgba(148,163,184,0.14)"; });
+      setRow.addEventListener("mouseleave", function () { setRow.style.background = "transparent"; });
+      setRow.addEventListener("click", function (e) {
+        e.preventDefault();
+        setOpen(false);
+        Promise.resolve(shell.openShellSettings()).catch(function () { /* 主进程会记日志 */ });
+      });
+      foot.appendChild(setRow);
+      panel.appendChild(foot);
+    }
+
     listEl.addEventListener("click", function (e) {
       var row = e.target;
       while (row && row !== listEl && !row.getAttribute("data-page-id")) row = row.parentNode;

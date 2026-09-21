@@ -1,7 +1,7 @@
 {
   "name": "dsh-integrated-desktop",
   "productName": "DSH Integrated",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "DSH 集成桌面端 —— 把官方 DeepSeek Harness 内核装进原生 Electron 外壳。外壳只负责窗口/托盘/原生体验与自有设置页，内核由外部独立管理，升级内核不需要动外壳。",
   "main": "src/main.js",
   "author": "陈黛华 / 18477514055 (https://github.com/18477514055)",
@@ -22,17 +22,19 @@
     "icon": "electron scripts/make-icon.js",
     "verify:icon": "node scripts/verify-icon.js",
     "ensure:icon": "node scripts/ensure-icon.js",
-    "pack": "node scripts/ensure-icon.js && electron-builder --win --dir",
-    "dist": "node scripts/ensure-icon.js && electron-builder --win",
-    "dist:portable": "node scripts/ensure-icon.js && electron-builder --win portable",
+    "pack": "node scripts/ensure-icon.js && node scripts/materialize-plugins.js && electron-builder --win --dir",
+    "dist": "node scripts/ensure-icon.js && node scripts/materialize-plugins.js && electron-builder --win",
+    "dist:portable": "node scripts/ensure-icon.js && node scripts/materialize-plugins.js && electron-builder --win portable",
     "release:bundle": "node scripts/make-release-bundle.js",
     "release:check": "node scripts/make-release-bundle.js --check",
     "release:publish": "python scripts/publish-release.py",
     "plugin:check": "node scripts/plugin-check.js",
+    "plugin:check:archive": "node scripts/plugin-check-archive.js",
     "plugin:status": "node scripts/install-plugin.js --status",
     "plugin:install": "node scripts/install-plugin.js --apply",
     "plugin:revert": "node scripts/install-plugin.js --revert",
     "provision:check": "node scripts/provision-check.js",
+    "update:check": "electron scripts/update-check.js",
     "postinstall": "node scripts/check-kernel.js"
   },
   "devDependencies": {
@@ -59,16 +61,8 @@
     ],
     "extraResources": [
       {
-        "from": "plugin",
-        "to": "plugins",
-        "filter": [
-          "**/*",
-          "!_retired",
-          "!_retired/**",
-          "!**/.gradle/**",
-          "!**/android/build/**",
-          "!**/android/app/build/**"
-        ]
+        "from": "runtime/materialized-plugins",
+        "to": "plugins"
       }
     ],
     "win": {

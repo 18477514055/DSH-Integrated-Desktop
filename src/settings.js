@@ -25,12 +25,14 @@
   }
 
   // ── 分栏 ──────────────────────────────────────────────────────────
+  // 抽成函数是为了**从外面跳到某一栏**（托盘那条「检查更新…」要用）。
+  function switchPane(which) {
+    document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("on", x.dataset.pane === which));
+    document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("on", p.dataset.pane === which));
+  }
+
   document.querySelectorAll("nav button").forEach((b) => {
-    b.addEventListener("click", () => {
-      document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("on", x === b));
-      const which = b.dataset.pane;
-      document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("on", p.dataset.pane === which));
-    });
+    b.addEventListener("click", () => switchPane(b.dataset.pane));
   });
 
   $("btn-close").addEventListener("click", () => {
@@ -87,6 +89,100 @@
     });
   }
 
+  // ── 更新（实现全在主进程 src/update.js）────────────────────────────
+  // 用户原话：「外壳设置里面可以加一个检查更新，这样就不用我手动去装了。」
+  let lastCheck = null;
+
+  const upStatus = (t) => { $("up-status").textContent = t; };
+
+  function fmtBytes(n) {
+    if (!n) return "";
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  async function doCheck() {
+    upStatus("正在查 GitHub…");
+    $("btn-up-check").disabled = true;
+    try {
+      const r = await S.checkUpdate();
+      lastCheck = r;
+      if (!r || !r.ok) {
+        upStatus(`检查失败：${(r && r.reason) || "未知原因"}`);
+        return;
+      }
+      if (!r.hasUpdate) {
+        upStatus(`已是最新（v${r.current}）`);
+        $("up-row-new").style.display = "none";
+        return;
+      }
+      upStatus(`发现新版本 v${r.latest}（当前 v${r.current}）`);
+      $("up-latest").textContent = `v${r.latest}`;
+      $("up-asset").textContent = r.asset
+        ? `${r.asset.name} · ${fmtBytes(r.asset.size)}`
+        : "（这个 Release 没挂安装包）";
+      $("up-notes").textContent = r.notes || "(没有说明)";
+      $("btn-up-go").disabled = !r.asset;
+      $("up-row-new").style.display = "";
+    } catch (e) {
+      upStatus(`检查出错：${(e && e.message) || e}`);
+    } finally {
+      $("btn-up-check").disabled = false;
+    }
+  }
+
+  async function doInstall() {
+    if (!lastCheck || !lastCheck.asset) return;
+    $("btn-up-go").disabled = true;
+    $("up-bar").style.display = "";
+    upStatus(`正在下载 v${lastCheck.latest}…`);
+    try {
+      const d = await S.downloadUpdate(lastCheck.asset);
+      if (!d || !d.ok) {
+        upStatus(`下载失败：${(d && d.reason) || "未知"}`);
+        $("btn-up-go").disabled = false;
+        return;
+      }
+      upStatus(d.reused ? "本地已有这个安装包，直接安装…" : "下载完成，正在启动安装器…");
+      $("up-prog").textContent = "";
+      const r = await S.installUpdate(d.path);
+      if (!r || !r.ok) {
+        upStatus(`启动安装器失败：${(r && r.reason) || "未知"}`);
+        $("btn-up-go").disabled = false;
+        return;
+      }
+      upStatus("安装器已启动。外壳随即退出 —— 装完安装器会自己把新版本打开。");
+    } catch (e) {
+      upStatus(`出错：${(e && e.message) || e}`);
+      $("btn-up-go").disabled = false;
+    }
+  }
+
+  function wireUpdate() {
+    $("up-current").textContent = (env && env.appVersion) ? `v${env.appVersion}` : "—";
+    $("btn-up-check").addEventListener("click", doCheck);
+    $("btn-up-page").addEventListener("click", () => S.openReleases().catch(() => { }));
+    $("btn-up-go").addEventListener("click", doInstall);
+
+    S.onUpdateProgress((p) => {
+      if (!p) return;
+      const pct = Math.max(0, Math.min(100, p.percent || 0));
+      $("up-fill").style.width = `${pct}%`;
+      $("up-prog").textContent = p.total
+        ? `${fmtBytes(p.got)} / ${fmtBytes(p.total)}（${pct}%）`
+        : fmtBytes(p.got);
+    });
+
+    // 托盘那条「检查更新…」= 打开设置页 + 跳到这一栏 + 自动查一次
+    if (S.onFocusPane) {
+      S.onFocusPane((pane) => {
+        if (!pane) return;
+        switchPane(String(pane));
+        if (String(pane) === "update") doCheck();
+      });
+    }
+  }
+
   // ── 关于 ──────────────────────────────────────────────────────────
   function renderAbout(e) {
     const kv = [
@@ -135,6 +231,7 @@
     $("set-logdir").textContent = env.logDir;
 
     wire();
+    wireUpdate();
 
     await ShellUI.mountActions($("actions"), { output, verdictEl: $("verdict") });
   }

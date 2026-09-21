@@ -80,4 +80,23 @@ contextBridge.exposeInMainWorld("dshShell", {
   switchPage: (id) => ipcRenderer.invoke("dsh:page:switch", String(id)),
   /** 主进程主动推的页面变化：{ active, pages:[…] } */
   onPageState: (cb) => subscribe("dsh:page:state", cb),
+  /** 打开外壳设置窗口（切换面板最后那一栏用；与 switchPage 同一套来源判定）。 */
+  openShellSettings: () => ipcRenderer.invoke("dsh:page:open-settings"),
+
+  // ── 检查更新（实现全在主进程 src/update.js）────────────────────
+  //
+  // ⚠️ 这一组会**下载文件并启动安装包** ⇒ 主进程只放行**外壳自有页面**
+  //    （也就是设置页）。官方 UI 与两个外部站点调它会被 `assertShellSender` 拒掉。
+  /** 查 GitHub 上有没有比当前更新的版本。只读，不写任何东西。 */
+  checkUpdate: () => ipcRenderer.invoke("dsh:update:check"),
+  /** 下载安装包。进度通过 onUpdateProgress 推。返回 { ok, path?, reason? }。 */
+  downloadUpdate: (asset) => ipcRenderer.invoke("dsh:update:download", asset),
+  /** 启动已下载的安装包（只接受本应用临时目录里的那个文件），随后外壳会退出让安装器替换。 */
+  installUpdate: (file) => ipcRenderer.invoke("dsh:update:install", String(file)),
+  /** 用系统浏览器打开 Releases 页（想自己下的时候用）。 */
+  openReleases: () => ipcRenderer.invoke("dsh:update:open-page"),
+  /** 下载进度：{ got, total, percent } */
+  onUpdateProgress: (cb) => subscribe("dsh:update:progress", cb),
+  /** 托盘「检查更新…」让设置页跳到某一栏：pane 名 */
+  onFocusPane: (cb) => subscribe("dsh:settings:focus-pane", cb),
 });

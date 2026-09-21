@@ -44,6 +44,7 @@ const K = require("./kernel");
 const diagnostics = require("./diagnostics");
 const P = require("./plugins");
 const SITES = require("./sites");
+const U = require("./update");
 const WHALE = require("./whale-path.json");
 
 // ── 最早期的错误捕获 ──────────────────────────────────────────────
@@ -991,6 +992,9 @@ function trayTemplate() {
       })),
     },
     { label: "设置…", accelerator: "Ctrl+,", click: () => openSettingsWindow() },
+    // ★ 检查更新只在设置页里实现一份：托盘这条只是**把设置页打开并跳到「更新」栏**，
+    //   不在这里另写一套对话框逻辑（两处实现必然分叉）。
+    { label: "检查更新…", click: () => openSettingsWindow("update") },
     { label: "在浏览器中打开", enabled: !!serverUrl, click: () => serverUrl && shell.openExternal(serverUrl) },
     { type: "separator" },
     {
@@ -1039,11 +1043,21 @@ function createTray() {
 }
 
 // ── 设置窗口 ──────────────────────────────────────────────────────
-function openSettingsWindow() {
+/**
+ * 打开（或聚焦）外壳设置窗口。
+ *
+ * @param {string} [pane] 想让设置页直接跳到哪一栏（`general` / `diag` / `update` / `about`）。
+ *   托盘那条「检查更新…」就是这么用的 —— **更新流程只在设置页里实现一份**，
+ *   托盘不另写一套对话框逻辑。
+ */
+function openSettingsWindow(pane) {
   if (settingsWindow && !settingsWindow.isDestroyed()) {
     if (settingsWindow.isMinimized()) settingsWindow.restore();
     settingsWindow.show();
     settingsWindow.focus();
+    if (pane) {
+      try { settingsWindow.webContents.send("dsh:settings:focus-pane", String(pane)); } catch { /* 忽略 */ }
+    }
     return;
   }
   settingsWindow = new BrowserWindow({
@@ -1070,6 +1084,12 @@ function openSettingsWindow() {
     if (/^https?:/.test(url)) shell.openExternal(url);
     return { action: "deny" };
   });
+  // 页面加载完再把"跳到哪一栏"告诉她 —— 加载前发会丢（页面还没订阅）
+  if (pane) {
+    settingsWindow.webContents.once("did-finish-load", () => {
+      try { settingsWindow.webContents.send("dsh:settings:focus-pane", String(pane)); } catch { /* 忽略 */ }
+    });
+  }
   settingsWindow.loadFile(path.join(__dirname, "settings.html"))
     .catch((e) => log("加载设置页失败:", (e && e.message) || e));
 }
@@ -1133,6 +1153,13 @@ function diagEmit(stream, text) {
     if (w && !w.isDestroyed()) {
       try { w.webContents.send("dsh:diag:out", { stream, text }); } catch { /* 窗口正在关 */ }
     }
+  }
+}
+
+/** 更新进度只推给设置窗口（更新流程就实现在那里）。 */
+function updateEmit(payload) {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    try { settingsWindow.webContents.send("dsh:update:progress", payload); } catch { /* 忽略 */ }
   }
 }
 
@@ -1273,6 +1300,59 @@ function registerIpc() {
   ipcMain.handle("dsh:page:switch", (e, id) => {
     assertPageSender(e);
     return switchPage(id);
+  });
+
+  // ── 切换面板里的「外壳设置」入口 ──
+  // 与 switchPage 同一个来源判定：把手注入在官方 UI 与两个外部站点里，
+  // 所以这里也必须放行它们（否则用户在网站页里点设置会被拒）。
+  ipcMain.handle("dsh:page:open-settings", (e) => {
+    assertPageSender(e);
+    openSettingsWindow();
+    return { ok: true };
+  });
+
+  // ── 检查更新（实现全在 src/update.js；这里只做来源判定与转发）──
+  // 这三条会下载文件、启动安装包 ⇒ 只放行**外壳自有页面**（也就是设置页）。
+  ipcMain.handle("dsh:update:check", async (e) => {
+    assertShellSender(e);
+    log("检查更新…");
+    const r = await U.check();
+    log(`检查更新：ok=${r.ok} 当前=${r.current} 最新=${r.latest || "-"} 有更新=${r.hasUpdate} ${r.reason || ""}`);
+    return r;
+  });
+
+  ipcMain.handle("dsh:update:download", async (e, asset) => {
+    assertShellSender(e);
+    const a = asset && typeof asset === "object" ? asset : null;
+    if (!a || !a.url) return { ok: false, reason: "没有可下载的附件" };
+    log(`开始下载更新：${a.name}（${a.size || "?"} 字节）`);
+    const r = await U.download(a, (p) => updateEmit({ kind: "progress", ...p }));
+    log(`下载更新结果：ok=${r.ok} ${r.reason || r.path}`);
+    return r;
+  });
+
+  ipcMain.handle("dsh:update:install", async (e, file) => {
+    assertShellSender(e);
+    const f = typeof file === "string" ? file : "";
+    // ★ 只允许启动**我们自己下到临时目录**里的那个安装包，不接受任意路径 ——
+    //   否则"检查更新"就变成了一个"运行任意 exe"的通道。
+    const tmp = path.resolve(app.getPath("temp")).toLowerCase();
+    if (!f || path.dirname(path.resolve(f)).toLowerCase() !== tmp) {
+      return { ok: false, reason: "拒绝：安装包不在本应用的临时目录里" };
+    }
+    const r = await U.launchInstaller(f);
+    if (r.ok) {
+      log("已启动安装包；外壳稍后退出，好让安装器替换正在运行的文件");
+      // 外壳不退出的话，安装器替换不了正在运行的 exe。
+      // 给安装器一点起来的时间再退（装完它会自己把新版本拉起来）。
+      setTimeout(() => { quitting = true; app.quit(); }, 1500);
+    }
+    return r;
+  });
+
+  ipcMain.handle("dsh:update:open-page", (e) => {
+    assertShellSender(e);
+    return U.openReleasesPage();
   });
 }
 

@@ -748,6 +748,59 @@ async function verifyPages(tmpDir) {
       console.log(`  站点页诊断: ${JSON.stringify(sp)}`);
       check("站点页面里也注入了切换把手（进去有出口）", !!(sp && sp.handle), JSON.stringify(sp));
     }
+
+    // ── 设置入口 + 检查更新（0.2.4 的两件新东西，一起真验）──
+    //  ★ **必须真点**：DOM 里有那个按钮，不等于点了有用。
+    console.log("  试「外壳设置」入口与「检查更新」…");
+    const clicked = await cdpEval(ws.url, `(() => {
+      const row = document.querySelector('[data-dsh-page-switch="panel"] [data-dsh-action="shell-settings"]');
+      if (!row) return "no-row";
+      row.click();
+      return "clicked";
+    })()`);
+    check("切换面板里有「外壳设置」入口", clicked === "clicked", String(clicked));
+
+    let setT = null;
+    const setDeadline = Date.now() + 20000;
+    while (Date.now() < setDeadline) {
+      try {
+        const ts3 = await listTargets();
+        setT = ts3.find((t) => t.type === "page" && /settings\.html/.test(t.url || ""));
+        if (setT) break;
+      } catch { /* CDP 抖动 */ }
+      await sleep(500);
+    }
+    check("点它真的打开了外壳设置窗口", !!setT, setT ? "settings.html 目标已出现" : "没等到 settings.html 目标");
+
+    if (setT) {
+      await sleep(1500);
+      const setProbe = `(() => JSON.stringify({
+        hasNav: !!document.querySelector('nav button[data-pane="update"]'),
+        hasPane: !!document.querySelector('.pane[data-pane="update"]'),
+        current: (document.getElementById('up-current') || {}).textContent || '',
+        hasBtn: !!document.getElementById('btn-up-check'),
+        status: (document.getElementById('up-status') || {}).textContent || '',
+      }))()`;
+      const s2 = JSON.parse(await cdpEval(setT.webSocketDebuggerUrl, setProbe, 20000));
+      check("设置页里有「更新」这一栏", s2.hasNav && s2.hasPane, JSON.stringify(s2));
+      check("更新栏显示了当前版本（v 开头）", /^v\d/.test(s2.current), s2.current);
+
+      // 真点一次「检查更新」—— 这一步要联网
+      await cdpEval(setT.webSocketDebuggerUrl,
+        `(() => { document.getElementById('btn-up-check').click(); return 'ok'; })()`, 20000);
+      let after = s2.status;
+      const upDeadline = Date.now() + 30000;
+      while (Date.now() < upDeadline) {
+        await sleep(1000);
+        after = await cdpEval(setT.webSocketDebuggerUrl,
+          `(document.getElementById('up-status') || {}).textContent || ''`, 20000);
+        if (after && !/正在查/.test(after)) break;
+      }
+      console.log(`  检查更新结果文案: ${after}`);
+      check("点「检查更新」真拿到了结论（不是停在「正在查」）",
+        /已是最新|发现新版本|检查失败|检查出错/.test(after), after);
+      check("结论里带版本号（说明真解析了 Release）", /v\d+\.\d+\.\d+/.test(after), after);
+    }
   } finally {
     await stopApp(child);
   }

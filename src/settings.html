@@ -80,6 +80,7 @@
 <main>
   <nav>
     <button data-pane="general" class="on">常规</button>
+    <button data-pane="update">更新</button>
     <button data-pane="diag">诊断与修复</button>
     <button data-pane="about">关于</button>
   </nav>
@@ -127,6 +128,45 @@
         <div class="v">
           <span class="mono" id="set-logdir">—</span>
           <button class="btn" id="btn-open-logs">打开</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 更新 ─────────────────────────────────────────────── -->
+    <section class="pane" data-pane="update">
+      <h2>更新</h2>
+      <p class="hint">
+        从本项目的 GitHub Releases 查新版本，查到就能**直接下载并安装** —— 不用自己去网页上找。
+        这里升的是**外壳**；内核是另一回事（内核版本见「关于」，升级内核不走这里）。
+      </p>
+
+      <div class="row">
+        <div class="k">当前版本</div>
+        <div class="v"><span class="mono" id="up-current">—</span></div>
+      </div>
+      <div class="row">
+        <div class="k">检查更新</div>
+        <div class="v">
+          <button class="btn" id="btn-up-check">检查更新</button>
+          <button class="btn" id="btn-up-page">打开下载页</button>
+          <span class="note" id="up-status">还没检查</span>
+        </div>
+      </div>
+      <div class="row" id="up-row-new" style="display:none">
+        <div class="k">新版本</div>
+        <div class="v" style="flex-direction:column;align-items:stretch;gap:8px">
+          <div><b id="up-latest"></b> <span class="note" id="up-asset"></span></div>
+          <div id="up-bar" style="display:none;height:8px;background:var(--line-soft);border-radius:6px;overflow:hidden">
+            <i id="up-fill" style="display:block;height:100%;width:0;background:var(--accent);transition:width .15s"></i>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button class="btn" id="btn-up-go">下载并安装</button>
+            <span class="note" id="up-prog"></span>
+          </div>
+          <details>
+            <summary style="cursor:pointer;color:var(--fg-dim)">这一版改了什么</summary>
+            <pre id="up-notes" style="white-space:pre-wrap;font-size:12px;color:#3d444d;max-height:220px;overflow:auto;margin:8px 0 0"></pre>
+          </details>
         </div>
       </div>
     </section>
