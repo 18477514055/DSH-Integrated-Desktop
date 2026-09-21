@@ -33,7 +33,8 @@ const ROOT = path.join(__dirname, "..");
 const CHECKS = [
   {
     file: "src/inject/page-switch.js",
-    marks: ["shell-settings", "外壳设置", "__dshPageSwitch", "swallowFromRoot", "data-page-id"],
+    marks: ["shell-settings", "外壳设置", "__dshPageSwitch", "swallowFromRoot", "data-page-id",
+      "data-dsh-note"],
   },
   {
     file: "src/settings.html",
@@ -49,7 +50,9 @@ const CHECKS = [
   },
   {
     file: "src/sites.js",
-    marks: ["chat.deepseek.com", "platform.deepseek.com", "LOCAL_ID"],
+    marks: ["chat.deepseek.com", "platform.deepseek.com", "LOCAL_ID",
+      "pagesUi", "statusOf", "did-fail-load", "FAIL_GRACE_MS", "loadInto", "errorCardHtml",
+      "did-navigate"],
   },
   {
     file: "src/main.js",

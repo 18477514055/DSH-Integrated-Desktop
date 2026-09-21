@@ -201,6 +201,19 @@
           whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
         }, p.hint));
       }
+      // ★ 0.2.7：把**这一页此刻的真实情况**也写出来 ——
+      //   加载没成功 / 提交成功了但停在了别的域（被重定向）/ 站点返回 4xx-5xx。
+      //   原来这些全是静默的：面板 ✓ 说你在开放平台，屏幕上却是网页版的页面
+      //   （用户原话：「点到开放平台，它还是保持着网页版的状态」）。
+      //   ⇒ 结论：**状态不许撒谎**，说不清就把它写在这行小字里。
+      if (p.note) {
+        var note = mk("span", {
+          color: p.bad ? "#fbbf24" : "#64748b", fontSize: "11px",
+          whiteSpace: "normal", wordBreak: "break-word",
+        }, (p.bad ? "⚠ " : "") + p.note);
+        note.setAttribute("data-dsh-note", p.bad ? "bad" : "info");
+        box.appendChild(note);
+      }
       row.appendChild(box);
       listEl.appendChild(row);
     });

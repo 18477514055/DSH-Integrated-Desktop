@@ -136,10 +136,13 @@ function launch(_mode, tmpDir, port, opts = {}) {
 
   // ★ 不用管道抓子进程输出：Windows 沙箱下 Node 的 piped stdio 会 EPERM。
   //   应用自己会把日志写进 <userData>/shell.log，失败时读文件即可（readAppLog）。
+  // ★ 可选：额外的 Electron 启动参数（pages 模式用它从 DNS 层制造一次确定性失败）
+  const extraArgs = Array.isArray(opts.extraArgs) ? opts.extraArgs : [];
   const child = spawn(electronExe, [
     ".",
     `--user-data-dir=${tmpDir}`,
     `--remote-debugging-port=${CDP_PORT}`,
+    ...extraArgs,
   ], { cwd: ROOT, env, stdio: "ignore", windowsHide: false });
 
   return { child };
@@ -697,6 +700,105 @@ async function verifyPages(tmpDir) {
     check("主进程状态**真的**变成 platform（不是只有按钮变了）",
       /"active":"platform"/.test(s1), String(s1).slice(0, 140));
 
+    // ══════════════════════════════════════════════════════════════
+    // ★★ 0.2.7：光看"状态变成 platform"**不算数** —— 那正是原来那个 bug
+    // ══════════════════════════════════════════════════════════════
+    // 0.2.6 及以前两个网站**共用一个 `WebContentsView`**，于是：平台加载失败时，
+    // 屏幕上留着的是**网页版**的页面，而 `activeId`（以及面板的 ✓、推给按钮的状态）
+    // 都说你在开放平台。用户原话：
+    //   「最开始的时候可以看到开放平台，但是现在点到开放平台，
+    //     它还是保持着网页版的状态」。
+    // 那次的日志证据：平台每次加载都 `ERR_ABORTED`，而**共用的那个 view** 的地址
+    // 还停在 chat.deepseek.com ⇒ 之后点哪一页都不重载，看着就是卡住。
+    // ⇒ 判据必须落到**那一页自己的视图**上（`views[id].host/.err/.visible`），
+    //   而不是 `active` 这个"我想去哪一页"的意图。
+    let snap = null;
+    const pdl = Date.now() + 50000;
+    while (Date.now() < pdl) {
+      snap = JSON.parse(await cdpEval(ws.url, `window.dshShell.pages().then(s => JSON.stringify(s))`));
+      const v = snap.views && snap.views.platform;
+      if (v && (v.err || v.host)) break;      // 有结论了：加载成功 或 已判定失败
+      await sleep(1500);
+    }
+    const V1 = snap.views || {};
+    const rowOf = (s, id) => (s.pages || []).find((p) => p.id === id) || {};
+
+    check("★ 切到开放平台之后，**可见的那一层**就是 platform（不是 chat 还开着）",
+      !!(V1.platform && V1.platform.visible === true) && !(V1.chat && V1.chat.visible === true),
+      `platform.visible=${V1.platform && V1.platform.visible} chat.visible=${V1.chat && V1.chat.visible}`);
+
+    // ★★ 这一条就是用户报的那个 bug 的直接判据
+    check("★★ 开放平台那一页**绝不会**停在网页版的地址上（0.2.6 的真 bug）",
+      !(V1.platform && V1.platform.host === "chat.deepseek.com"),
+      `platform.host=${JSON.stringify(V1.platform && V1.platform.host)} err=${JSON.stringify(V1.platform && V1.platform.err)}`);
+
+    if (V1.platform && V1.platform.err) {
+      console.log(`  站点没加载成功：${V1.platform.err}（多半是站点/WAF 挡了这台机器）`);
+      check("★ 没加载成功时，面板那一行**必须**把原因写出来（不许静默）",
+        rowOf(snap, "platform").bad === true && !!rowOf(snap, "platform").note,
+        JSON.stringify({ note: rowOf(snap, "platform").note, bad: rowOf(snap, "platform").bad }));
+      const cardT = await findTarget((t) => t.type === "page"
+        && /开放平台/.test(t.title || "") && /^data:text\/html/.test(t.url || ""), 8000);
+      check("★ 失败后那一页换成了**本地错误卡片**（而不是把别的站点的页面留在屏幕上）",
+        !!cardT, cardT ? cardT.url.slice(0, 46) : "没找到错误卡片 target");
+      if (cardT) {
+        const cardTxt = String(await cdpEval(cardT.webSocketDebuggerUrl, `document.body.innerText.slice(0,240)`));
+        check("★ 错误卡片上写着错误码与重试办法",
+          /ERR_|HTTP /.test(cardTxt) && /重试|再点一次/.test(cardTxt),
+          cardTxt.replace(/\s+/g, " ").slice(0, 130));
+      }
+    } else {
+      check("★ 站点加载成功时，那一页的地址必须落在本站域（跨域跳转要在面板上说明）",
+        V1.platform.host === "platform.deepseek.com" || rowOf(snap, "platform").bad === true,
+        `host=${JSON.stringify(V1.platform && V1.platform.host)} note=${JSON.stringify(rowOf(snap, "platform").note)}`);
+      console.log("  SKIP  失败分支（当前站点可达，没走到错误卡片那条路）");
+
+      // ★ 同域内的重定向只能靠**路径**认：实测 `platform.deepseek.com/` 会返回 200
+      //   然后自己跳到 `/sign_in` —— 域名没变，"实际停在别的域"那条判据不会触发，
+      //   用户看着一个登录页却不知道这就是"开放平台没登进去"。
+      const pt = await findTarget((t) => t.type === "page" && /platform\.deepseek\.com/.test(t.url || ""), 6000);
+      if (pt) {
+        const pth = String(await cdpEval(pt.webSocketDebuggerUrl, `location.pathname`, 10000));
+        console.log(`  开放平台那一页的实际路径: ${pth}`);
+        if (/\/(sign[-_]?in|log[-_]?in|auth|oauth|passport)/i.test(pth)) {
+          const row = rowOf(JSON.parse(await cdpEval(ws.url, `window.dshShell.pages().then(s => JSON.stringify(s))`)), "platform");
+          check("★ 同域内跳到登录页时，面板那一行**必须**说明「停在登录页」",
+            row.bad === true && /登录/.test(row.note || ""), JSON.stringify({ note: row.note, bad: row.bad }));
+        } else {
+          console.log("  SKIP  同域登录页那一条 —— 这一页当前不在登录路径上");
+        }
+      }
+    }
+
+    // ── 反方向再走一趟：chat → platform → chat，确认两页**互不覆盖** ──
+    await cdpEval(ws.url, `window.dshShell.switchPage('chat').then(r => JSON.stringify(r))`, 20000);
+    let cs = null;
+    const cdl = Date.now() + 30000;
+    while (Date.now() < cdl) {
+      cs = JSON.parse(await cdpEval(ws.url, `window.dshShell.pages().then(s => JSON.stringify(s))`));
+      const v = cs.views && cs.views.chat;
+      if (v && (v.err || v.host)) break;
+      await sleep(1500);
+    }
+    check("★ 切到网页版时，可见的是 chat 那一层、platform 那一层收起",
+      !!(cs.views.chat && cs.views.chat.visible === true) && !(cs.views.platform && cs.views.platform.visible === true),
+      JSON.stringify(cs.views));
+    check("★★ 两页互不覆盖：在网页版这一页看到的一定是 chat 的域（或它自己的错误卡片）",
+      cs.views.chat.host !== "platform.deepseek.com",
+      `chat.host=${JSON.stringify(cs.views.chat.host)} err=${JSON.stringify(cs.views.chat.err)}`);
+
+    // ── ★ 不依赖站点可达性，**强行**制造一次失败，把"失败要看得见"那条路验死 ──
+    //   做法：找到 platform 那一页**自己的**页面目标，在里面把地址改成必然连不上的
+    //   127.0.0.1:9 ⇒ 主框架 did-fail-load(ERR_CONNECTION_REFUSED) ⇒ 应当换成错误卡片。
+    //
+    //   ⚠️⚠️ 这一招**实测不灵，已经废掉**（2026-09-22）：
+    //   站点页面自己挂了 `beforeunload`，而**没有用户手势**时 Chromium 会**直接取消**
+    //   这次导航 —— 日志里连一条导航记录都没有，`did-fail-load` 根本不触发。
+    //   我第一版就把它当成"验过了"，那是**假的**（量具自己撒谎，本轮第四次）。
+    //   ⇒ 改成 `verifyPagesOffline()`：用**指向死端口的代理**（本机地址绕过）
+    //     把所有外部站点确定性掐掉，制造一次真的加载失败。
+    console.log("  （失败那条路在第二趟里用死代理确定性制造，见下）");
+
     // ★ 安全边界：合法取值只有三个 id，别的一律拒
     const bad = await cdpEval(ws.url, `window.dshShell.switchPage('evil').then(r => JSON.stringify(r))`);
     check("非法页面 id 被拒（越不出这三页）", /"ok":false/.test(bad), String(bad));
@@ -845,6 +947,110 @@ async function verifyPages(tmpDir) {
     }
   } finally {
     await stopApp(child);
+  }
+
+  // ★ 第二趟：把「站点真的连不上」那条路**确定性**地验掉（见下面的说明）
+  await verifyPagesOffline(tmpDir);
+}
+
+/**
+ * ★★ 「站点连不上」这条路 —— 用启动参数从 **DNS 层**制造一次确定性失败。
+ *
+ * ══════════════════════════════════════════════════════════════════
+ * 为什么不能用"把那一页的地址改成 127.0.0.1:9"
+ * ══════════════════════════════════════════════════════════════════
+ * 第一版就是这么写的，而且**它悄悄地什么也没做**：
+ * 站点页面自己挂了 `beforeunload`，而没有用户手势时 Chromium 会**直接取消**
+ * 这次导航 —— shell.log 里连一条导航记录都没有，`did-fail-load` 根本没触发。
+ * 我却拿它当"验过了"（量具自己撒谎，本轮第四次踩到同一类坑）。
+ *
+ * `--host-resolver-rules=MAP platform.deepseek.com ~NOTFOUND` 是 **DNS 层**的确定性失败：
+ * 不管站点此刻通不通、有没有 beforeunload，主框架就是解析不到域名。
+ *
+ * ⚠️⚠️ **但这招在本机也没生效**（2026-09-22 第二次实测）：本机走 Clash 代理
+ *   （`127.0.0.1:7897`），**域名是在代理那边解析的** ⇒ 本地的 resolver 规则被整个绕过，
+ *   平台照样加载成功（日志里 `[platform] 已显示 …（HTTP 200）`）。
+ *   现在是第三次尝试，用**指向死端口的代理**：
+ *
+ *     --proxy-server=127.0.0.1:9   ← 一个必然连不上的代理
+ *     --proxy-bypass-list=127.0.0.1;localhost   ← 本机内核必须绕过，否则连界面都起不来
+ *
+ *   结果：本机页面照常、**所有外部站点确定性失败**（ERR_PROXY_CONNECTION_FAILED）。
+ *   这跟"代理挂了/断网"是同一个现象，正是要验的那条路。
+ *
+ * ⚠️ 这一趟**只**验那一件事：失败被认出来、错误卡片出现、
+ *    面板写清原因、那一页仍然可见、再点一次会真的重试。
+ *    不去重验第一趟已经验过的面板/设置那些（它们的判据不受这次失败影响）。
+ */
+async function verifyPagesOffline(tmpDir) {
+  const PORT = 3183;                      // 与 pages 的 3178 / firstrun 的 3180 错开
+  const dir = tmpDir + "-offline";
+  fs.mkdirSync(dir, { recursive: true });
+  console.log("");
+  console.log("  ── 第二趟：把外部站点用死代理掐掉（本机绕过），验「连不上」那条路 ──");
+  const { child } = launch("pages", dir, PORT, {
+    extraArgs: [
+      "--proxy-server=127.0.0.1:9",
+      "--proxy-bypass-list=127.0.0.1;localhost",
+    ],
+  });
+  try {
+    const target = await waitForPage((t) => t.url.startsWith(`http://127.0.0.1:${PORT}/`), 120000);
+    const ws = target.webSocketDebuggerUrl;
+    await sleep(2500);
+
+    await cdpEval(ws, `window.dshShell.switchPage('platform').then(r => JSON.stringify(r))`, 20000);
+    let v = null;
+    const dl = Date.now() + 30000;
+    while (Date.now() < dl) {
+      v = JSON.parse(await cdpEval(ws, `window.dshShell.pages().then(s => JSON.stringify(s.views.platform))`));
+      if (v && /ERR_/.test(v.err || "")) break;
+      await sleep(1000);
+    }
+    check("★★ 站点真的连不上时，那一页的失败被判出来并记下错误码（死代理确定性制造）",
+      !!(v && /ERR_/.test(v.err || "")), JSON.stringify(v));
+    check("★ 失败之后那一页**仍然是可见的那一层**（不会莫名其妙跳走）",
+      !!(v && v.visible === true), JSON.stringify(v));
+    check("★★ 那一页**绝不会**停在别的站点的地址上（0.2.6 的真 bug）",
+      !(v && v.host === "chat.deepseek.com"), JSON.stringify(v));
+
+    const st = JSON.parse(await cdpEval(ws, `window.dshShell.pages().then(s => JSON.stringify(s))`));
+    const row = (st.pages || []).find((p) => p.id === "platform") || {};
+    check("★ 面板那一行把原因写出来了（bad=true 且有文案）",
+      row.bad === true && !!row.note, JSON.stringify({ note: row.note, bad: row.bad }));
+
+    const card = await findTarget((t) => t.type === "page"
+      && /开放平台/.test(t.title || "") && /^data:text\/html/.test(t.url || ""), 10000);
+    check("★★ 失败后这一页换成了**本地错误卡片**（不是留下别的站点的页面、也不是空白）",
+      !!card, card ? card.url.slice(0, 46) : "没找到错误卡片 target");
+    if (card) {
+      const txt = String(await cdpEval(card.webSocketDebuggerUrl, `document.body.innerText.slice(0,260)`));
+      check("★ 卡片上写着错误码、想要的地址与重试办法",
+        /ERR_/.test(txt) && /platform\.deepseek\.com/.test(txt) && /重试|再点一次/.test(txt),
+        txt.replace(/\s+/g, " ").slice(0, 140));
+    }
+
+    // 再点一次这一页必须**真的重新去加载**，不是卡在错误卡片上
+    await cdpEval(ws, `window.dshShell.switchPage('platform').then(r => JSON.stringify(r))`, 20000);
+    await sleep(4000);
+    const loads = readAppLog(dir, 500).filter((l) => /加载站点：https:\/\/platform\.deepseek\.com/.test(l));
+    check("★ 再点一次这一页会**真的重试**（日志里出现新一轮「加载站点」）",
+      loads.length >= 2, `${loads.length} 次`);
+
+    // ★ 这一趟自己干了什么，必须打出来 —— 不然失败时只能靠猜
+    //   （第一次跑这里时，我只打了主那一趟的日志，于是"事件到底响没响"完全看不见）
+    const pt2 = await findTarget((t) => t.type === "page" && /platform\.deepseek\.com/.test(t.url || ""), 5000);
+    if (pt2) {
+      const href = String(await cdpEval(pt2.webSocketDebuggerUrl, `location.href`, 10000));
+      console.log(`  这一页的 webContents 认为自己在: ${href}`);
+    }
+    const tail = readAppLog(dir, 500).filter((l) => /站点|platform|页面|did-fail-load/.test(l)).slice(-12);
+    console.log("  第二趟日志（筛过）:");
+    for (const l of tail) console.log("    " + l);
+  } finally {
+    await stopApp(child);
+    await sleep(400);
+    try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* 交给外层 */ }
   }
 }
 
@@ -1107,6 +1313,23 @@ async function findSettingsTarget(timeoutMs) {
       const t = ts.find((x) => x.type === "page" && /settings\.html/.test(x.url || ""));
       if (t) return t;
     } catch { /* CDP 还在起来 */ }
+    await sleep(400);
+  }
+  return null;
+}
+
+/**
+ * 等一个满足条件的页面目标出现（找站点视图那一层要用）。
+ * 与 findSettingsTarget 分开写是有意的：这两个判据看的字段不一样。
+ */
+async function findTarget(pred, timeoutMs) {
+  const dl = Date.now() + timeoutMs;
+  while (Date.now() < dl) {
+    try {
+      const ts = await listTargets();
+      const t = ts.find(pred);
+      if (t) return t;
+    } catch { /* CDP 还没起来 */ }
     await sleep(400);
   }
   return null;

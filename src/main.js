@@ -584,12 +584,32 @@ function attachShortcuts(wc) {
 }
 
 // ── 页面切换：本机 DSH / DeepSeek 网页版 / DeepSeek 开放平台 ──────
+/**
+ * 三页清单 + 当前页。
+ *
+ * ★ 0.2.7 起除了静态的 label/hint，还带上**每一页此刻的真相**
+ *   （`host` / `note` / `bad` / `err`）—— 见 `sites.js` 的 `pagesUi()`。
+ *   原来的 bug 就是这里只说"你想去哪一页"，从不报告"那一页到底显示成了什么"。
+ *   `views` 是给验收脚本核对用的真实地址（**不推给网站页面的脚本**，见 pagesUi 的注释）。
+ */
 function pageState() {
   const active = siteHost ? siteHost.active() : SITES.LOCAL_ID;
-  return {
-    active,
-    pages: SITES.PAGES.map((p) => ({ id: p.id, label: p.label, hint: p.hint })),
-  };
+  const pages = siteHost
+    ? siteHost.pagesUi()
+    : SITES.PAGES.map((p) => ({ id: p.id, label: p.label, hint: p.hint, host: "", note: "", bad: false, err: "" }));
+  const views = {};
+  if (siteHost) {
+    for (const p of SITES.PAGES) {
+      if (p.kind !== "web") continue;
+      const s = siteHost.statusOf(p.id);
+      // ★ 只外发**非敏感**的那几项。这个 payload 会经 `dsh:page:list` 回到两个网站页面的
+      //   脚本里（切换把手要用它），而完整 URL 的路径/查询串上可能带登录跳转参数
+      //   ⇒ 不外发完整地址。要完整地址的是**验收脚本**，它直接去那一页自己的
+      //   webContents 上读 `location.href`（那是"屏幕上到底是什么"最硬的证据）。
+      views[p.id] = { host: s.host, http: s.http, err: s.err, visible: s.visible };
+    }
+  }
+  return { active, pages, views };
 }
 
 /** 切页。任何异常都吞掉并记日志 —— 切页失败不该让外壳崩掉。 */
