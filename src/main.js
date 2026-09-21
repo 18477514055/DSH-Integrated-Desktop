@@ -1207,8 +1207,11 @@ async function pluginState({ force = false } = {}) {
     profile,
     counts: {
       total: rows.length,
-      installed: rows.filter((r) => r.state === "installed" || r.state === "update" || r.state === "disabled").length,
+      // ★ "已装"要把**本地装的**也算进去（dev 联接 / 本地 tgz / npm）——
+      //   第一版只数我们装的那些，于是真机上显示「已装 0」而实际装着 11 个。
+      installed: rows.filter((r) => ["installed", "update", "disabled", "local"].includes(r.state)).length,
       updatable: rows.filter((r) => r.state === "update").length,
+      local: rows.filter((r) => r.state === "local").length,
       broken: rows.filter((r) => r.state === "broken").length,
     },
   };

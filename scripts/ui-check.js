@@ -823,6 +823,37 @@ async function verifyPlugins(tmpDir) {
     const pkgFile = path.join(dshHome, "profiles", "web", "package.json");
     check("（前置）临时家里内核已经把 profile 建出来了", fs.existsSync(pkgFile), pkgFile);
 
+    // ★ 种一个「本地装的」插件进去（模拟开发机那种 dev 联接），专门验
+    //   **"已装 ≠ 从我们仓库装的"** 这条。
+    //   第一版就是在这儿瞎的：真机 B 家里装着 11 个插件、界面报「已装 0」，
+    //   并且给已经装着的插件显示「安装」按钮 —— 一点就会覆盖用户的 dev link。
+    const localSrc = path.join(tmpDir, "local-dev-plugin", "dsh-multi-session");
+    fs.mkdirSync(path.join(localSrc, "lib"), { recursive: true });
+    fs.writeFileSync(path.join(localSrc, "package.json"), JSON.stringify({
+      name: "dsh-multi-session", version: "9.9.9", main: "lib/index.js",
+      dsh: { bundle: { patch: "./cordis.patch.yml" }, client: { platform: "web" } },
+    }, null, 2) + "\n", "utf8");
+    fs.writeFileSync(path.join(localSrc, "cordis.patch.yml"), "- insert: []\n", "utf8");
+    fs.writeFileSync(path.join(localSrc, "lib", "index.js"), "module.exports = {};\n", "utf8");
+    {
+      const pj = JSON.parse(fs.readFileSync(pkgFile, "utf8").replace(/^\uFEFF/, ""));
+      pj.dependencies = pj.dependencies || {};
+      pj.dependencies["dsh-multi-session"] = "link:" + localSrc;
+      pj.dsh = pj.dsh || { profile: {} };
+      pj.dsh.profile = pj.dsh.profile || {};
+      pj.dsh.profile.bundles = pj.dsh.profile.bundles || [];
+      if (!pj.dsh.profile.bundles.includes("dsh-multi-session")) pj.dsh.profile.bundles.push("dsh-multi-session");
+      fs.writeFileSync(pkgFile, JSON.stringify(pj, null, 2) + "\n", "utf8");
+
+      const nm = path.join(dshHome, "profiles", "web", "node_modules");
+      fs.mkdirSync(nm, { recursive: true });
+      const link = path.join(nm, "dsh-multi-session");
+      try { fs.rmSync(link, { recursive: true, force: true }); } catch { /* 没有就算了 */ }
+      let linked = false;
+      try { fs.symlinkSync(localSrc, link, "junction"); linked = true; } catch { linked = false; }
+      check("（夹具）已把 dsh-multi-session 种成本地 dev 联接（指向仓库外的目录）", linked, link);
+    }
+
     // ① 从主界面用受限通道打开外壳设置窗口 —— 与用户在把手里点「外壳设置…」同一条路
     const opened = await cdpEval(mainUrl, `window.dshShell.openShellSettings().then(r => JSON.stringify(r))`);
     check("主界面能打开外壳设置窗口", /"ok":true/.test(opened), String(opened));
@@ -870,7 +901,11 @@ async function verifyPlugins(tmpDir) {
           tags: Array.from(c.querySelectorAll('.tag')).map(t=>t.textContent),
           desc: (c.querySelector('.ds')||{}).textContent||'',
           meta: (c.querySelector('.meta')||{}).textContent||'',
-          ops: Array.from(c.querySelectorAll('button[data-pl-act]')).map(b=>b.dataset.plAct),
+          ops: Array.from(c.querySelectorAll('button[data-pl-act]')).map(b=>({
+            act: b.dataset.plAct,
+            replace: b.dataset.plReplace === '1',
+            label: (b.textContent||'').trim(),
+          })),
         })),
       });
     })()`;
@@ -901,6 +936,21 @@ async function verifyPlugins(tmpDir) {
       st.cards.every((c) => /来自 \S+\/\S+/.test(c.meta)),
       JSON.stringify(st.cards.map((c) => c.meta.slice(0, 70))));
 
+    // ── ★ 「本地装的」必须被认出来（真机实测出来的缺陷，这一段专防它复发）──
+    check("★ 已装数把本地装的也算上了（不是「已装 0」）", !/已装 0 \//.test(st.count), st.count);
+    const msCard = st.cards.find((c) => c.name === "dsh-multi-session");
+    check("★ 本地 dev 联接的那个插件被认成「已装（本地装的）」",
+      !!(msCard && msCard.tags.includes("已装（本地装的）")),
+      msCard ? JSON.stringify(msCard.tags) : "清单里没有 dsh-multi-session 这张卡");
+    check("★ 它那张卡**不给**普通「安装」，只给「改用仓库版」",
+      !!(msCard && msCard.ops.some((o) => o.act === "install" && o.replace)
+        && !msCard.ops.some((o) => o.act === "install" && !o.replace)),
+      msCard ? JSON.stringify(msCard.ops) : "无卡");
+    check("它标出了来路（本地目录联接 / 本地包文件 / npm）",
+      !!(msCard && /装在：/.test(msCard.meta)), msCard ? msCard.meta.slice(0, 120) : "无卡");
+    check("它报的是**本地那一份**的版本 9.9.9（不是线上版本）",
+      !!(msCard && /本机 v9\.9\.9/.test(msCard.meta)), msCard ? msCard.meta.slice(0, 120) : "无卡");
+
     // ④ 真点「检查插件更新」—— DOM 里有按钮不等于点了有用
     await cdpEval(ws, `(() => { document.getElementById('btn-pl-check').click(); return 'ok'; })()`, 20000);
     let after = st.status;
@@ -915,7 +965,9 @@ async function verifyPlugins(tmpDir) {
       /清单更新于|显示的是缓存|取清单失败/.test(after), after);
 
     // ⑤ ★ 真装一个：挑「可装 + 不是开发者工具」的那张卡，点它的安装按钮
-    const pick = st.cards.find((c) => c.ops.includes("install") && !c.tags.includes("开发者工具"));
+    //    ★ 必须是**普通安装**（不是"改用仓库版"）—— 否则会去覆盖上面那个种进去的本地插件
+    const pick = st.cards.find((c) => c.ops.some((o) => o.act === "install" && !o.replace)
+      && !c.tags.includes("开发者工具"));
     if (!pick) {
       console.log("  SKIP  清单里没有可装的非开发工具插件 —— 安装这一段没验到，**不算通过**");
       return;
@@ -926,7 +978,7 @@ async function verifyPlugins(tmpDir) {
       const c = Array.from(document.querySelectorAll('#pl-list .pl-card'))
         .find(x => ((x.querySelector('.nm')||{}).textContent||'') === ${JSON.stringify(pick.name)});
       if (!c) return 'no-card';
-      const b = c.querySelector('button[data-pl-act="install"]');
+      const b = c.querySelector('button[data-pl-act="install"]:not([data-pl-replace])');
       if (!b) return 'no-btn';
       b.click();
       return 'clicked';

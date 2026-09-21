@@ -458,6 +458,105 @@ section("⑨ assertNotCommunityHome —— A 环境一个字节都不许写");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+section("⑩ listInstalled 认不认得出「本地装的」—— 真机上栽过的那一条");
+// ─────────────────────────────────────────────────────────────────────────
+// 为什么会栽：第一版只认"落点在 <dshHome>\plugins 下"的那一种。
+// 拿真实 B 家一跑 ⇒ `已装 0`，而那台机器实际装着 11 个插件（dev 联接 / 本地 tgz / npm）。
+// 后果不是少显示几个，是**给已经装着的插件显示「安装」按钮**，一点就覆盖掉用户的 dev link。
+{
+  const H = path.join(root, "homeSources");
+  makeHome(H);
+  const nm = path.join(H, "profiles", "web", "node_modules");
+  const profileDir = path.join(H, "profiles", "web");
+  const nm2 = path.join(profileDir, "node_modules");
+  fs.mkdirSync(nm2, { recursive: true });
+
+  // ① 本地目录联接（dev）—— 本体在"仓库"里，不在我们的 store 下
+  const devSrc = buildPlugin(path.join(root, "elsewhere-repo", "dsh-dev-linked"), "dsh-dev-linked", "3.1.4");
+  fs.symlinkSync(devSrc, path.join(nm2, "dsh-dev-linked"), "junction");
+
+  // ② 本地 tgz（file:，相对 profile 目录）—— 与 dsh-crosshub 同一种写法
+  const tgzDir = path.join(profileDir, "plugin-src");
+  fs.mkdirSync(tgzDir, { recursive: true });
+  const localTgz = packTgz(buildPlugin(path.join(root, "src-local-pkg"), "dsh-local-pkg", "0.4.2"),
+    path.join(tgzDir, "dsh-local-pkg-0.4.2.tgz"));
+  chk(fs.existsSync(localTgz), "（夹具）造出本地 tgz");
+  // pnpm 解包后的目录（我们只关心"读得出它是什么"）
+  const unpacked = path.join(nm2, "dsh-local-pkg");
+  fs.mkdirSync(unpacked, { recursive: true });
+  fs.cpSync(buildPlugin(path.join(root, "src-local-unpacked"), "dsh-local-pkg", "0.4.2"),
+    unpacked, { recursive: true, dereference: true });
+
+  // ③ 从 npm 装的
+  const regDir = path.join(nm2, "dsh-from-npm");
+  fs.mkdirSync(regDir, { recursive: true });
+  fs.cpSync(buildPlugin(path.join(root, "src-npm"), "dsh-from-npm", "1.0.7"),
+    regDir, { recursive: true, dereference: true });
+
+  // ④ 一个**不是插件**的普通依赖（不该被列出来）
+  const plainDir = path.join(nm2, "just-a-lib");
+  fs.mkdirSync(plainDir, { recursive: true });
+  fs.writeFileSync(path.join(plainDir, "package.json"),
+    JSON.stringify({ name: "just-a-lib", version: "1.0.0" }, null, 2) + "\n", "utf8");
+
+  // ⑤ 官方框架包（没有 dsh 字段 ⇒ 也不该被列出来）
+  const baseDir = path.join(nm2, "@deepseek-ai", "dsh-base");
+  fs.mkdirSync(baseDir, { recursive: true });
+  fs.writeFileSync(path.join(baseDir, "package.json"),
+    JSON.stringify({ name: "@deepseek-ai/dsh-base", version: "0.1.5" }, null, 2) + "\n", "utf8");
+
+  // 写进 profile
+  const pj = JSON.parse(fs.readFileSync(path.join(profileDir, "package.json"), "utf8"));
+  pj.dependencies = {
+    ...pj.dependencies,
+    "@deepseek-ai/dsh-base": "0.1.5-rc.2",
+    "just-a-lib": "^1.0.0",
+    "dsh-dev-linked": "link:" + devSrc,
+    "dsh-local-pkg": "file:./plugin-src/dsh-local-pkg-0.4.2.tgz",
+    "dsh-from-npm": "^1.0.7",
+  };
+  pj.dsh.profile.bundles.push("dsh-dev-linked", "dsh-local-pkg", "dsh-from-npm");
+  fs.writeFileSync(path.join(profileDir, "package.json"), JSON.stringify(pj, null, 2) + "\n", "utf8");
+
+  const l = I.listInstalled({ dshHome: H, profile: "web" });
+  const by = (n) => l.plugins.find((p) => p.name === n);
+  chk(l.ok === true, "列得出");
+  chk(by("dsh-dev-linked") && by("dsh-dev-linked").source === "local-link",
+    "① link: 到仓库外 ⇒ source=local-link", by("dsh-dev-linked") ? by("dsh-dev-linked").source : "没列出来");
+  chk(by("dsh-dev-linked") && by("dsh-dev-linked").version === "3.1.4",
+    "① 读出了它自己的版本", by("dsh-dev-linked") ? by("dsh-dev-linked").version : "");
+  chk(by("dsh-local-pkg") && by("dsh-local-pkg").source === "local-file",
+    "② file: 的本地 tgz ⇒ source=local-file", by("dsh-local-pkg") ? by("dsh-local-pkg").source : "没列出来");
+  chk(by("dsh-from-npm") && by("dsh-from-npm").source === "registry",
+    "③ 版本号 spec ⇒ source=registry", by("dsh-from-npm") ? by("dsh-from-npm").source : "没列出来");
+  chk(by("dsh-from-npm") && by("dsh-from-npm").version === "1.0.7", "③ 从 node_modules 读出真版本");
+  chk(!by("just-a-lib"), "★ 没有 dsh 字段的普通依赖**不列**");
+  chk(!by("@deepseek-ai/dsh-base"), "★ 官方框架包**不列**");
+  chk(l.plugins.every((p) => p.source !== "hub" || p.ours === true), "hub 来源才标 ours");
+  chk(l.plugins.filter((p) => p.source !== "hub").every((p) => p.ours === false),
+    "★ 本地来源的一律 ours=false（`ours` 只表示「是不是我们从仓库装的那一份」）");
+
+  // 一个**我们的**落点在，且读不回来时，必须仍能被列出来（好让界面报「落点丢了」）
+  const pj2 = JSON.parse(fs.readFileSync(path.join(profileDir, "package.json"), "utf8"));
+  pj2.dependencies["dsh-gone"] = "link:" + path.join(H, "plugins", "dsh-gone");
+  pj2.dsh.profile.bundles.push("dsh-gone");
+  fs.writeFileSync(path.join(profileDir, "package.json"), JSON.stringify(pj2, null, 2) + "\n", "utf8");
+  const l2 = I.listInstalled({ dshHome: H, profile: "web" });
+  const gone = l2.plugins.find((p) => p.name === "dsh-gone");
+  chk(!!gone && gone.source === "hub" && gone.dirExists === false,
+    "★ 落点被删掉的自家插件仍然列得出来，且 dirExists=false（界面才能报「落点丢了」）",
+    gone ? JSON.stringify({ source: gone.source, dirExists: gone.dirExists }) : "没列出来");
+
+  // resolveDep 的边角
+  chk(I.resolveDep(profileDir, nm2, "x", "git+https://example.com/x.git") === null,
+    "认不出来的 spec ⇒ null（不猜）");
+  chk(I.resolveDep(profileDir, nm2, "x", "") === null, "空 spec ⇒ null（不炸）");
+  chk(I.resolveDep(profileDir, nm2, "x", "file:./rel/dir").kind === "file"
+    && path.isAbsolute(I.resolveDep(profileDir, nm2, "x", "file:./rel/dir").target),
+    "★ file: 的相对路径按 **profile 目录** 解析成绝对路径（pnpm 的规矩）");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 console.log(`\n${"=".repeat(64)}`);
 console.log(`plugin-install-check：${OK} OK / ${FAILS.length} FAIL`);
 if (FAILS.length) {

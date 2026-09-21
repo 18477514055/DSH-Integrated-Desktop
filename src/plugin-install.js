@@ -541,41 +541,113 @@ function uninstall(opts = {}) {
 }
 
 /**
- * 这个家里现在装了哪些**我们管的**插件（落点在 <dshHome>\plugins\ 下的那些）。
- * 别处来的 link（开发机联到仓库目录的）会被标成 ours:false —— 看得见、但不算我们的。
+ * 解析一条依赖 spec 到底指向哪里。
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * ★ 为什么非得四种都认（2026-09-21 在**真实 B 家**上实测出来的）
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 第一版只认"落点在 <dshHome>\plugins 下"的那一种，于是在真机上**一个都认不出来**
+ * （报 `已装 0`，而那台机器实际装着 11 个插件）。本机同时存在这四种：
+ *
+ *   dsh-multi-session     = link:D:\...\plugin\dsh-multi-session    ← 开发机联接（本体在仓库）
+ *   dsh-crosshub          = file:./plugin-src/dsh-crosshub-….tgz    ← 相对 profile 的本地包
+ *   dsh-plugin-uploader   = file:C:/Users/…/published/….tgz         ← 上传器的归档
+ *   dsh-connect-workbuddy = ^2.0.4                                  ← 从 npm 装的
+ *
+ * **后果不是"少显示几个"**：是会给已经装着的插件显示「安装」按钮，
+ * 一点就把用户那条 dev link **覆盖掉** —— 他悄悄失去了"改源码即时生效"。
+ */
+function resolveDep(profileDir, nmDir, name, spec) {
+  const raw = String(spec || "").trim();
+  let kind = "unknown";
+  let target = null;
+
+  if (raw.startsWith("link:")) {
+    kind = "link";
+    target = raw.slice(5);
+  } else if (raw.startsWith("file:")) {
+    kind = "file";
+    let t = raw.slice(5);
+    // file: 的相对路径按 **profile 目录** 解析（pnpm 的规矩）
+    if (!path.isAbsolute(t)) t = path.resolve(profileDir, t);
+    target = t;
+  } else if (/^[\^~]?\d/.test(raw) || raw === "*" || raw === "latest") {
+    kind = "registry";
+    target = path.join(nmDir, name);   // npm 装的就看 node_modules 里那一个
+  } else {
+    return null;                        // 认不出来的一律不猜
+  }
+
+  // 指向的是 tarball 而不是目录 ⇒ 去看 node_modules 里实际解出来的那一个
+  let look = target;
+  if (kind === "file" && /\.(tgz|tar\.gz)$/i.test(target)) look = path.join(nmDir, name);
+
+  return { kind, target, look };
+}
+
+/** 它在磁盘上到底在不在、版本多少、**是不是一个 DSH 插件**。 */
+function probePackage(dir) {
+  const pj = readJson(path.join(dir, "package.json"));
+  if (!pj) return { exists: false, version: null, isPlugin: false };
+  const dsh = pj.dsh || {};
+  return {
+    exists: true,
+    version: typeof pj.version === "string" ? pj.version : null,
+    // ★ 与内核认插件的规矩一致：声明了 dsh.bundle 或 dsh.client 才叫插件。
+    //   否则 dsh-base 这类框架包、以及一大堆普通依赖全会混进来。
+    isPlugin: !!(dsh.bundle || dsh.client),
+  };
+}
+
+/**
+ * 这个家里现在装了哪些插件 —— **不管它是从哪来的**。
+ *
+ * `source` 四种：`hub`（我们装的，落点在 <dshHome>\plugins）、
+ * `local-link`（开发机联接）、`local-file`（本地 tgz / 目录）、`registry`（npm 装的）。
+ * `ours` 只表示「是不是我们从仓库装的那一份」；卸载对四种都可用，
+ * 但界面据此区分措辞（本地装的那份要点「改用仓库版」并二次确认，不能长得像普通「安装」）。
  */
 function listInstalled(opts = {}) {
   const { dshHome, profile = "web" } = opts;
-  const out = { ok: false, plugins: [], errors: [] };
+  const out = { ok: false, plugins: [], errors: [], scanned: 0 };
   try { assertNotCommunityHome(dshHome); } catch (e) { out.errors.push(e.message); return out; }
 
-  const { pkgFile, nmDir } = profilePaths(dshHome, profile);
+  const { profileDir, pkgFile, nmDir } = profilePaths(dshHome, profile);
   const json = readJson(pkgFile);
   if (!json) { out.errors.push(`profile package.json 读不到：${pkgFile}`); return out; }
 
   const storeDir = path.join(dshHome, PLUGINS_SUBDIR);
+  const storeLc = path.resolve(storeDir).toLowerCase();
   const bundles = (((json.dsh || {}).profile || {}).bundles) || [];
+
   for (const [name, spec] of Object.entries(json.dependencies || {})) {
     if (typeof spec !== "string") continue;
-    let target = null;
-    if (spec.startsWith("link:")) target = spec.slice(5);
-    else if (spec.startsWith("file:")) target = spec.slice(5);
-    if (!target) continue;
+    out.scanned += 1;
 
-    const ours = path.resolve(target).toLowerCase().startsWith(path.resolve(storeDir).toLowerCase());
-    if (!ours) continue;                       // 别人的 / 开发机上的，不列
+    const r = resolveDep(profileDir, nmDir, name, spec);
+    if (!r) continue;
 
     const linkPath = path.join(nmDir, name);
     let junctionOk = false;
     try { junctionOk = !!fs.realpathSync(linkPath); } catch { junctionOk = false; }
-    const pj = readJson(path.join(target, "package.json"));
+
+    const underStore = path.resolve(r.target).toLowerCase().startsWith(storeLc);
+    const source = underStore ? "hub" : (r.kind === "registry" ? "registry" : `local-${r.kind}`);
+    const probe = probePackage(r.look);
+
+    // 落点在**我们的 store** 里 ⇒ 不管读不读得到 package.json，它就是我们装的。
+    // 读不到 = 落点被删了 ⇒ 要让界面能报「落点丢了」，而不是当成没装。
+    if (!underStore && !probe.isPlugin) continue;
+
     out.plugins.push({
       name,
-      version: pj ? (pj.version || "0.0.0") : null,
+      version: probe.version || "0.0.0",
       spec,
-      dest: target,
-      ours: true,
-      dirExists: isDir(target),
+      target: r.target,
+      kind: r.kind,
+      source,
+      ours: source === "hub",
+      dirExists: probe.exists,
       junctionOk,
       enabled: bundles.includes(name),
     });
@@ -592,6 +664,8 @@ module.exports = {
   uninstall,
   listInstalled,
   // 零件（脚本与 UI 都要用）
+  resolveDep,
+  probePackage,
   validatePluginDir,
   extractTgz,
   detectPluginRoot,

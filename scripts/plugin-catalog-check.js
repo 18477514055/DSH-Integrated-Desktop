@@ -188,16 +188,16 @@ section("⑥ isDevOnly —— 优先读索引字段，读不到才退回落名�
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-section("⑦ mergeInstalled —— 清单 × 本机已装");
+section("⑦ mergeInstalled —— 清单 × 本机已装（含「本地装的」那一路）");
 // ═════════════════════════════════════════════════════════════════════════
 {
   const mk = (name, version) => C.normalizeEntry({ ...GOOD, name, version }).entry;
   const groups = C.groupByName([mk("dsh-a", "1.1.0"), mk("dsh-b", "2.0.0"), mk("dsh-c", "3.0.0"), mk("dsh-d", "4.0.0")]);
 
   const rows = C.mergeInstalled(groups, [
-    { name: "dsh-b", version: "2.0.0", dest: "x", enabled: true, junctionOk: true, dirExists: true },
-    { name: "dsh-c", version: "2.9.0", dest: "y", enabled: true, junctionOk: true, dirExists: true },
-    { name: "dsh-d", version: "4.0.0", dest: "z", enabled: true, junctionOk: true, dirExists: false },
+    { name: "dsh-b", version: "2.0.0", source: "hub", target: "x", enabled: true, junctionOk: true, dirExists: true },
+    { name: "dsh-c", version: "2.9.0", source: "hub", target: "y", enabled: true, junctionOk: true, dirExists: true },
+    { name: "dsh-d", version: "4.0.0", source: "hub", target: "z", enabled: true, junctionOk: true, dirExists: false },
   ]);
   const at = (n) => rows.find((r) => r.name === n);
   chk(at("dsh-a").state === "not-installed", "没装 ⇒ not-installed");
@@ -210,8 +210,27 @@ section("⑦ mergeInstalled —— 清单 × 本机已装");
   chk(at("dsh-d").canInstall === true, "broken 可以重装");
 
   const disabled = C.mergeInstalled(C.groupByName([mk("dsh-e", "1.0.0")]),
-    [{ name: "dsh-e", version: "1.0.0", enabled: false, dirExists: true, junctionOk: true }]);
+    [{ name: "dsh-e", version: "1.0.0", source: "hub", enabled: false, dirExists: true, junctionOk: true }]);
   chk(disabled[0].state === "disabled", "装了但没在 bundles 里 ⇒ disabled");
+
+  // ── ★ 「本地装的」那一路（真机上栽过：B 家装着 11 个，界面报「已装 0」）──
+  const loc = C.mergeInstalled(
+    C.groupByName([mk("dsh-f", "1.0.0"), mk("dsh-g", "2.0.0"), mk("dsh-h", "1.0.0")]),
+    [
+      { name: "dsh-f", version: "0.5.0", source: "local-link", target: "D:\\repo\\dsh-f", enabled: true, junctionOk: true, dirExists: true },
+      { name: "dsh-g", version: "2.0.0", source: "registry", target: "nm", enabled: true, junctionOk: true, dirExists: true },
+      { name: "dsh-h", version: "1.0.0", source: "local-file", target: "C:\\x.tgz", enabled: true, junctionOk: true, dirExists: true },
+    ]);
+  const lt = (n) => loc.find((r) => r.name === n);
+  chk(lt("dsh-f").state === "local", "★ dev 联接装着的 ⇒ state=local（不是 not-installed）");
+  chk(lt("dsh-f").canInstall === false, "★★ 本地装着的**不给**普通「安装」按钮（那会覆盖用户的 dev link）");
+  chk(lt("dsh-f").canReplace === true, "给的是「改用仓库版」");
+  chk(lt("dsh-f").local.version === "0.5.0", "报的是**本地那一份**的版本，不是线上版本");
+  chk(lt("dsh-f").localSource === "local-link" && lt("dsh-h").localSource === "local-file"
+    && lt("dsh-g").localSource === "registry", "来路分别标成 local-link / local-file / registry",
+    JSON.stringify([lt("dsh-f").localSource, lt("dsh-h").localSource, lt("dsh-g").localSource]));
+  chk(lt("dsh-g").state === "local", "npm 装的也算「已装」（local）");
+  chk(lt("dsh-h").canReplace === true && lt("dsh-h").canInstall === false, "本地文件装的同理");
 
   chk(C.mergeInstalled(groups, []).every((r) => r.state === "not-installed"), "一个都没装 ⇒ 全是 not-installed");
   chk(C.mergeInstalled([], []).length === 0, "空清单 → 空结果");

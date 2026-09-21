@@ -204,12 +204,24 @@
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   }
 
+  /** 插件是"从哪来的" —— 这一栏是用户判断"该不该动它"的依据。 */
+  function sourceLabel(src) {
+    switch (src) {
+      case "hub": return "从插件仓库装的";
+      case "local-link": return "本地目录联接（开发用）";
+      case "local-file": return "本地包文件";
+      case "registry": return "从 npm 装的";
+      default: return "本地";
+    }
+  }
+
   function stateTag(r) {
     switch (r.state) {
       case "installed": return '<span class="tag on">已装</span>';
       case "update": return '<span class="tag up">可更新</span>';
       case "disabled": return '<span class="tag up">没启用</span>';
       case "broken": return '<span class="tag bad">落点丢了</span>';
+      case "local": return '<span class="tag on">已装（本地装的）</span>';
       default: return "";
     }
   }
@@ -227,7 +239,11 @@
 
     const meta = [];
     meta.push(`线上 v${latest.version}`);
-    if (r.local) meta.push(`本机 v${r.local.version}`);
+    if (r.local) {
+      meta.push(`本机 v${r.local.version}`);
+      meta.push(`装在：${sourceLabel(r.localSource)}`);
+      if (r.local.target) meta.push(`→ ${r.local.target}`);
+    }
     if (latest.repo) meta.push(`来自 ${latest.repo}`);
     if (latest.bytes) meta.push(fmtBytes(latest.bytes));
     if (latest.sha256) meta.push(`sha256 ${latest.sha256.slice(0, 12)}…`);
@@ -236,6 +252,11 @@
     const ops = [];
     if (r.canInstall) {
       ops.push(`<button class="btn" data-pl-act="install" data-pl-name="${e(r.name)}">安装</button>`);
+    }
+    // ★ 本地已经装着的：**不**给"安装"，给"改用仓库版"并且界面会先问一句 ——
+    //   否则一个看起来无害的「安装」会把用户的 dev link 悄悄换掉。
+    if (r.canReplace) {
+      ops.push(`<button class="btn" data-pl-act="install" data-pl-replace="1" data-pl-source="${e(sourceLabel(r.localSource))}" data-pl-name="${e(r.name)}">改用仓库版</button>`);
     }
     if (r.canUpdate) {
       ops.push(`<button class="btn" data-pl-act="install" data-pl-name="${e(r.name)}">更新到 v${e(r.remoteVersion)}</button>`);
@@ -267,6 +288,7 @@
     $("pl-count").textContent = `已装 ${c.installed || 0} / 清单 ${c.total || 0}`;
     $("pl-upd").textContent = [
       c.updatable ? `${c.updatable} 个可更新` : "",
+      c.local ? `${c.local} 个是本地装的` : "",
       c.broken ? `${c.broken} 个落点丢了` : "",
     ].filter(Boolean).join(" · ");
     plStatus(st.stale
@@ -367,8 +389,21 @@
       if (!btn) return;
       const act = btn.dataset.plAct;
       const name = btn.dataset.plName;
-      if (act === "install") doInstallPlugin(name, btn);
-      else if (act === "uninstall") doUninstallPlugin(name, btn);
+      if (act === "install") {
+        // ★ "改用仓库版"是个**会覆盖**的动作（把 dev link 换成从仓库装的那一份），
+        //   必须让用户明确点过一次确认 —— 不能长得跟普通「安装」一样。
+        if (btn.dataset.plReplace === "1") {
+          const go = window.confirm(
+            `「${name}」现在装的是本地那一份（${btn.dataset.plSource || "本地"}）。\n\n` +
+            "改用仓库版会把它在档案里的指向换成从插件仓库装下来的那一份。\n" +
+            "本地那份文件不会被删，但不会再被客户端加载。\n\n继续吗？"
+          );
+          if (!go) return;
+        }
+        doInstallPlugin(name, btn);
+      } else if (act === "uninstall") {
+        doUninstallPlugin(name, btn);
+      }
     });
 
     S.onPluginProgress((p) => {

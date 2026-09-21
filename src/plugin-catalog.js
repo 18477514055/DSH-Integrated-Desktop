@@ -269,24 +269,50 @@ function groupByName(entries) {
  *
  * @param {Array} groups            groupByName 的结果
  * @param {Array} installed         plugin-install.js 的 listInstalled().plugins
- * @returns {Array} 每项多出 { state, localVersion, remoteVersion, canInstall, canUpdate, canUninstall }
+ * @returns {Array} 每项多出 { state, localSource, local, remoteVersion,
+ *                            canInstall, canReplace, canUpdate, canUninstall }
+ *
+ * ★★ 状态机的关键一条（2026-09-21 用户点出来的）：
+ *   **"本机已装"不等于"从我们仓库装的"**。本机可能有 dev 联接、本地 tgz、从 npm 装的包。
+ *   第一版只看 `local.dirExists`，于是会给一个**已经装着的**插件显示「安装」按钮 ——
+ *   点下去会把它在档案里的指向改掉，用户**悄悄失去"改源码即时生效"**。
+ *   （真机实测：B 家装着 11 个插件，第一版一个都没认出来、报「已装 0」。）
+ *   现在：本地装的 → state=`local`，按钮是**「改用仓库版」**且界面会先问一句，
+ *   而不是一个看起来无害的「安装」。
  */
 function mergeInstalled(groups, installed) {
   const byName = new Map((installed || []).map((p) => [p.name, p]));
   return groups.map((g) => {
     const local = byName.get(g.name) || null;
     const remoteVersion = g.latest ? g.latest.version : "";
+
     let state = "not-installed";
-    if (local && !local.dirExists) state = "broken";          // 落点没了/被删了
-    else if (local && local.enabled === false) state = "disabled";
-    else if (local) state = cmpVersion(remoteVersion, local.version) > 0 ? "update" : "installed";
+    if (local && local.source === "hub") {
+      // 我们装的：能判"该不该更新"，也能判"落点还在不在"
+      if (!local.dirExists) state = "broken";
+      else if (local.enabled === false) state = "disabled";
+      else state = cmpVersion(remoteVersion, local.version) > 0 ? "update" : "installed";
+    } else if (local) {
+      // 本地装的（dev 联接 / 本地 tgz / npm）—— 它**确实装着**，只是来路不同。
+      state = "local";
+    }
 
     return {
       ...g,
       state,
-      local: local ? { version: local.version, dest: local.dest, enabled: local.enabled, junctionOk: local.junctionOk } : null,
+      localSource: local ? local.source : "",
+      local: local ? {
+        version: local.version,
+        target: local.target,
+        source: local.source,
+        enabled: local.enabled,
+        junctionOk: local.junctionOk,
+        dirExists: local.dirExists,
+      } : null,
       remoteVersion,
       canInstall: state === "not-installed" || state === "broken",
+      // 本地装着的：**不**给普通安装按钮，只给"改用仓库版"（界面会先问一句）
+      canReplace: state === "local" && !!remoteVersion,
       canUpdate: state === "update" || state === "disabled",
       canUninstall: !!local,
     };
