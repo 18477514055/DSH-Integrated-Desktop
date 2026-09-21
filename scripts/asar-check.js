@@ -21,6 +21,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 
 const ROOT = path.join(__dirname, "..");
 
@@ -123,7 +124,15 @@ function main() {
   const head = Buffer.alloc(16);
   fs.readSync(fd, head, 0, 16, 0);
   const headerSize = head.readUInt32LE(12);
-  const base = 16 + headerSize;
+  // ★★ 数据区起点必须**按 4 字节对齐** —— 2026-09-22 实测抓到的（发布 0.2.7 前）：
+  //   asar 的 JSON 头写完之后会 padding 到 4 的倍数，而 `readUInt32LE(12)` 给的是
+  //   **未 padding 的字符串长度**。所以真实起点是 `align4(16 + headerSize)`，
+  //   不是 `16 + headerSize`。
+  //   活例：headerSize=6414 时 16+6414=6430 → 真实起点 6432，**差 2 字节**。
+  //   ⚠️ 这个错位原来一直没被发现，因为本脚本只做**子串匹配** —— 整体平移 2 字节
+  //   照样能 `includes()` 到所有标记（即"全中"其实是假的严格）。
+  //   现在除了标记，还会对 `src/*.js` 做**逐字节 sha256**比对，错位就再也混不过去。
+  const base = 16 + headerSize + ((4 - ((16 + headerSize) % 4)) % 4);
   const tree = readTree(fd, headerSize);
 
   const nodeAt = (parts) => {
@@ -160,6 +169,70 @@ function main() {
     }
   }
   fs.closeSync(fd);
+
+  // ══════════════════════════════════════════════════════════════════
+  // ★★ 逐字节比对：产物里的 `src/**` 必须与磁盘上（= git HEAD）**完全相同**
+  // ══════════════════════════════════════════════════════════════════
+  //
+  // 为什么非要有这一段（2026-09-22，发布 0.2.7 前实测）：
+  //   上面那些"功能标记全中"只证明**某个片段在**，不证明**整个文件是同一份** ——
+  //   而且原来 base 少算 2 字节（见上），整体平移照样能 `includes()` 到所有标记。
+  //   要回答"这个安装包里的代码是不是我眼前这一份"，只有 sha256 说了算。
+  //   ⇒ 这一段就是 `verify:asar` 的**结论性判据**。
+  {
+    const fd2 = fs.openSync(asar, "r");
+    const walk = (node, rel) => {
+      const out = [];
+      for (const [name, child] of Object.entries(node.files || {})) {
+        const r = rel ? rel + "/" + name : name;
+        if (child && child.files) out.push(...walk(child, r));
+        else if (child && child.size !== undefined) out.push({ rel: r, size: child.size, offset: child.offset });
+      }
+      return out;
+    };
+    const srcNode = nodeAt(["src"]);
+    const entries = srcNode ? walk(srcNode, "src") : [];
+    let same = 0;
+    const diff = [];
+    const gone = [];
+    for (const e of entries) {
+      const onDisk = path.join(ROOT, e.rel);
+      if (!fs.existsSync(onDisk)) { gone.push(e.rel); continue; }
+      const buf = Buffer.alloc(e.size);
+      fs.readSync(fd2, buf, 0, e.size, base + parseInt(e.offset, 10));
+      const a = crypto.createHash("sha256").update(buf).digest("hex");
+      const b = crypto.createHash("sha256").update(fs.readFileSync(onDisk)).digest("hex");
+      if (a === b) same += 1; else diff.push(e.rel);
+    }
+    fs.closeSync(fd2);
+
+    // 反向：磁盘上有、产物里没有的（漏打包）
+    const diskFiles = [];
+    (function w(d, rel) {
+      for (const en of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, en.name);
+        const r = rel ? rel + "/" + en.name : en.name;
+        if (en.isDirectory()) w(p, r); else diskFiles.push("src/" + r);
+      }
+    })(path.join(ROOT, "src"), "");
+    const packed = new Set(entries.map((e) => e.rel));
+    const missing = diskFiles.filter((f) => !packed.has(f));
+
+    console.log("");
+    console.log(`  src/** 逐字节比对: ${same}/${entries.length} 个文件与磁盘 sha256 相同`);
+    if (diff.length) console.log(`  FAIL  与磁盘不一致：${diff.join(", ")}`);
+    if (gone.length) console.log(`  FAIL  产物里有、磁盘上没有：${gone.join(", ")}`);
+    if (missing.length) console.log(`  FAIL  磁盘上有、产物里没打进去：${missing.join(", ")}`);
+
+    if (diff.length || gone.length || missing.length) {
+      console.log("  ⇒ 产物里的代码**不是**你现在看到的这一份（或漏打了文件）");
+      process.exitCode = 1;
+      // 不 return：让下面结构性检查也照常打印，一次看全
+      bad += diff.length + gone.length + missing.length;
+    } else {
+      console.log("  ⇒ 产物 = 源码树 = git HEAD（逐字节）");
+    }
+  }
 
   // ── 结构性检查：**包干干净净**（0.2.6 的核心承诺，从"打印一句"升级成"断言"）──
   //
