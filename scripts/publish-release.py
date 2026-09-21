@@ -44,6 +44,22 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GH = os.path.join(ROOT, "github")
 CHECK_ONLY = "--check" in sys.argv
 
+# ══════════════════════════════════════════════════════════════════════════
+# ★★ 先把 stdout/stderr 切到 UTF-8 —— 否则这个脚本会被**自己打印的一句话**弄挂
+# ══════════════════════════════════════════════════════════════════════════
+# 实测（2026-09-22，发布 0.2.7 时真的挂在发布这一步）：
+#   UnicodeEncodeError: 'gbk' codec can't encode character '\u24ea'
+#     at publish-release.py:171  print("\u24ea 本地校验（SHA256SUMS.txt 共 %d 条）")
+# Windows 上 Python 的 stdout 默认跟控制台代码页走（本机是 GBK）。而 GBK **有** ①②③，
+# 却**没有** ⓪(U+24EA) —— 于是"打印个序号"直接抛异常，整个发布会停在那里，
+# 而且报错看着像编码问题、不像发布问题。
+# ⇒ errors="replace" 是刻意的：宁可把个别符号打成 ?，也不该让一句日志否决整次发布。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:          # 老 Python / 被重定向成非文本流时就算了，别为这个崩
+    pass
+
 API = "https://api.github.com"
 UPLOADS = "https://uploads.github.com"
 
