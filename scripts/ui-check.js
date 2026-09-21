@@ -127,6 +127,13 @@ function launch(_mode, tmpDir, port, opts = {}) {
   const env = { ...process.env };
   delete env.ELECTRON_RUN_AS_NODE;
 
+  // ★ 首启向导默认**只在打包版**自动弹（见 main.js 的 firstRunAutoEnabled）。
+  //   这里显式开/关，而不是靠"开发机默认不弹"这条巧合：
+  //   · 只有 firstrun 模式传 firstRun:true（它要验的就是"自己弹出来"）；
+  //   · 其余六个模式显式写 off —— 它们的判据是 `waitForPage` 找页面，
+  //     多一个设置窗口就多一个 CDP page 目标，会把它们搅乱。
+  env.DSH_FIRST_RUN = opts.firstRun ? "force" : "off";
+
   // ★ 不用管道抓子进程输出：Windows 沙箱下 Node 的 piped stdio 会 EPERM。
   //   应用自己会把日志写进 <userData>/shell.log，失败时读文件即可（readAppLog）。
   const child = spawn(electronExe, [
@@ -1076,14 +1083,306 @@ async function verifyPlugins(tmpDir) {
   }
 }
 
+// ── 模式七：首次安装向导（0.2.6：安装包不带插件）──────────────────
+/**
+ * 用户原话：「我们发出去的包干干净净的，有本体客户端就足够了……如果他们在下载的时候
+ * 或者安装的时候勾选，他们就从我的仓库的其他链接拉取他们。」
+ *
+ * 这一模式要证明的**不是**"界面画出来了"，而是四件真事：
+ *   ① 全新安装第一次启动，向导**自己**弹出来（不点任何东西），并且停在勾选那一栏；
+ *   ② 勾选清单的默认值是对的（能装的默认勾、开发者工具默认不勾、已装的不给点）；
+ *   ③ 「先跳过」真的把标记写下来、并把窗口让开；
+ *   ④ 第二次启动**不再弹**（家里仍然一个插件都没有 ⇒ 唯一拦住它的是那个标记），
+ *      然后从「集成版插件」栏手动打开向导、**真装一个**，
+ *      并去磁盘上核对 profile 的三处契约（不是看插件自己的结果文案）。
+ *
+ * ⚠️ 两次启动用的是**同一个** temp userData（这正是要验的：跨启动的标记）。
+ *    全程不碰 B / A：DSH_HOME 落在 temp 里。
+ */
+async function findSettingsTarget(timeoutMs) {
+  const dl = Date.now() + timeoutMs;
+  while (Date.now() < dl) {
+    try {
+      const ts = await listTargets();
+      const t = ts.find((x) => x.type === "page" && /settings\.html/.test(x.url || ""));
+      if (t) return t;
+    } catch { /* CDP 还在起来 */ }
+    await sleep(400);
+  }
+  return null;
+}
+
+/** 首启向导那一屏的现场快照（复选框名字/是否勾上/是否可点 + 按钮文案）。 */
+const FR_PROBE = `(() => {
+  const pane = document.querySelector('.pane[data-pane="welcome"]');
+  const items = Array.from(document.querySelectorAll('#fr-list .fr-item')).map((c) => {
+    const ck = c.querySelector('input.fr-ck');
+    return {
+      name: ck ? ck.dataset.frName : '',
+      checked: !!(ck && ck.checked),
+      disabled: !!(ck && ck.disabled),
+      tagOff: c.classList.contains('off'),
+      meta: (c.querySelector('.meta') || {}).textContent || '',
+    };
+  });
+  const btn = document.getElementById('btn-fr-install');
+  const done = document.getElementById('fr-done');
+  const acts = document.getElementById('fr-actions');
+  return JSON.stringify({
+    paneOn: pane ? pane.classList.contains('on') : false,
+    paneDisplay: pane ? getComputedStyle(pane).display : null,
+    navHasWizard: !!document.querySelector('nav button[data-pane="welcome"]'),
+    repo: (document.getElementById('fr-repo') || {}).textContent || '',
+    status: (document.getElementById('fr-status') || {}).textContent || '',
+    items,
+    btnLabel: btn ? (btn.textContent || '').trim() : '',
+    btnDisabled: !!(btn && btn.disabled),
+    doneDisplay: done ? getComputedStyle(done).display : null,
+    doneText: (document.getElementById('fr-done-text') || {}).textContent || '',
+    actsDisplay: acts ? getComputedStyle(acts).display : null,
+  });
+})()`;
+
+/** 等 shell.log 里出现匹配的一行（窗口标题这类只在 did-finish-load 之后才有的东西）。 */
+async function waitForLogLine(tmpDir, re, timeoutMs) {
+  const dl = Date.now() + timeoutMs;
+  let tail = [];
+  while (Date.now() < dl) {
+    tail = readAppLog(tmpDir, 400);
+    const hit = tail.find((l) => re.test(l));
+    if (hit) return hit;
+    await sleep(400);
+  }
+  return null;
+}
+
+async function verifyFirstRun(tmpDir) {
+  const PORT = 3180;
+  const dshHome = path.join(tmpDir, "dsh-home");
+  const pkgFile = path.join(dshHome, "profiles", "web", "package.json");
+  const marker = path.join(tmpDir, "first-run.json");
+
+  // ══ 第一趟：全新家 ⇒ 向导应该自己弹出来 ══════════════════════════
+  const a = launch("firstrun", tmpDir, PORT, { firstRun: true });
+  let picked = null;
+  try {
+    await waitForPage((t) => t.url.startsWith(`http://127.0.0.1:${PORT}/`), 120000);
+    check("（前置）临时家里内核已经把 profile 建出来了", fs.existsSync(pkgFile), pkgFile);
+    check("（前置）这个家一个插件都没有（真的是全新用户）",
+      !fs.existsSync(path.join(dshHome, "plugins"))
+      || fs.readdirSync(path.join(dshHome, "plugins")).filter((n) => !n.startsWith(".")).length === 0,
+      path.join(dshHome, "plugins"));
+
+    // ① **不点任何东西**，等向导自己出现 —— 这就是这个功能本身
+    const setT = await findSettingsTarget(60000);
+    check("★ 全新安装启动后，首启向导**自己**弹了出来（全程没点任何东西）",
+      !!setT, setT ? "settings.html 出现了" : "等 60 秒也没出现");
+
+    // 窗口标题（CDP 的 target.title 是**文档**标题，看不见窗口标题 ⇒ 从应用日志回读）。
+    // ★ 必须**轮询**：CDP 的 page 目标在 `did-finish-load` **之前**就出现了，
+    //   而标题是在 load 完才设的 —— 直接读会稳定读空（第一版就是这么假 FAIL 的）。
+    const titleLine = await waitForLogLine(tmpDir, /首启向导.*窗口标题/, 15000);
+    check("★ 向导窗口的标题是「欢迎使用…」而不是「设置…」（窗口标题，从应用日志回读）",
+      !!titleLine && /欢迎使用/.test(titleLine), titleLine || "等 15 秒也没等到那一行");
+
+    if (!setT) return;
+    const ws = setT.webSocketDebuggerUrl;
+    await sleep(1200);
+
+    // ② 停在勾选那一栏，且清单真的渲染出来了（要联网；连不上会明确报错）
+    let fr = null;
+    const cd = Date.now() + 45000;
+    while (Date.now() < cd) {
+      fr = JSON.parse(await cdpEval(ws, FR_PROBE, 20000));
+      if (fr.items.length) break;
+      await sleep(1000);
+    }
+    console.log(`  向导状态: ${fr.status}`);
+    console.log(`  清单 ${fr.items.length} 条  按钮: ${fr.btnLabel}`);
+    for (const it of fr.items) {
+      console.log(`    ${it.checked ? "[x]" : "[ ]"} ${it.name}${it.disabled ? "（不可点）" : ""}`);
+    }
+
+    check("★ 向导自己停在「先挑几个集成版插件」那一栏（不是停在常规）",
+      fr.paneOn && fr.paneDisplay !== "none", `paneOn=${fr.paneOn} display=${fr.paneDisplay}`);
+    check("★ 这一栏**不在**左侧导航里（只对没插件的新用户有意义，不给老用户添噪音）",
+      fr.navHasWizard === false, `navHasWizard=${fr.navHasWizard}`);
+    check("清单真的渲染出了可勾的条目", fr.items.length > 0, `items=${fr.items.length} status=${fr.status}`);
+    check("仓库名回填了（主进程把 repo 报回来了）", /DSH-Plugin-Hub/.test(fr.repo), fr.repo);
+    check("状态行给了结论（清单更新于… / 显示的是缓存… / 取清单失败）",
+      /清单更新于|显示的是缓存|取清单失败/.test(fr.status), fr.status);
+
+    // 默认值：能装的默认勾上、开发者工具默认不勾、已装/不兼容的画成灰的且不可点
+    const checkable = fr.items.filter((x) => !x.disabled);
+    check("★ 至少有一条默认就勾上了（一进来就是可用的默认选择）",
+      checkable.some((x) => x.checked), JSON.stringify(checkable.map((x) => [x.name, x.checked])));
+    const uploader = fr.items.find((x) => x.name === "dsh-plugin-uploader");
+    if (uploader) {
+      check("★ 开发者工具（dsh-plugin-uploader）默认**不**勾",
+        uploader.checked === false, `checked=${uploader.checked}`);
+    } else {
+      console.log("  SKIP  开发者工具默认不勾 —— 这一版清单里没有 dsh-plugin-uploader");
+    }
+    check("★ 按钮文案跟着勾选数走，且此刻是可点的",
+      /安装选中的 \d+ 个插件/.test(fr.btnLabel) && fr.btnDisabled === false,
+      `${fr.btnLabel} disabled=${fr.btnDisabled}`);
+    check("装之前不显示收工块", fr.doneDisplay === "none", String(fr.doneDisplay));
+
+    // ③ 一条都不勾 ⇒ 按钮必须变灰（不能给出一个点下去什么都不做的按钮）
+    // ★ 用**真点击**而不是 `c.checked = false`：直接改属性**不派发 change 事件**，
+    //   页面上的计数就不会更新 —— 第一版这么写，量到的是"按钮还是「3 个」"，
+    //   看起来像产品 bug，其实是量具没接上（判据禁止用假动作代替真动作）。
+    const noneSel = JSON.parse(await cdpEval(ws, `(() => {
+      document.querySelectorAll('#fr-list input.fr-ck').forEach((c) => {
+        if (!c.disabled && c.checked) c.click();
+      });
+      const b = document.getElementById('btn-fr-install');
+      return JSON.stringify({ label: (b.textContent||'').trim(), disabled: b.disabled });
+    })()`, 20000));
+    check("★ 一条都不勾时，安装按钮变灰且文案回到默认",
+      noneSel.disabled === true && noneSel.label === "安装选中的插件",
+      JSON.stringify(noneSel));
+
+    // ④ 「先跳过，直接开始用」⇒ 记标记 + 把窗口让开
+    const before = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8") : "(无)";
+    await cdpEval(ws, `document.getElementById('btn-fr-skip').click(); 'clicked'`, 20000);
+    await sleep(1500);
+    let mk = null;
+    try { mk = JSON.parse(fs.readFileSync(marker, "utf8").replace(/^\uFEFF/, "")); } catch { mk = null; }
+    check("★「先跳过」把首启标记写下来了（<userData>/first-run.json）",
+      !!(mk && mk.done === true && mk.skipped === true),
+      `之前=${before} 之后=${JSON.stringify(mk)}`);
+    // ★ detail 也要跟着结果走 —— 判 PASS 却印一句「settings.html 还在」会让人以为量错了
+    const stray1 = await findSettingsTarget(6000);
+    check("★「先跳过」真的把向导窗口关掉了（路让开，露出客户端本体）",
+      !stray1, stray1 ? "settings.html 还在" : "窗口已关");
+    check("跳过之后这个家里依然一个插件都没有（跳过就是跳过，不会偷偷装东西）",
+      !fs.existsSync(path.join(dshHome, "plugins"))
+      || fs.readdirSync(path.join(dshHome, "plugins")).filter((n) => !n.startsWith(".")).length === 0,
+      path.join(dshHome, "plugins"));
+  } finally {
+    await stopApp(a.child);
+  }
+
+  // ══ 第二趟：同一个家（有标记、仍然零插件）⇒ 不许再弹 ═══════════
+  await sleep(800);
+  const b = launch("firstrun", tmpDir, PORT, { firstRun: true });
+  try {
+    await waitForPage((t) => t.url.startsWith(`http://127.0.0.1:${PORT}/`), 120000);
+    // 主进程是在 loadURL 解析完之后**紧接着**判定并弹窗的 ⇒ 等 12 秒足够看清"弹没弹"
+    await sleep(12000);
+    const stray = await findSettingsTarget(1500);
+    check("★★ 第二次启动**不再**自动弹向导（家里仍然零插件 ⇒ 唯一拦住它的是那个标记）",
+      !stray, stray ? "又弹出来了" : "没弹，正确");
+
+    const target = await waitForPage((t) => t.url.startsWith(`http://127.0.0.1:${PORT}/`), 20000);
+    const mainUrl = target.webSocketDebuggerUrl;
+
+    // ⑤ 手动那条路：设置窗口 →「集成版插件」栏 →「打开首次安装向导」
+    const opened = await cdpEval(mainUrl, `window.dshShell.openShellSettings().then(r => JSON.stringify(r))`);
+    check("主界面能打开外壳设置窗口", /"ok":true/.test(opened), String(opened));
+    const setT = await findSettingsTarget(20000);
+    check("外壳设置窗口真的出现了", !!setT, setT ? "settings.html" : "没等到");
+    if (!setT) return;
+
+    const ws = setT.webSocketDebuggerUrl;
+    await sleep(1500);
+    const jumped = JSON.parse(await cdpEval(ws, `(() => {
+      const b = document.querySelector('nav button[data-pane="plugins"]');
+      if (!b) return JSON.stringify({ err: 'no-nav' });
+      b.click();
+      const w = document.getElementById('btn-pl-wizard');
+      if (!w) return JSON.stringify({ err: 'no-button' });
+      w.click();
+      const pane = document.querySelector('.pane[data-pane="welcome"]');
+      return JSON.stringify({
+        paneOn: pane ? pane.classList.contains('on') : false,
+        display: pane ? getComputedStyle(pane).display : null,
+        pluginsPaneOn: (document.querySelector('.pane[data-pane="plugins"]')||{classList:{contains:()=>false}}).classList.contains('on'),
+      });
+    })()`, 20000));
+    check("★ 老用户能从「集成版插件」栏手动打开向导（按钮点了真的切到那一栏）",
+      jumped.paneOn && jumped.display !== "none" && jumped.pluginsPaneOn === false,
+      JSON.stringify(jumped));
+
+    // ⑥ 真装一个：只勾一条，点安装，等收工块
+    let fr2 = null;
+    const cd2 = Date.now() + 45000;
+    while (Date.now() < cd2) {
+      fr2 = JSON.parse(await cdpEval(ws, FR_PROBE, 20000));
+      if (fr2.items.length) break;
+      await sleep(1000);
+    }
+    check("手动打开的向导同样渲染出了清单", fr2.items.length > 0, `items=${fr2.items.length} status=${fr2.status}`);
+    const target0 = fr2.items.find((x) => !x.disabled && x.name === "dsh-archive-manager")
+      || fr2.items.find((x) => !x.disabled);
+    check("清单里至少有一条现在能装", !!target0, JSON.stringify(fr2.items.map((x) => x.name)));
+    if (!target0) return;
+    picked = target0.name;
+
+    const sel = JSON.parse(await cdpEval(ws, `(() => {
+      // 同上：真点击，别改属性 —— 只有真事件才会让页面重算按钮文案
+      document.querySelectorAll('#fr-list input.fr-ck').forEach((c) => {
+        const want = (c.dataset.frName === ${JSON.stringify(picked)});
+        if (!c.disabled && c.checked !== want) c.click();
+      });
+      const b = document.getElementById('btn-fr-install');
+      return JSON.stringify({ label: (b.textContent||'').trim(), disabled: b.disabled });
+    })()`, 20000));
+    check("只勾一条时按钮文案是「安装选中的 1 个插件」且可点",
+      sel.label === "安装选中的 1 个插件" && sel.disabled === false, JSON.stringify(sel));
+
+    await cdpEval(ws, `document.getElementById('btn-fr-install').click(); 'ok'`, 20000);
+    let done = null;
+    const cd3 = Date.now() + 90000;
+    while (Date.now() < cd3) {
+      done = JSON.parse(await cdpEval(ws, FR_PROBE, 20000));
+      if (done.doneDisplay !== "none") break;
+      await sleep(1500);
+    }
+    console.log(`  收工块: ${JSON.stringify(done && done.doneText)}`);
+    check(`★ 真装完 ${picked} 之后出现了收工块，并说清下一步是重启内核`,
+      done.doneDisplay !== "none" && done.doneText.includes(picked) && /重启/.test(done.doneText),
+      JSON.stringify(done.doneText));
+    check("收工之后安装按钮那一排收起来（不给重复点的机会）",
+      done.actsDisplay === "none", String(done.actsDisplay));
+
+    // ⑦ 磁盘上核对：落点 + profile 三处契约（**不看插件自己的结果文案**）
+    const store = path.join(dshHome, "plugins", picked);
+    check(`★ 插件本体真的落在 <DSH_HOME>\\plugins\\${picked}`,
+      fs.existsSync(path.join(store, "package.json")), store);
+    let pj = null;
+    try { pj = JSON.parse(fs.readFileSync(pkgFile, "utf8").replace(/^\uFEFF/, "")); } catch { pj = null; }
+    const dep = pj && pj.dependencies ? pj.dependencies[picked] : null;
+    check(`① profile dependencies["${picked}"] 是 link: 指向那个落点`,
+      typeof dep === "string" && dep.startsWith("link:")
+      && path.resolve(dep.slice(5)).toLowerCase() === path.resolve(store).toLowerCase(), String(dep));
+    const bundles = pj && pj.dsh && pj.dsh.profile ? pj.dsh.profile.bundles : null;
+    check(`② dsh.profile.bundles 里含 ${picked}`,
+      Array.isArray(bundles) && bundles.includes(picked), JSON.stringify(bundles));
+    let real = null;
+    try { real = fs.realpathSync(path.join(dshHome, "profiles", "web", "node_modules", picked)); } catch { real = null; }
+    check(`③ node_modules\\${picked} 真的解析到那个落点`,
+      !!real && path.resolve(real).toLowerCase() === path.resolve(store).toLowerCase(), String(real));
+
+    let mk2 = null;
+    try { mk2 = JSON.parse(fs.readFileSync(marker, "utf8").replace(/^\uFEFF/, "")); } catch { mk2 = null; }
+    check("★ 装完把首启标记更新成「装过这些了」",
+      !!(mk2 && mk2.done === true && Array.isArray(mk2.installed) && mk2.installed.includes(picked)),
+      JSON.stringify(mk2));
+  } finally {
+    await stopApp(b.child);
+  }
+}
+
 // ── 主流程 ────────────────────────────────────────────────────────
 (async () => {
   if (typeof WebSocket === "undefined") {
     console.error("这个 node 没有全局 WebSocket，无法走 CDP（需要 Node 22+）");
     process.exit(1);
   }
-  if (!["loading", "inject", "probe", "reuse", "pages", "plugins"].includes(MODE)) {
-    console.error("用法: node scripts/ui-check.js <loading|inject|probe|reuse|pages|plugins>");
+  if (!["loading", "inject", "probe", "reuse", "pages", "plugins", "firstrun"].includes(MODE)) {
+    console.error("用法: node scripts/ui-check.js <loading|inject|probe|reuse|pages|plugins|firstrun>");
     process.exit(1);
   }
 
@@ -1099,7 +1398,8 @@ async function verifyPlugins(tmpDir) {
         : MODE === "reuse" ? verifyReuse(tmpDir)
           : MODE === "pages" ? verifyPages(tmpDir)
             : MODE === "plugins" ? verifyPlugins(tmpDir)
-              : verifyInject(tmpDir));
+              : MODE === "firstrun" ? verifyFirstRun(tmpDir)
+                : verifyInject(tmpDir));
   } catch (e) {
     console.error(`\n[ui-check] 无法完成检查: ${(e && e.stack) || e}`);
     failures.push("执行异常: " + ((e && e.message) || e));

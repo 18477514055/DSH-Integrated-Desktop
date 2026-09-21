@@ -113,10 +113,22 @@ contextBridge.exposeInMainWorld("dshShell", {
   /** 装或更新一个插件。返回 { ok, errors, warnings, version, needsRestart }。 */
   installPlugin: (name, version) => ipcRenderer.invoke(
     "dsh:plugins:install", String(name), version ? String(version) : null),
+  /** 首启向导用：一次装好几个（清单只下一次网）。返回 { ok, results, installed, needsRestart }。 */
+  installPlugins: (names) => ipcRenderer.invoke(
+    "dsh:plugins:install-many", Array.isArray(names) ? names.map(String) : []),
   /** 卸一个插件（撤 profile 三处 + 删落点）。 */
   uninstallPlugin: (name) => ipcRenderer.invoke("dsh:plugins:uninstall", String(name)),
   /** 用系统浏览器打开插件仓库主页。 */
   openPluginHub: () => ipcRenderer.invoke("dsh:plugins:open-page"),
   /** 插件下载/安装进度：{ kind:"start"|"progress"|"end", name, version?, got?, total?, percent?, ok? } */
   onPluginProgress: (cb) => subscribe("dsh:plugins:progress", cb),
+
+  // ── 首次安装向导（标记文件 src/first-run.js）────────────────────
+  //
+  // 0.2.6 起安装包**不带插件**（包干干净净），插件的入口变成"首启时勾选、从插件仓库拉"。
+  // 这一组只读写 <userData>/first-run.json，不碰 DSH_HOME。
+  /** 向导走过了没有。 */
+  firstRunState: () => ipcRenderer.invoke("dsh:first-run:state"),
+  /** 记成"收工了"（此后不再自动弹）。payload: { skipped?, installed? } */
+  firstRunDone: (payload) => ipcRenderer.invoke("dsh:first-run:done", payload || {}),
 });

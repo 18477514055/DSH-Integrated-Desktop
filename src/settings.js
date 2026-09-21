@@ -3,9 +3,13 @@
 /**
  * settings.js —— 设置窗口页面逻辑。
  *
- * 三栏：常规 / 诊断与修复 / 关于。
+ * 栏位：常规 / 更新 / 集成版插件 / 首次安装向导（**不进导航**）/ 诊断与修复 / 关于。
  * 「诊断与修复」那一栏与加载页底部抽屉**用的是同一个动作白名单**
  * （都在主进程 `diagnostics.js` 里），所以两边永远一致，不会各写一份。
+ *
+ * ★ 「首次安装向导」为什么藏在页面里而不是导航里：它只对"还没有插件的全新用户"有意义
+ *   （0.2.6 起安装包不带插件）。露出的两条路见 `wirePlugins()` 的 `btn-pl-wizard`
+ *   与主进程的 `maybeAutoOpenFirstRun()`。
  */
 
 (() => {
@@ -13,6 +17,28 @@
   const S = window.dshShell;
   const output = ShellUI.createOutput($("out"), $("btn-clear"));
   output.init($("btn-clear"));
+
+  /**
+   * 「跳到某一栏」的订阅 —— **必须在这里（同步执行期）就订上**。
+   *
+   * ★ 原来它写在 `wireUpdate()` 里，而那要等 `boot()` 先 `await S.getEnv()` 才走到。
+   *   主进程那边却是在 `did-finish-load` 那一刻 `send()` 的 —— 两个时刻谁先谁后没有保证，
+   *   实测那条消息**丢**了：托盘点「检查更新…」会把设置窗口打开，但停在「常规」栏、
+   *   也不会自动查一次（看起来像"托盘那条菜单没接线"）。
+   *   首启向导走的**是同一条路**（`openSettingsWindow("welcome")`）⇒ 不修的话
+   *   自动弹出的向导会停在「常规」栏，用户根本看不到勾选清单。
+   *
+   * 所以：订阅提前到同步期，先记下来；等 `boot()` 把各栏都接好线了再执行。
+   */
+  let pendingPane = null;
+  let paneHandler = null;
+  if (S && S.onFocusPane) {
+    S.onFocusPane((pane) => {
+      if (!pane) return;
+      if (paneHandler) paneHandler(String(pane));
+      else pendingPane = String(pane);
+    });
+  }
 
   let env = null;
   let savedTimer = null;
@@ -209,15 +235,17 @@
         : fmtBytes(p.got);
     });
 
-    // 托盘那条「检查更新…」= 打开设置页 + 跳到这一栏 + 自动查一次
-    if (S.onFocusPane) {
-      S.onFocusPane((pane) => {
-        if (!pane) return;
-        switchPane(String(pane));
-        if (String(pane) === "update") doCheck();
-        if (String(pane) === "plugins") loadPlugins(false);
-      });
-    }
+    // 托盘那条「检查更新…」= 打开设置页 + 跳到这一栏 + 自动查一次；
+    // 首启向导同一条路（跳到 welcome 并开始读清单）。
+    // 订阅本身在文件开头（同步期）就订好了，这里只是把"收到之后做什么"接上。
+    paneHandler = (pane) => {
+      switchPane(pane);
+      if (pane === "update") doCheck();
+      if (pane === "plugins") loadPlugins(false);
+      if (pane === "welcome") loadWizard();
+    };
+    // 订阅早于接线时收到的那一条，在这里补做
+    if (pendingPane) { const p = pendingPane; pendingPane = null; paneHandler(p); }
   }
 
   // ── 集成版插件（清单在主进程 src/plugin-catalog.js；装/卸在 src/plugin-install.js）──
@@ -418,6 +446,11 @@
   function wirePlugins() {
     $("btn-pl-check").addEventListener("click", () => loadPlugins(true));
     $("btn-pl-hub").addEventListener("click", () => S.openPluginHub().catch(() => { }));
+    // 安装包不带插件 ⇒ 新用户唯一的入口就是向导。这里给它一个随时能回去的按钮。
+    $("btn-pl-wizard").addEventListener("click", () => {
+      switchPane("welcome");
+      loadWizard();
+    });
 
     // 事件委托：卡片是 innerHTML 画出来的，逐张挂监听会在重画后丢掉
     $("pl-list").addEventListener("click", (ev) => {
@@ -453,6 +486,254 @@
         plProg(p.total ? `${fmtBytes(p.got)} / ${fmtBytes(p.total)}（${pct}%）` : fmtBytes(p.got));
       } else if (p.kind === "end" && !p.ok) {
         plProg(`${p.name} 安装失败`);
+      }
+    });
+  }
+
+  // ── 首次安装向导（0.2.6：安装包不带插件，插件在这一屏勾）────────────
+  //
+  // 用户原话：「我们发出去的包干干净净的，有本体客户端就足够了……如果他们在下载的时候
+  // 或者安装的时候勾选，他们就从我的仓库的其他链接拉取他们。」
+  //
+  // 与「集成版插件」栏的分工：
+  //   · 那一栏是**长期管理**：单个装 / 更 / 卸，看每一条的来路与状态；
+  //   · 这一屏是**第一次的挑选**：一屏勾完、一次装一批、装完收工。
+  // 两屏读的是**同一份** pluginState（主进程算出来的唯一真相）⇒ 不会互相矛盾。
+  //
+  // ★ 这一屏**不进左侧导航**：它只对"还没有插件的新用户"有意义，对老用户是噪音。
+  //   入口只有两个：主进程 firstRunDue() 判定后的自动弹出，
+  //   以及「集成版插件」栏里的「打开首次安装向导」按钮。
+  let frBusy = false;
+
+  const frStatus = (t) => { $("fr-status").textContent = t; };
+  const frProg = (t) => { $("fr-prog").textContent = t; };
+
+  /** 这一条**现在能不能装**。不能装的画成灰的，而不是给一个点了必然失败的按钮。 */
+  function frInstallable(r) {
+    if (!r || !r.compatible) return false;
+    if (!r.latest || !r.latest.version) return false;
+    return ["not-installed", "broken"].includes(r.state);
+  }
+
+  /** 不能装的话，为什么 —— 直接印在卡片上，省得用户猜。 */
+  function frWhyNot(r) {
+    if (!r.compatible) return "不适用于本外壳";
+    if (!r.latest || !r.latest.version) return "清单里没有可装的版本";
+    switch (r.state) {
+      case "installed": return "已经装好了";
+      case "update": return "已经装好了（有新版，去「集成版插件」里更新）";
+      case "disabled": return "已经装好了（没启用）";
+      case "local": return "本机已经装了（本地那一份）";
+      default: return "";
+    }
+  }
+
+  function frItemHtml(r) {
+    const e = ShellUI.esc;
+    const latest = r.latest || {};
+    const can = frInstallable(r);
+    // 默认勾上"能装的、且不是开发者工具"的那些 —— 一进来就是一个可用的默认选择
+    const checked = can && !r.devOnly;
+    const desc = latest.description
+      ? e(latest.description)
+      : '<i style="color:var(--fg-faint)">（发布者未填说明）</i>';
+
+    const tags = [];
+    if (r.devOnly) tags.push('<span class="tag dev">开发者工具</span>');
+    if (!r.compatible) tags.push('<span class="tag bad">不适用于本外壳</span>');
+    else if (!can) tags.push('<span class="tag on">已装</span>');
+
+    const meta = [`线上 v${latest.version}`];
+    if (r.local) meta.push(`本机 v${r.local.version}`);
+    if (latest.repo) meta.push(`来自 ${latest.repo}`);
+    if (latest.bytes) meta.push(fmtBytes(latest.bytes));
+    if (!can) meta.push(frWhyNot(r));
+
+    // ★ 整张卡片就是一个 <label> ⇒ 点卡片任何地方都能勾/取消（不必瞄准那个小方块）。
+    //   不可装的给 disabled：<label> 点它不会有任何反应，也就不会"看着能点其实点不动"。
+    return `<label class="pl-card fr-item${can ? "" : " off"}">
+      <div class="hd">
+        <input type="checkbox" class="fr-ck" data-fr-name="${e(r.name)}"${checked ? " checked" : ""}${can ? "" : " disabled"}>
+        <span class="nm">${e(r.name)}</span>${tags.join("")}
+      </div>
+      <p class="ds">${desc}</p>
+      <div class="meta">${meta.map(e).join(" · ")}</div>
+    </label>`;
+  }
+
+  const frSelected = () => [...document.querySelectorAll("#fr-list input.fr-ck:checked")]
+    .map((x) => x.dataset.frName);
+
+  function frSyncActions() {
+    const sel = frSelected();
+    const btn = $("btn-fr-install");
+    btn.disabled = frBusy || sel.length === 0;
+    btn.textContent = sel.length ? `安装选中的 ${sel.length} 个插件` : "安装选中的插件";
+    $("fr-sel").textContent = sel.length ? "" : "（上面一条都没勾）";
+  }
+
+  function renderWizard(st) {
+    const list = $("fr-list");
+    if (!st || !st.ok) {
+      $("fr-repo").textContent = "—";
+      frStatus(`取清单失败：${(st && st.error) || "未知原因"}`);
+      list.innerHTML = '<div class="pl-empty">连不上插件仓库，本机也没有缓存 —— '
+        + '先点「先跳过」把客户端用起来，以后在「集成版插件」里随时能装。</div>';
+      $("fr-actions").style.display = "";
+      frSyncActions();
+      return;
+    }
+
+    const rows = st.rows || [];
+    $("fr-repo").textContent = st.repo || "—";
+    frStatus(st.stale
+      ? `这次没连上插件仓库，显示的是缓存（${fmtTime(st.fetchedAt)}）`
+      : `清单更新于 ${fmtTime(st.fetchedAt)}`);
+
+    // 读不懂的东西**明说**，不假装没发生（与「集成版插件」栏同一套措辞）
+    const warn = [];
+    if (!st.knownSchema) warn.push(`清单格式是 ${st.schema}，本外壳认识的是更早的一版 —— 可能读不全。`);
+    for (const w of (st.warnings || []).slice(0, 3)) warn.push(w);
+    $("fr-notice").innerHTML = warn.length
+      ? `<div class="pl-warn">${warn.map(ShellUI.esc).join("<br>")}</div>`
+      : "";
+
+    list.innerHTML = rows.length
+      ? rows.map(frItemHtml).join("")
+      : '<div class="pl-empty">仓库里现在还没有插件。</div>';
+    $("fr-actions").style.display = "";
+    frSyncActions();
+  }
+
+  async function loadWizard() {
+    if (frBusy) return;
+    $("fr-done").style.display = "none";
+    $("fr-actions").style.display = "";
+    $("fr-row-prog").style.display = "none";
+    $("fr-notice").innerHTML = "";
+    $("fr-list").innerHTML = "";
+    $("btn-fr-install").disabled = true;
+    frStatus("正在读清单…");
+    try {
+      renderWizard(await S.plugins());
+    } catch (e) {
+      frStatus(`出错：${(e && e.message) || e}`);
+    }
+  }
+
+  /** 装完之后的收工块：说清"装了什么 / 有没有失败 / 下一步点哪"。 */
+  function showWizardDone(okList, bad) {
+    $("fr-actions").style.display = "none";
+    $("fr-row-prog").style.display = "none";
+    $("fr-done").style.display = "";
+    const lines = [`已经把 ${okList.join("、")} 装进 DSH 档案了。`];
+    if (bad.length) {
+      lines.push("这几个没装上：" + bad
+        .map((x) => `${x.name}（${(x.errors || []).join("；") || "未知原因"}）`).join("；"));
+    }
+    lines.push("插件要内核重读一次档案才会加载 —— 点下面的按钮重启一次内核就生效了。");
+    $("fr-done-text").innerHTML = lines.map(ShellUI.esc).join("<br>");
+  }
+
+  async function doInstallSelected() {
+    if (frBusy) return;
+    const names = frSelected();
+    if (!names.length) return;
+
+    frBusy = true;
+    $("btn-fr-install").disabled = true;
+    $("fr-row-prog").style.display = "";
+    $("fr-fill").style.width = "0%";
+    frProg(`正在准备 ${names.length} 个插件…`);
+    try {
+      const r = await S.installPlugins(names);
+      const okList = (r && r.installed) || [];
+      const bad = ((r && r.results) || []).filter((x) => !x.ok);
+
+      if (!okList.length) {
+        const why = (r && r.errors && r.errors.join("；"))
+          || bad.map((x) => `${x.name}：${(x.errors || []).join("；")}`).join(" | ")
+          || "未知原因";
+        frProg(`一个都没装上：${why}`);
+        $("fr-fill").style.width = "0%";
+        frBusy = false;
+        frSyncActions();
+        return;
+      }
+
+      // ★ 先把账记了再报喜：记不上最多下次再弹一次向导，比"装完了却没记账"轻。
+      try { await S.firstRunDone({ installed: okList }); } catch { /* 见上 */ }
+      showWizardDone(okList, bad);
+    } catch (e) {
+      frProg(`出错：${(e && e.message) || e}`);
+      frBusy = false;
+      frSyncActions();
+    }
+  }
+
+  /**
+   * 「先跳过，直接开始用」—— 真的把路让开：记成收工，然后关掉这个窗口。
+   *
+   * ★ 必须 **await 完记账再关窗口**：关窗口会触发主进程的 `closed` 处理器，
+   *   而它会把"用户直接关掉了向导"记成 `dismissed` —— 两条 IPC 谁先被处理没有保证，
+   *   先关窗口就可能把标记写成 `{skipped:true, dismissed:true}`（两种收工方式混在一起）。
+   *   实测大部分时候是 skipped 先到，但那是运气，不是保证。
+   */
+  async function doSkip() {
+    if (frBusy) return;
+    $("btn-fr-skip").disabled = true;
+    try { await S.firstRunDone({ skipped: true }); } catch { /* 记不上最多下次再弹 */ }
+    S.closeSelf().catch(() => { });
+  }
+
+  /**
+   * 重启内核让插件生效。
+   *
+   * ★ 走的是**诊断白名单里那一个** `restart-kernel`（与「诊断与修复」栏同一个动作），
+   *   不另写一套重启逻辑 —— 那条路上的失败回退（换档案起不来时退回原档案）
+   *   是 2026-09-19 事故后专门补的，重写一遍必然漏掉。
+   * ★ 先让用户确认：重启会打断正在生成的回答。
+   */
+  async function doRestartForPlugins() {
+    const go = await ShellUI.confirmModal(
+      "要重启内核吗？\n\n"
+      + "正在生成的回答会中断；新内核起来时会重新读一遍 DSH 档案，刚装的插件就生效了。");
+    if (!go) return;
+    $("btn-fr-restart").disabled = true;
+    $("fr-done-text").innerHTML = ShellUI.esc("正在重启内核…（这个窗口马上会关掉，请看主界面）");
+    S.runAction("restart-kernel").catch(() => { });
+    // 不等它跑完：动作一执行主界面就会切回加载页，这个窗口留着只会挡在前面
+    setTimeout(() => { S.closeSelf().catch(() => { }); }, 400);
+  }
+
+  function wireWizard() {
+    // 勾选变化 → 更新计数与按钮文字（事件委托：卡片是 innerHTML 画出来的）
+    $("fr-list").addEventListener("change", (ev) => {
+      const t = ev.target;
+      if (t && t.classList && t.classList.contains("fr-ck")) frSyncActions();
+    });
+
+    $("btn-fr-install").addEventListener("click", doInstallSelected);
+    $("btn-fr-skip").addEventListener("click", doSkip);
+    $("btn-fr-restart").addEventListener("click", doRestartForPlugins);
+    $("btn-fr-finish").addEventListener("click", () => { S.closeSelf().catch(() => { }); });
+
+    S.onPluginProgress((p) => {
+      if (!p) return;
+      // itemIndex/itemTotal 是整批的第几个；got/total 是**这一个**的字节数。
+      // 两个都用上，别混：`p.total` 只可能是字节数。
+      const at = p.itemTotal ? `第 ${p.itemIndex || "?"}/${p.itemTotal} 个 · ` : "";
+      if (p.kind === "start") {
+        $("fr-row-prog").style.display = "";
+        frProg(`${at}正在下载 ${p.name}${p.version ? " v" + p.version : ""}…`);
+      } else if (p.kind === "progress") {
+        const pct = Math.max(0, Math.min(100, p.percent || 0));
+        $("fr-fill").style.width = `${pct}%`;
+        frProg(at + (p.total
+          ? `${fmtBytes(p.got)} / ${fmtBytes(p.total)}（${pct}%）`
+          : fmtBytes(p.got)));
+      } else if (p.kind === "end" && !p.ok) {
+        frProg(`${at}${p.name} 安装失败`);
       }
     });
   }
@@ -507,6 +788,7 @@
     wire();
     wireUpdate();
     wirePlugins();
+    wireWizard();
     loadPlugins(false);
 
     await ShellUI.mountActions($("actions"), { output, verdictEl: $("verdict") });

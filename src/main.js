@@ -47,6 +47,7 @@ const SITES = require("./sites");
 const U = require("./update");
 const PC = require("./plugin-catalog");
 const PI = require("./plugin-install");
+const FR = require("./first-run");
 const WHALE = require("./whale-path.json");
 
 // ── 最早期的错误捕获 ──────────────────────────────────────────────
@@ -190,6 +191,57 @@ function bundledPluginsEnabled() {
   if (env === "off" || env === "0" || env === "false") return false;
   if (env === "auto" || env === "1" || env === "true") return true;
   return app.isPackaged === true;
+}
+
+/**
+ * 「首次安装向导」要不要**自动**弹出来。
+ *
+ * ★ 开发机默认不弹，`app.isPackaged` 才自动弹 —— 与 `bundledPluginsEnabled()` 同一条思路，
+ *   但这里还有第二个、更硬的理由：**本项目有五个验收脚本会用一个全新的临时
+ *   `--user-data-dir` 起真客户端**（`ui-check` 的六个模式、`plugin-check`、
+ *   `plugin-check-archive`、`plugin-check-mobile-remote`）。那些临时家全都是"全新家"
+ *   ⇒ 如果开发模式下也自动弹，每个脚本都会多出一个设置窗口、多一个 CDP page 目标，
+ *   把它们的 `waitForPage` 判据全搅乱。
+ *   ⇒ 默认只在打包版弹；要**主动验**它，用 `DSH_FIRST_RUN=force`
+ *     （`scripts/ui-check.js firstrun` 就是这么干的），不必改任何别的脚本。
+ *
+ * 取值：`force`/`on`/`1`/`true` = 一定弹；`off`/`0`/`false` = 一定不弹（给用户的逃生阀）。
+ * `DSH_FIRST_RUN=off` 也让用户能自己关掉它，不必等我们发新版本。
+ */
+function firstRunAutoEnabled() {
+  const env = String(process.env.DSH_FIRST_RUN || "").toLowerCase();
+  if (env === "off" || env === "0" || env === "false") return false;
+  if (env === "force" || env === "on" || env === "1" || env === "true") return true;
+  return app.isPackaged === true;
+}
+
+/** 这一次是不是"自动弹出的首启向导" —— 决定关窗口时要不要记 `dismissed`。 */
+let firstRunWizardAuto = false;
+
+/**
+ * 首启向导**该不该自动弹**（三个条件同时成立）。
+ *
+ * ① 这一份 userData 还没走过向导（`<userData>/first-run.json` 里没有 `done:true`）；
+ * ② `firstRunAutoEnabled()`（见上，开发机默认不弹）；
+ * ③ **这个家里一个插件都没有** —— 这条是为了"从 0.2.5 升上来的老用户"：
+ *    他们的插件是随包落位/开发联接装好的，本来就不需要挑。判据**只看本机磁盘**，
+ *    不联网（`listInstalled` 是纯本地扫描）⇒ 断网也不会误判成"全新用户"而骚扰他。
+ *    家里一个插件都没有 = 真正的全新用户，才该看到菜单。
+ */
+function firstRunDue() {
+  if (FR.isDone(app.getPath("userData"))) return false;
+  if (!firstRunAutoEnabled()) return false;
+  try {
+    const inst = PI.listInstalled({ dshHome: getDshHome(), profile: settings.profile || "web" });
+    if (inst.plugins.length > 0) {
+      log(`[首启向导] 这个家里已经有 ${inst.plugins.length} 个插件 ⇒ 不当作全新用户，不弹向导`);
+      return false;
+    }
+  } catch (e) {
+    // 读不到（profile 还没建、家是空的）就当"全新" —— 那正是我们要处理的场景
+    log(`[首启向导] 扫本机插件时出错（按全新处理）：${(e && e.message) || e}`);
+  }
+  return true;
 }
 
 /**
@@ -1062,6 +1114,9 @@ function openSettingsWindow(pane) {
     }
     return;
   }
+  // 「首次安装向导」是**同一个窗口的另一个栏**，但它对用户是"欢迎页"而不是"设置页"
+  // ⇒ 标题跟着换，别让人第一次打开客户端就看到「设置」两个字。
+  const isWelcome = String(pane || "") === "welcome";
   settingsWindow = new BrowserWindow({
     width: 940,
     height: 700,
@@ -1069,7 +1124,7 @@ function openSettingsWindow(pane) {
     minHeight: 520,
     show: false,
     backgroundColor: "#ffffff",
-    title: "设置 · DSH 集成桌面端",
+    title: isWelcome ? "欢迎使用 · DSH 集成桌面端" : "设置 · DSH 集成桌面端",
     icon: iconPath() || undefined,
     parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
     webPreferences: {
@@ -1081,7 +1136,19 @@ function openSettingsWindow(pane) {
     },
   });
   settingsWindow.once("ready-to-show", () => settingsWindow.show());
-  settingsWindow.on("closed", () => { settingsWindow = null; });
+  settingsWindow.on("closed", () => {
+    settingsWindow = null;
+    // ★ 自动弹出的首启向导，用户**什么都没点就把窗口关了** ⇒ 记成"见过向导了"。
+    //   不记的话每次启动都会再弹一次 —— 那是骚扰，不是向导。
+    //   手动打开的向导（firstRunWizardAuto=false）不记：用户只是关了个设置窗口。
+    if (firstRunWizardAuto) {
+      firstRunWizardAuto = false;
+      if (!FR.isDone(app.getPath("userData"))) {
+        const s = FR.mark(app.getPath("userData"), { dismissed: true, appVersion: app.getVersion() });
+        log(`[首启向导] 用户直接关掉了向导 ⇒ 记为已看过（随时可在「集成版插件」里重开）：${JSON.stringify(s)}`);
+      }
+    }
+  });
   settingsWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/.test(url)) shell.openExternal(url);
     return { action: "deny" };
@@ -1089,11 +1156,39 @@ function openSettingsWindow(pane) {
   // 页面加载完再把"跳到哪一栏"告诉她 —— 加载前发会丢（页面还没订阅）
   if (pane) {
     settingsWindow.webContents.once("did-finish-load", () => {
+      // ★ 窗口标题必须**加载完之后**再设。
+      //   `new BrowserWindow({ title })` 在页面自带 <title> 时会被文档标题盖掉 ——
+      //   Electron 文档原话：If the HTML tag <title> is defined in the HTML file
+      //   loaded by loadURL(), this property will be ignored.
+      //   （实测：只传选项时窗口标题仍然是「设置 · DSH 集成桌面端」。）
+      if (isWelcome && settingsWindow && !settingsWindow.isDestroyed()) {
+        try {
+          settingsWindow.setTitle("欢迎使用 · DSH 集成桌面端");
+          log(`[首启向导] 窗口标题 → ${settingsWindow.getTitle()}`);
+        } catch { /* 忽略 */ }
+      }
       try { settingsWindow.webContents.send("dsh:settings:focus-pane", String(pane)); } catch { /* 忽略 */ }
     });
   }
   settingsWindow.loadFile(path.join(__dirname, "settings.html"))
     .catch((e) => log("加载设置页失败:", (e && e.message) || e));
+}
+
+/**
+ * 自动弹首启向导。**只在 bootstrap 里、内核已经就绪之后调一次。**
+ *
+ * 时机是刻意的：勾选装插件要写 profile 的三处契约，而**全新机器上 profile 是内核
+ * 第一次跑起来才建的** ⇒ 早于 `ensureServer()` 弹，用户勾完会发现"写不进去"。
+ * 所以向导永远排在内核就绪之后。
+ *
+ * 它**不阻塞启动**：向导是一个独立窗口，主界面照常在后面加载完。
+ */
+function maybeAutoOpenFirstRun() {
+  if (SMOKE) return;                                  // 冒烟测试不弹任何窗口
+  if (!firstRunDue()) return;
+  firstRunWizardAuto = true;
+  log("[首启向导] 全新安装（家里没有插件、也没走过向导）⇒ 弹出集成版插件挑选向导");
+  openSettingsWindow("welcome");
 }
 
 function toggleWindow() {
@@ -1196,6 +1291,63 @@ function pluginsEmit(payload) {
       try { w.webContents.send("dsh:plugins:progress", payload); } catch { /* 窗口正在关 */ }
     }
   }
+}
+
+/**
+ * 从**一份已经取好的清单快照**里装一个插件。
+ *
+ * ★ 抽出来是为了"单个装"与"首启向导整批装"共用同一份实现 ——
+ *   复制一遍的话，将来只改一处（比如校验方式）就会让两条路悄悄分叉，
+ *   而这两条路写的是同一个 profile 契约。
+ *
+ * ★ 版本与下载地址**只从清单快照里取**，渲染进程递进来的名字必须先在清单里找到。
+ *   否则"装插件"就成了"从任意 URL 装任意代码"的通道。
+ *
+ * @param {object} st     `pluginState()` 的返回值（含 rows / dshHome / profile）
+ * @param {string} name   包名
+ * @param {?string} version 指定版本；null = 用清单里的 latest
+ * @param {object} [extra] 额外塞进进度事件的字段（首启向导用它带 index/total）
+ */
+async function installOneFromIndex(st, name, version, extra = {}) {
+  const row = st.rows.find((r) => r.name === name);
+  if (!row) return { ok: false, errors: [`清单里没有 ${name}`] };
+  const entry = version
+    ? row.versions.find((v) => v.version === String(version))
+    : row.latest;
+  if (!entry) return { ok: false, errors: [`清单里没有 ${name}@${version}`] };
+
+  log(`安装插件 ${entry.name}@${entry.version}（来自 ${entry.repo}）`);
+  pluginsEmit({ kind: "start", name: entry.name, version: entry.version, ...extra });
+
+  const dl = await PC.downloadArchive(entry, (p) => pluginsEmit({ kind: "progress", name: entry.name, ...extra, ...p }));
+  if (!dl.ok) {
+    pluginsEmit({ kind: "end", name: entry.name, ok: false, ...extra });
+    log(`下载插件失败：${dl.error}`);
+    return { ok: false, errors: [dl.error], version: entry.version };
+  }
+
+  let r;
+  try {
+    r = PI.installFromArchive({
+      dshHome: st.dshHome,
+      profile: st.profile,
+      tgz: dl.path,
+      // 索引给了哈希就一定要对得上；没给则 installFromArchive 会走"未校验"的降级路径并留警告
+      expectedSha256: entry.sha256 || undefined,
+      name: entry.name,
+      log: (m) => log(`[插件] ${m}`),
+    });
+  } catch (err) {
+    r = { ok: false, errors: [`安装出错：${(err && err.message) || err}`], warnings: [], changed: [] };
+  } finally {
+    // 下载的那个 tgz 装完就没用了：插件本体已经拷进 <DSH_HOME>\plugins\<名字>，
+    // profile 里写的是 link 指过去 —— **不留悬空引用**（与上传器的 file: 方案不同）。
+    PC.cleanupArchive(dl.path);
+  }
+
+  pluginsEmit({ kind: "end", name: entry.name, ok: !!r.ok, ...extra });
+  log(`安装插件 ${entry.name}@${entry.version}：ok=${r.ok} changed=${JSON.stringify(r.changed || [])} ${(r.errors || []).join("；")}`);
+  return { ...r, version: entry.version, needsRestart: !!r.ok };
 }
 
 /**
@@ -1467,45 +1619,46 @@ function registerIpc() {
 
     const st = await pluginState({ force: true });
     if (!st.ok) return { ok: false, errors: [st.error || "取插件清单失败"] };
-    const row = st.rows.find((r) => r.name === want);
-    if (!row) return { ok: false, errors: [`清单里没有 ${want}`] };
-    const entry = version
-      ? row.versions.find((v) => v.version === String(version))
-      : row.latest;
-    if (!entry) return { ok: false, errors: [`清单里没有 ${want}@${version}`] };
+    return installOneFromIndex(st, want, version);
+  });
 
-    log(`安装插件 ${entry.name}@${entry.version}（来自 ${entry.repo}）`);
-    pluginsEmit({ kind: "start", name: entry.name, version: entry.version });
+  /**
+   * 首启向导用：**一次装好几个**。
+   *
+   * ★ 只是把"循环"搬到主进程，**不是**多开一条能力更大的通道：
+   *   渲染进程递进来的依旧只有包名，清单**只拉一次**，每个名字照样要在这份快照里找得到。
+   *   这么做的两个实际好处：
+   *     ① 清单只下一次网（否则装 4 个就拉 4 次索引）；
+   *     ② 整批共享**同一份清单快照** —— 不会出现"装到第 3 个时索引变了"这种半新半旧。
+   */
+  ipcMain.handle("dsh:plugins:install-many", async (e, names) => {
+    assertShellSender(e);
+    const want = (Array.isArray(names) ? names : [])
+      .map((n) => String(n || "").trim()).filter(Boolean);
+    if (!want.length) return { ok: true, results: [], installed: [], needsRestart: false };
+    if (want.length > 32) return { ok: false, errors: ["一次勾太多了（上限 32 个）"], results: [], installed: [], needsRestart: false };
 
-    const dl = await PC.downloadArchive(entry, (p) => pluginsEmit({ kind: "progress", name: entry.name, ...p }));
-    if (!dl.ok) {
-      pluginsEmit({ kind: "end", name: entry.name, ok: false });
-      log(`下载插件失败：${dl.error}`);
-      return { ok: false, errors: [dl.error] };
+    const st = await pluginState({ force: true });
+    if (!st.ok) return { ok: false, errors: [st.error || "取插件清单失败"], results: [], installed: [], needsRestart: false };
+
+    log(`[首启向导] 开始整批安装：${want.join(", ")}`);
+    const results = [];
+    for (let i = 0; i < want.length; i += 1) {
+      // ★ 字段名是 `itemIndex`/`itemTotal` 而**不是** `index`/`total` ——
+      //   `total` 已经被下载进度占用（字节总数，见 downloadArchive 的进度事件）。
+      //   叫 `total` 会被 `...p` 覆盖掉，页面上就分不清"第几个"和"多少字节"。
+      const extra = { itemIndex: i + 1, itemTotal: want.length };
+      let r;
+      try {
+        r = await installOneFromIndex(st, want[i], null, extra);
+      } catch (err) {
+        r = { ok: false, errors: [`安装出错：${(err && err.message) || err}`] };
+      }
+      results.push({ name: want[i], ok: !!r.ok, version: r.version || "", errors: r.errors || [], warnings: r.warnings || [] });
     }
-
-    let r;
-    try {
-      r = PI.installFromArchive({
-        dshHome: st.dshHome,
-        profile: st.profile,
-        tgz: dl.path,
-        // 索引给了哈希就一定要对得上；没给则 installFromArchive 会走"未校验"的降级路径并留警告
-        expectedSha256: entry.sha256 || undefined,
-        name: entry.name,
-        log: (m) => log(`[插件] ${m}`),
-      });
-    } catch (err) {
-      r = { ok: false, errors: [`安装出错：${(err && err.message) || err}`], warnings: [], changed: [] };
-    } finally {
-      // 下载的那个 tgz 装完就没用了：插件本体已经拷进 <DSH_HOME>\plugins\<名字>，
-      // profile 里写的是 link 指过去 —— **不留悬空引用**（与上传器的 file: 方案不同）。
-      PC.cleanupArchive(dl.path);
-    }
-
-    pluginsEmit({ kind: "end", name: entry.name, ok: !!r.ok });
-    log(`安装插件 ${entry.name}@${entry.version}：ok=${r.ok} changed=${JSON.stringify(r.changed || [])} ${(r.errors || []).join("；")}`);
-    return { ...r, version: entry.version, needsRestart: !!r.ok };
+    const installed = results.filter((r) => r.ok).map((r) => r.name);
+    log(`[首启向导] 整批装完：成功 ${installed.length}/${want.length} 个 [${installed.join(", ")}]`);
+    return { ok: installed.length > 0, results, installed, needsRestart: installed.length > 0 };
   });
 
   ipcMain.handle("dsh:plugins:uninstall", async (e, name) => {
@@ -1526,6 +1679,37 @@ function registerIpc() {
   ipcMain.handle("dsh:plugins:open-page", (e) => {
     assertShellSender(e);
     return shell.openExternal(`https://github.com/${PC.HUB_REPO}`);
+  });
+
+  // ── 首次安装向导（标记文件见 src/first-run.js）────────────────────
+  //
+  // 只读写 `<userData>/first-run.json`，**不碰 DSH_HOME**。
+  // 判定"要不要自动弹"在主进程（firstRunDue），页面只负责"记成收工了"。
+  ipcMain.handle("dsh:first-run:state", (e) => {
+    assertShellSender(e);
+    const s = FR.read(app.getPath("userData")) || {};
+    return {
+      done: s.done === true,
+      at: s.at || "",
+      installed: Array.isArray(s.installed) ? s.installed : [],
+      skipped: s.skipped === true,
+      dismissed: s.dismissed === true,
+      autoEnabled: firstRunAutoEnabled(),
+      userData: app.getPath("userData"),
+    };
+  });
+
+  ipcMain.handle("dsh:first-run:done", (e, payload) => {
+    assertShellSender(e);
+    const p = payload && typeof payload === "object" ? payload : {};
+    firstRunWizardAuto = false;   // 用户已经明确表态，关窗口时不必再记一次 dismissed
+    const s = FR.mark(app.getPath("userData"), {
+      appVersion: app.getVersion(),
+      skipped: p.skipped === true,
+      installed: Array.isArray(p.installed) ? p.installed.map(String).slice(0, 64) : [],
+    });
+    log(`[首启向导] 收工：${JSON.stringify(s)}`);
+    return { ok: !!s, state: s };
   });
 }
 
@@ -1604,6 +1788,9 @@ async function bootstrap() {
     await mainWindow.loadURL(serverUrl);
     startHealthWatch();
     verifyUiLoaded().catch(() => { /* 已记录 */ });
+    // ★ 首启向导排在这里：profile 此刻一定已经在了（内核就绪的副作用），
+    //   而主界面已经加载完 —— 向导窗口浮在上面，用户关掉它就是客户端本体。
+    maybeAutoOpenFirstRun();
   } catch (e) {
     const msg = (e && e.message) || String(e);
     log("启动失败:", msg);

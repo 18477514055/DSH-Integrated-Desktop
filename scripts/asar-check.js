@@ -38,12 +38,14 @@ const CHECKS = [
   {
     file: "src/settings.html",
     marks: ['data-pane="update"', 'data-pane="plugins"', 'data-pane="diag"',
-      "up-current", "pl-list", "btn-pl-check", "up-row-local", "btn-up-local"],
+      'data-pane="welcome"', "up-current", "pl-list", "btn-pl-check", "up-row-local", "btn-up-local",
+      "btn-pl-wizard", "fr-list", "btn-fr-install", "fr-done"],
   },
   {
     file: "src/settings.js",
     marks: ["wireUpdate()", "wirePlugins()", "loadPlugins(false)", "doInstallPlugin",
-      "doUninstallPlugin", "ShellUI.esc", "doInstallLocal", "localNewer", "sourceLabel"],
+      "doUninstallPlugin", "ShellUI.esc", "doInstallLocal", "localNewer", "sourceLabel",
+      "wireWizard()", "loadWizard", "doInstallSelected", "frInstallable", "firstRunDone"],
   },
   {
     file: "src/sites.js",
@@ -57,6 +59,8 @@ const CHECKS = [
       "dsh:plugins:list", "dsh:plugins:check", "dsh:plugins:install", "dsh:plugins:uninstall",
       "pluginState", "pluginsEmit",
       "localInstallerDirs", "localInstallerFound",
+      "dsh:plugins:install-many", "installOneFromIndex",
+      "dsh:first-run:state", "dsh:first-run:done", "firstRunDue", "maybeAutoOpenFirstRun",
     ],
   },
   {
@@ -65,7 +69,14 @@ const CHECKS = [
   },
   {
     file: "src/preload.js",
-    marks: ["switchPage", "openShellSettings", "checkUpdate", "installPlugin", "uninstallPlugin", "checkPlugins"],
+    marks: ["switchPage", "openShellSettings", "checkUpdate", "installPlugin", "uninstallPlugin", "checkPlugins",
+      "installPlugins", "firstRunState", "firstRunDone"],
+  },
+  {
+    // ★ 0.2.6 起：安装包**不带插件**，插件的入口在首启向导 —— 这个文件必须真的在产物里，
+    //   否则"标记读不出来"会让向导每次启动都弹（骚扰），或者再也弹不出来（新用户拿不到插件）。
+    file: "src/first-run.js",
+    marks: ["first-run.json", "isDone", "mark", "statePath"],
   },
   {
     // ★ 这两个是插件管理器的两块核心，**必须真的进产物**
@@ -147,9 +158,17 @@ function main() {
   }
   fs.closeSync(fd);
 
-  // 顺带两条结构性检查
+  // ── 结构性检查：**包干干净净**（0.2.6 的核心承诺，从"打印一句"升级成"断言"）──
+  //
+  // 用户原话：「我们发出去的包干干净净的，有本体客户端就足够了。」
+  // ⇒ 安装产物里**不许**带插件：插件改由首启向导从插件仓库拉（见 src/first-run.js）。
+  //   这两条断言的作用是：谁把 `extraResources` 或 `build.files` 里的 plugin 加回来，
+  //   `npm run verify:asar` 立刻 FAIL —— 不再靠人记得。
+  let structBad = 0;
+
   const hasPluginDir = !!(tree.files && tree.files.plugin);
-  console.log(`\n  asar 内 plugin/ 目录存在: ${hasPluginDir}（应为 false —— 插件走 extraResources）`);
+  console.log(`\n  asar 内 plugin/ 目录存在: ${hasPluginDir}（必须 false —— 插件不进 asar）`);
+  if (hasPluginDir) { structBad += 1; console.log("  FAIL  asar 里带了 plugin/ 目录"); }
 
   const unpacked = path.join(path.dirname(asar), "plugins");
   const hasPlugins = fs.existsSync(unpacked);
@@ -158,13 +177,20 @@ function main() {
     try { pluginNames = fs.readdirSync(unpacked); } catch { /* 忽略 */ }
   }
   console.log(`  resources/plugins 存在: ${hasPlugins}${hasPlugins ? "  → " + pluginNames.join(", ") : "（干净包：不带内置插件）"}`);
+  if (hasPlugins) {
+    structBad += 1;
+    console.log(`  FAIL  产物里带了 ${pluginNames.length} 个内置插件 —— 0.2.6 起必须不带。`
+      + `\n        插件现在由「首次安装向导」从插件仓库拉（src/first-run.js + src/plugin-catalog.js）。`
+      + `\n        若是故意要恢复随包分发，请同时改这里与 AGENTS.md §7，别只改 package.json。`);
+  }
 
   console.log("");
-  if (bad === 0) {
-    console.log(`结论：${filesOk} 个文件、${totalMarks} 个功能标记全部命中`);
+  if (bad === 0 && structBad === 0) {
+    console.log(`结论：${filesOk} 个文件、${totalMarks} 个功能标记全部命中；结构性检查全过（干净包）`);
     process.exit(0);
   }
-  console.log(`结论：${bad} 个标记缺失 —— **产物里的代码不是你现在看到的这一份**`);
+  if (bad) console.log(`结论：${bad} 个标记缺失 —— **产物里的代码不是你现在看到的这一份**`);
+  if (structBad) console.log(`结论：${structBad} 项结构性检查没过 —— 这个包不是「干净包」`);
   process.exit(1);
 }
 

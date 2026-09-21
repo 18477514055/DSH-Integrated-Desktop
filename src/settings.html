@@ -68,6 +68,18 @@
     border-radius: 8px; padding: 8px 10px; font-size: 12px; margin: 10px 0;
   }
 
+  /* ── 首启向导（勾选清单） ──
+     整张卡片就是一个 <label> ⇒ 点卡片任何地方都能勾/取消，不必瞄准那个小方块。 */
+  .fr-item { cursor: pointer; display: block; }
+  .fr-item:hover { border-color: #c7d0ff; }
+  .fr-item .hd { align-items: center; }
+  .fr-item .hd input[type=checkbox] {
+    width: 16px; height: 16px; accent-color: var(--accent); flex: none; margin: 0 2px 0 0;
+  }
+  .fr-item.off { opacity: .6; cursor: default; }
+  .fr-item.off:hover { border-color: var(--line); }
+  .fr-actions { margin-top: 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
   .diag-grid { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 14px; align-items: start; }
   @media (max-width: 860px) { .diag-grid { grid-template-columns: 1fr; } }
   .diag-grid .output { max-height: 56vh; position: sticky; top: 0; }
@@ -156,8 +168,8 @@
     <section class="pane" data-pane="update">
       <h2>更新</h2>
       <p class="hint">
-        从本项目的 GitHub Releases 查新版本，查到就能**直接下载并安装** —— 不用自己去网页上找。
-        这里升的是**外壳**；内核是另一回事（内核版本见「关于」，升级内核不走这里）。
+        从本项目的 GitHub Releases 查新版本，查到就能<b>直接下载并安装</b> —— 不用自己去网页上找。
+        这里升的是<b>外壳</b>；内核是另一回事（内核版本见「关于」，升级内核不走这里）。
       </p>
 
       <div class="row">
@@ -206,11 +218,58 @@
       </div>
     </section>
 
+    <!-- ── 首次安装向导 ───────────────────────────────────────
+         **不进左侧导航**：只有两条路会把它露出来 ——
+         ① 全新安装第一次启动（主进程 firstRunDue() 判定后自动打开）；
+         ② 「集成版插件」栏里的「打开首次安装向导」按钮。
+         故意不加导航项，是因为它只对"还没有插件的新用户"有意义，对老用户是噪音。 -->
+    <section class="pane" data-pane="welcome">
+      <h2>先挑几个集成版插件</h2>
+      <p class="hint">
+        安装包本身<b>不再带插件</b>了 —— 你要哪些，现在勾出来，我们从自己的插件仓库拉下来装。
+        装完<b>重启一次内核</b>就生效。不想现在挑也行：点「先跳过」，以后在「集成版插件」里随时能装。
+      </p>
+
+      <div class="row">
+        <div class="k">插件仓库</div>
+        <div class="v">
+          <span class="mono" id="fr-repo">—</span>
+          <span class="note" id="fr-status">正在读清单…</span>
+        </div>
+      </div>
+      <div class="row" id="fr-row-prog" style="display:none">
+        <div class="k">进度</div>
+        <div class="v" style="flex-direction:column;align-items:stretch;gap:6px">
+          <div style="height:8px;background:var(--line-soft);border-radius:6px;overflow:hidden">
+            <i id="fr-fill" style="display:block;height:100%;width:0;background:var(--accent);transition:width .15s"></i>
+          </div>
+          <span class="note" id="fr-prog"></span>
+        </div>
+      </div>
+
+      <div id="fr-notice"></div>
+      <div id="fr-list" class="pl-list"></div>
+
+      <div class="fr-actions" id="fr-actions">
+        <button class="btn btn-primary" id="btn-fr-install" disabled>安装选中的插件</button>
+        <button class="btn" id="btn-fr-skip">先跳过，直接开始用</button>
+        <span class="note" id="fr-sel"></span>
+      </div>
+
+      <div id="fr-done" style="display:none">
+        <div class="pl-warn" id="fr-done-text"></div>
+        <div class="fr-actions">
+          <button class="btn btn-primary" id="btn-fr-restart">重启内核使其生效</button>
+          <button class="btn" id="btn-fr-finish">以后再说</button>
+        </div>
+      </div>
+    </section>
+
     <!-- ── 集成版插件 ───────────────────────────────────────── -->
     <section class="pane" data-pane="plugins">
       <h2>集成版插件</h2>
       <p class="hint">
-        这些是**我们这一套**的插件，住在 <span class="mono" id="pl-repo">—</span>。
+        这些是<b>我们这一套</b>的插件，住在 <span class="mono" id="pl-repo">—</span>。
         勾选装上就写进 DSH 档案，<b>重启一次客户端</b>才生效。
         装进去的是别人写的代码，所以只从我们自己的仓库下，并且逐个核对 sha256。
         这里管的是<b>插件</b>；外壳自己的新版本在「更新」那一栏。
@@ -231,6 +290,13 @@
           <span class="note" id="pl-upd"></span>
         </div>
       </div>
+      <div class="row">
+        <div class="k">第一次装插件</div>
+        <div class="v">
+          <button class="btn" id="btn-pl-wizard">打开首次安装向导</button>
+          <span class="note">一屏勾选、一次装完（安装包不带插件，插件都从仓库拉）</span>
+        </div>
+      </div>
       <div class="row" id="pl-row-prog" style="display:none">
         <div class="k">进度</div>
         <div class="v" style="flex-direction:column;align-items:stretch;gap:6px">
@@ -249,7 +315,7 @@
     <section class="pane" data-pane="diag">
       <h2>诊断与修复</h2>
       <p class="hint">
-        这里和加载页底部的抽屉是**同一份清单**（都来自主进程的动作白名单）。
+        这里和加载页底部的抽屉是<b>同一份清单</b>（都来自主进程的动作白名单）。
         标了「会中断」的会先弹确认 —— 它们会打断正在生成的回答。
       </p>
       <div class="diag-grid">
