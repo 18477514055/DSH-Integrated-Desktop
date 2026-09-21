@@ -806,14 +806,197 @@ async function verifyPages(tmpDir) {
   }
 }
 
+// ── 模式六：集成版插件清单（真开设置页 / 真拉清单 / 真装一个 / 去磁盘找证据）──
+//
+// ★ 这一段最要紧的判据是最后那 6 条**磁盘证据**：
+//   界面上写"装好了"不算数 —— 必须去临时家里看到 profile 三处契约 + 插件本体。
+//   这是本项目 §5 验证纪律的硬要求：**目标行为本身**，不是代理证据。
+async function verifyPlugins(tmpDir) {
+  const PORT = 3179;   // 自己的内核端口（不与 pages 的 3178 / loading 的 3177 撞）
+  const { child } = launch("plugins", tmpDir, PORT, { seedWorkspace: true });
+  try {
+    const target = await waitForPage((t) => t.url.startsWith(`http://127.0.0.1:${PORT}/`), 120000);
+    const mainUrl = target.webSocketDebuggerUrl;
+    console.log(`  已连上官方界面: ${target.url.split("?")[0]}`);
+
+    const dshHome = path.join(tmpDir, "dsh-home");
+    const pkgFile = path.join(dshHome, "profiles", "web", "package.json");
+    check("（前置）临时家里内核已经把 profile 建出来了", fs.existsSync(pkgFile), pkgFile);
+
+    // ① 从主界面用受限通道打开外壳设置窗口 —— 与用户在把手里点「外壳设置…」同一条路
+    const opened = await cdpEval(mainUrl, `window.dshShell.openShellSettings().then(r => JSON.stringify(r))`);
+    check("主界面能打开外壳设置窗口", /"ok":true/.test(opened), String(opened));
+
+    let setT = null;
+    const dl = Date.now() + 20000;
+    while (Date.now() < dl) {
+      try {
+        const ts = await listTargets();
+        setT = ts.find((t) => t.type === "page" && /settings\.html/.test(t.url || ""));
+        if (setT) break;
+      } catch { /* CDP 抖动 */ }
+      await sleep(500);
+    }
+    check("外壳设置窗口真的出现了", !!setT, setT ? "settings.html" : "没等到");
+    if (!setT) return;
+
+    const ws = setT.webSocketDebuggerUrl;
+    await sleep(1500);
+
+    // ② 真点导航切到「集成版插件」
+    const nav = await cdpEval(ws, `(() => {
+      const b = document.querySelector('nav button[data-pane="plugins"]');
+      if (!b) return 'no-nav';
+      b.click();
+      const p = document.querySelector('.pane[data-pane="plugins"]');
+      return JSON.stringify({
+        paneOn: p ? p.classList.contains('on') : false,
+        display: p ? getComputedStyle(p).display : null,
+      });
+    })()`, 20000);
+    const nv = JSON.parse(nav);
+    check("设置页里有「集成版插件」这一栏，点了真的显示",
+      nv.paneOn && nv.display !== "none", nav);
+
+    const probe = `(() => {
+      const cards = Array.from(document.querySelectorAll('#pl-list .pl-card'));
+      return JSON.stringify({
+        repo: (document.getElementById('pl-repo')||{}).textContent||'',
+        count: (document.getElementById('pl-count')||{}).textContent||'',
+        status: (document.getElementById('pl-status')||{}).textContent||'',
+        upd: (document.getElementById('pl-upd')||{}).textContent||'',
+        cards: cards.map(c => ({
+          name: (c.querySelector('.nm')||{}).textContent||'',
+          tags: Array.from(c.querySelectorAll('.tag')).map(t=>t.textContent),
+          desc: (c.querySelector('.ds')||{}).textContent||'',
+          meta: (c.querySelector('.meta')||{}).textContent||'',
+          ops: Array.from(c.querySelectorAll('button[data-pl-act]')).map(b=>b.dataset.plAct),
+        })),
+      });
+    })()`;
+
+    // ③ 等清单渲染出来（要联网；连不上会落到缓存或明确失败）
+    let st = null;
+    const cd = Date.now() + 45000;
+    while (Date.now() < cd) {
+      st = JSON.parse(await cdpEval(ws, probe, 20000));
+      if (st.cards.length) break;
+      await sleep(1000);
+    }
+    console.log(`  清单状态: ${st.status}`);
+    console.log(`  计数: ${st.count}   可更新: ${st.upd || "(无)"}   卡片数: ${st.cards.length}`);
+
+    check("清单真的渲染出了卡片", st.cards.length > 0, `cards=${st.cards.length} status=${st.status}`);
+    check("仓库名回填了（主进程把 repo 报回来了）", /DSH-Plugin-Hub/.test(st.repo), st.repo);
+    check("计数文案是「已装 N / 清单 M」", /已装 \d+ \/ 清单 \d+/.test(st.count), st.count);
+    check("状态行给了结论（清单更新于… / 显示的是缓存…）",
+      /清单更新于|显示的是缓存|取清单失败/.test(st.status), st.status);
+    check("★ 每张卡都有名字、说明位与操作按钮",
+      st.cards.every((c) => c.name && c.desc && c.ops.length >= 1),
+      JSON.stringify(st.cards.slice(0, 2)));
+    check("★ 每张卡都写了 sha256（或明说没给）",
+      st.cards.every((c) => /sha256/.test(c.meta)),
+      JSON.stringify(st.cards.map((c) => c.meta.slice(0, 70))));
+    check("每张卡都标了「来自 <owner/repo>」（插件可以住在别的仓库）",
+      st.cards.every((c) => /来自 \S+\/\S+/.test(c.meta)),
+      JSON.stringify(st.cards.map((c) => c.meta.slice(0, 70))));
+
+    // ④ 真点「检查插件更新」—— DOM 里有按钮不等于点了有用
+    await cdpEval(ws, `(() => { document.getElementById('btn-pl-check').click(); return 'ok'; })()`, 20000);
+    let after = st.status;
+    const ud = Date.now() + 40000;
+    while (Date.now() < ud) {
+      await sleep(1000);
+      after = await cdpEval(ws, `(document.getElementById('pl-status')||{}).textContent||''`, 20000);
+      if (after && !/正在查|正在读取/.test(after)) break;
+    }
+    console.log(`  检查插件更新结果: ${after}`);
+    check("点「检查插件更新」真拿到了结论（不是停在「正在查」）",
+      /清单更新于|显示的是缓存|取清单失败/.test(after), after);
+
+    // ⑤ ★ 真装一个：挑「可装 + 不是开发者工具」的那张卡，点它的安装按钮
+    const pick = st.cards.find((c) => c.ops.includes("install") && !c.tags.includes("开发者工具"));
+    if (!pick) {
+      console.log("  SKIP  清单里没有可装的非开发工具插件 —— 安装这一段没验到，**不算通过**");
+      return;
+    }
+
+    console.log(`  真装 ${pick.name} …（会下载、核对 sha256、写进临时家的 profile）`);
+    const clicked = await cdpEval(ws, `(() => {
+      const c = Array.from(document.querySelectorAll('#pl-list .pl-card'))
+        .find(x => ((x.querySelector('.nm')||{}).textContent||'') === ${JSON.stringify(pick.name)});
+      if (!c) return 'no-card';
+      const b = c.querySelector('button[data-pl-act="install"]');
+      if (!b) return 'no-btn';
+      b.click();
+      return 'clicked';
+    })()`, 20000);
+    check("点得到那张卡的「安装」按钮", clicked === "clicked", String(clicked));
+
+    let prog = "";
+    const pd = Date.now() + 120000;
+    while (Date.now() < pd) {
+      await sleep(1000);
+      prog = await cdpEval(ws, `(document.getElementById('pl-prog')||{}).textContent||''`, 20000);
+      if (/重启一次客户端才生效|失败|出错/.test(prog)) break;
+    }
+    console.log(`  安装结果文案: ${prog}`);
+    check("★ 真点「安装」后拿到了结论（不是停在下载中）",
+      /重启一次客户端才生效|失败|出错/.test(prog), prog);
+    check("★ 安装成功（文案说要重启才生效）", /重启一次客户端才生效/.test(prog), prog);
+
+    // ⑥ 去磁盘上找证据 —— **不看界面自述**
+    let pkg = null;
+    try { pkg = JSON.parse(fs.readFileSync(pkgFile, "utf8").replace(/^\uFEFF/, "")); } catch { /* 下面各条会报 */ }
+    check("① dependencies 里写了 link:<落点>",
+      !!(pkg && typeof pkg.dependencies[pick.name] === "string"
+        && pkg.dependencies[pick.name].startsWith("link:")),
+      pkg ? String(pkg.dependencies[pick.name]) : "profile 读不到");
+    check("② dsh.profile.bundles 里有它",
+      !!(pkg && pkg.dsh && pkg.dsh.profile && pkg.dsh.profile.bundles.includes(pick.name)),
+      pkg ? JSON.stringify(pkg.dsh.profile.bundles) : "");
+
+    const linkPath = path.join(dshHome, "profiles", "web", "node_modules", pick.name);
+    let real = null;
+    try { real = fs.realpathSync(linkPath); } catch { /* 下面会报 */ }
+    check("③ node_modules 里有联接", !!real, String(real));
+
+    const dest = path.join(dshHome, "plugins", pick.name);
+    check("插件本体落到了 <DSH_HOME>\\plugins\\<名字>",
+      fs.existsSync(path.join(dest, "package.json")), dest);
+    check("③ 的联接确实指向那个落点",
+      !!real && path.resolve(real).toLowerCase() === path.resolve(dest).toLowerCase(),
+      `${real} vs ${dest}`);
+
+    let through = null;
+    try { through = fs.readdirSync(path.join(linkPath, "lib")); } catch { /* 下面会报 */ }
+    check("★ 通过联接真的读得到插件文件（不是「文件在那儿」）",
+      !!(through && through.length), JSON.stringify(through));
+
+    let raw = Buffer.alloc(0);
+    try { raw = fs.readFileSync(pkgFile); } catch { /* 上面已报 */ }
+    check("profile package.json **无 BOM**（带 BOM = 整台 DSH 起不来）",
+      !(raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf),
+      [...raw.subarray(0, 3)].join(","));
+
+    // ⑦ 界面状态应该跟着变成「已装」
+    const after2 = JSON.parse(await cdpEval(ws, probe, 20000));
+    const card2 = after2.cards.find((c) => c.name === pick.name);
+    check("★ 卡片状态跟着变成「已装」",
+      !!(card2 && card2.tags.includes("已装")), card2 ? JSON.stringify(card2.tags) : "卡片不见了");
+  } finally {
+    await stopApp(child);
+  }
+}
+
 // ── 主流程 ────────────────────────────────────────────────────────
 (async () => {
   if (typeof WebSocket === "undefined") {
     console.error("这个 node 没有全局 WebSocket，无法走 CDP（需要 Node 22+）");
     process.exit(1);
   }
-  if (!["loading", "inject", "probe", "reuse", "pages"].includes(MODE)) {
-    console.error("用法: node scripts/ui-check.js <loading|inject|probe|reuse|pages>");
+  if (!["loading", "inject", "probe", "reuse", "pages", "plugins"].includes(MODE)) {
+    console.error("用法: node scripts/ui-check.js <loading|inject|probe|reuse|pages|plugins>");
     process.exit(1);
   }
 
@@ -828,7 +1011,8 @@ async function verifyPages(tmpDir) {
       : MODE === "probe" ? probeUi(tmpDir)
         : MODE === "reuse" ? verifyReuse(tmpDir)
           : MODE === "pages" ? verifyPages(tmpDir)
-            : verifyInject(tmpDir));
+            : MODE === "plugins" ? verifyPlugins(tmpDir)
+              : verifyInject(tmpDir));
   } catch (e) {
     console.error(`\n[ui-check] 无法完成检查: ${(e && e.stack) || e}`);
     failures.push("执行异常: " + ((e && e.message) || e));

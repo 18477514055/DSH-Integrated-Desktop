@@ -99,4 +99,24 @@ contextBridge.exposeInMainWorld("dshShell", {
   onUpdateProgress: (cb) => subscribe("dsh:update:progress", cb),
   /** 托盘「检查更新…」让设置页跳到某一栏：pane 名 */
   onFocusPane: (cb) => subscribe("dsh:settings:focus-pane", cb),
+
+  // ── 集成版插件（清单 src/plugin-catalog.js；装/卸 src/plugin-install.js）──
+  //
+  // ⚠️ 这一组会**往 DSH 家里装东西、并改 profile** ⇒ 主进程只放行**外壳自有页面**。
+  //    官方 UI 与两个外部站点调它会被 `assertShellSender` 拒掉。
+  // ★ 这里只暴露"包名 + 版本"：**下载地址与 sha256 传不进去** ——
+  //    主进程每次重新拉清单后自己取。否则这个通道就成了"从任意 URL 装任意代码"。
+  /** 清单 × 本机已装的全貌（含 counts / stale / warnings / skipped）。 */
+  plugins: () => ipcRenderer.invoke("dsh:plugins:list"),
+  /** 强制重新拉一次远端清单（「检查插件更新」按钮用）。 */
+  checkPlugins: () => ipcRenderer.invoke("dsh:plugins:check"),
+  /** 装或更新一个插件。返回 { ok, errors, warnings, version, needsRestart }。 */
+  installPlugin: (name, version) => ipcRenderer.invoke(
+    "dsh:plugins:install", String(name), version ? String(version) : null),
+  /** 卸一个插件（撤 profile 三处 + 删落点）。 */
+  uninstallPlugin: (name) => ipcRenderer.invoke("dsh:plugins:uninstall", String(name)),
+  /** 用系统浏览器打开插件仓库主页。 */
+  openPluginHub: () => ipcRenderer.invoke("dsh:plugins:open-page"),
+  /** 插件下载/安装进度：{ kind:"start"|"progress"|"end", name, version?, got?, total?, percent?, ok? } */
+  onPluginProgress: (cb) => subscribe("dsh:plugins:progress", cb),
 });

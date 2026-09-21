@@ -49,6 +49,25 @@
   label.sw { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
   label.sw input { width: 15px; height: 15px; accent-color: var(--accent); }
 
+  /* ── 集成版插件清单 ── */
+  .pl-list { margin-top: 6px; display: flex; flex-direction: column; gap: 10px; }
+  .pl-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: #fff; }
+  .pl-card .hd { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .pl-card .nm { font-weight: 600; font-family: var(--mono); font-size: 13px; }
+  .pl-card .tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--line-soft); color: var(--fg-dim); }
+  .pl-card .tag.dev { background: #fff4e0; color: #9a6212; }
+  .pl-card .tag.on { background: var(--accent-soft); color: var(--accent); }
+  .pl-card .tag.up { background: #e7f5ea; color: #1d7a3a; }
+  .pl-card .tag.bad { background: #fdeaea; color: #b3261e; }
+  .pl-card .ds { color: var(--fg-dim); font-size: 12.5px; margin: 6px 0 0; }
+  .pl-card .meta { color: var(--fg-faint); font-size: 11.5px; margin: 6px 0 0; font-family: var(--mono); word-break: break-all; }
+  .pl-card .ops { margin-top: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .pl-empty { color: var(--fg-faint); font-size: 12.5px; padding: 10px 0; }
+  .pl-warn {
+    color: #9a6212; background: #fff8ec; border: 1px solid #f0dcb8;
+    border-radius: 8px; padding: 8px 10px; font-size: 12px; margin: 10px 0;
+  }
+
   .diag-grid { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 14px; align-items: start; }
   @media (max-width: 860px) { .diag-grid { grid-template-columns: 1fr; } }
   .diag-grid .output { max-height: 56vh; position: sticky; top: 0; }
@@ -81,6 +100,7 @@
   <nav>
     <button data-pane="general" class="on">常规</button>
     <button data-pane="update">更新</button>
+    <button data-pane="plugins">集成版插件</button>
     <button data-pane="diag">诊断与修复</button>
     <button data-pane="about">关于</button>
   </nav>
@@ -169,6 +189,45 @@
           </details>
         </div>
       </div>
+    </section>
+
+    <!-- ── 集成版插件 ───────────────────────────────────────── -->
+    <section class="pane" data-pane="plugins">
+      <h2>集成版插件</h2>
+      <p class="hint">
+        这些是**我们这一套**的插件，住在 <span class="mono" id="pl-repo">—</span>。
+        勾选装上就写进 DSH 档案，<b>重启一次客户端</b>才生效。
+        装进去的是别人写的代码，所以只从我们自己的仓库下，并且逐个核对 sha256。
+        这里管的是<b>插件</b>；外壳自己的新版本在「更新」那一栏。
+      </p>
+
+      <div class="row">
+        <div class="k">本机已装</div>
+        <div class="v">
+          <span class="mono" id="pl-count">—</span>
+          <span class="note" id="pl-status">还没检查</span>
+        </div>
+      </div>
+      <div class="row">
+        <div class="k">插件清单</div>
+        <div class="v">
+          <button class="btn" id="btn-pl-check">检查插件更新</button>
+          <button class="btn" id="btn-pl-hub">打开插件仓库</button>
+          <span class="note" id="pl-upd"></span>
+        </div>
+      </div>
+      <div class="row" id="pl-row-prog" style="display:none">
+        <div class="k">进度</div>
+        <div class="v" style="flex-direction:column;align-items:stretch;gap:6px">
+          <div style="height:8px;background:var(--line-soft);border-radius:6px;overflow:hidden">
+            <i id="pl-fill" style="display:block;height:100%;width:0;background:var(--accent);transition:width .15s"></i>
+          </div>
+          <span class="note" id="pl-prog"></span>
+        </div>
+      </div>
+
+      <div id="pl-notice"></div>
+      <div id="pl-list" class="pl-list"></div>
     </section>
 
     <!-- ── 诊断与修复 ───────────────────────────────────────── -->

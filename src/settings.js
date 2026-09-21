@@ -179,8 +179,211 @@
         if (!pane) return;
         switchPane(String(pane));
         if (String(pane) === "update") doCheck();
+        if (String(pane) === "plugins") loadPlugins(false);
       });
     }
+  }
+
+  // ── 集成版插件（清单在主进程 src/plugin-catalog.js；装/卸在 src/plugin-install.js）──
+  //
+  // 用户原话：「想用的时候打开清单，然后点击检查更新，就可以查到我最新推出来的集成版插件。」
+  //
+  // ★ 页面**不拼 URL、不算哈希**：只提交包名。下载地址与 sha256 由主进程
+  //   每次重新拉清单后自己取（理由见 preload.js 那一节）。
+  // ★ 清单是**远端数据** ⇒ 所有插进 DOM 的文本一律过 ShellUI.esc，不裸拼 innerHTML。
+  let pluginBusy = false;
+
+  const plStatus = (t) => { $("pl-status").textContent = t; };
+  const plProg = (t) => { $("pl-prog").textContent = t; };
+
+  function fmtTime(iso) {
+    if (!iso) return "未知时间";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return String(iso);
+    const p = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  function stateTag(r) {
+    switch (r.state) {
+      case "installed": return '<span class="tag on">已装</span>';
+      case "update": return '<span class="tag up">可更新</span>';
+      case "disabled": return '<span class="tag up">没启用</span>';
+      case "broken": return '<span class="tag bad">落点丢了</span>';
+      default: return "";
+    }
+  }
+
+  function cardHtml(r) {
+    const e = ShellUI.esc;
+    const latest = r.latest || {};
+    const desc = latest.description
+      ? e(latest.description)
+      : '<i style="color:var(--fg-faint)">（发布者未填说明）</i>';
+
+    const tags = [stateTag(r)];
+    if (r.devOnly) tags.push('<span class="tag dev">开发者工具</span>');
+    if (!r.compatible) tags.push('<span class="tag bad">不适用于本外壳</span>');
+
+    const meta = [];
+    meta.push(`线上 v${latest.version}`);
+    if (r.local) meta.push(`本机 v${r.local.version}`);
+    if (latest.repo) meta.push(`来自 ${latest.repo}`);
+    if (latest.bytes) meta.push(fmtBytes(latest.bytes));
+    if (latest.sha256) meta.push(`sha256 ${latest.sha256.slice(0, 12)}…`);
+    else meta.push("这条没有 sha256，装上不校验内容");
+
+    const ops = [];
+    if (r.canInstall) {
+      ops.push(`<button class="btn" data-pl-act="install" data-pl-name="${e(r.name)}">安装</button>`);
+    }
+    if (r.canUpdate) {
+      ops.push(`<button class="btn" data-pl-act="install" data-pl-name="${e(r.name)}">更新到 v${e(r.remoteVersion)}</button>`);
+    }
+    if (r.canUninstall) {
+      ops.push(`<button class="btn" data-pl-act="uninstall" data-pl-name="${e(r.name)}">卸载</button>`);
+    }
+    if (!ops.length) ops.push('<span class="note">已是最新</span>');
+
+    return `<div class="pl-card">
+      <div class="hd"><span class="nm">${e(r.name)}</span>${tags.join("")}</div>
+      <p class="ds">${desc}</p>
+      <div class="meta">${meta.map(e).join(" · ")}</div>
+      <div class="ops">${ops.join("")}</div>
+    </div>`;
+  }
+
+  function renderPlugins(st) {
+    const list = $("pl-list");
+    if (!st || !st.ok) {
+      plStatus(`取清单失败：${(st && st.error) || "未知原因"}`);
+      plProg("");
+      list.innerHTML = '<div class="pl-empty">拿不到插件清单（连不上插件仓库，本机也没有缓存）。</div>';
+      return;
+    }
+
+    const c = st.counts || {};
+    $("pl-repo").textContent = st.repo || "—";
+    $("pl-count").textContent = `已装 ${c.installed || 0} / 清单 ${c.total || 0}`;
+    $("pl-upd").textContent = [
+      c.updatable ? `${c.updatable} 个可更新` : "",
+      c.broken ? `${c.broken} 个落点丢了` : "",
+    ].filter(Boolean).join(" · ");
+    plStatus(st.stale
+      ? `这次没连上插件仓库，显示的是缓存（${fmtTime(st.fetchedAt)}）`
+      : `清单更新于 ${fmtTime(st.fetchedAt)}`);
+
+    // 读不懂的东西**明说**，不假装没发生
+    const warn = [];
+    if (!st.knownSchema) warn.push(`清单格式是 ${st.schema}，本外壳认识的是更早的一版 —— 可能读不全。`);
+    for (const w of (st.warnings || []).slice(0, 3)) warn.push(w);
+    for (const s of (st.skipped || []).slice(0, 3)) warn.push(`跳过一条：${s}`);
+    $("pl-notice").innerHTML = warn.length
+      ? `<div class="pl-warn">${warn.map(ShellUI.esc).join("<br>")}</div>`
+      : "";
+
+    if (!st.rows || !st.rows.length) {
+      list.innerHTML = '<div class="pl-empty">清单是空的 —— 仓库里还没有插件。</div>';
+      return;
+    }
+    list.innerHTML = st.rows.map(cardHtml).join("");
+  }
+
+  async function loadPlugins(force) {
+    if (pluginBusy) return;
+    pluginBusy = true;
+    $("btn-pl-check").disabled = true;
+    plStatus(force ? "正在查插件仓库…" : "正在读取…");
+    try {
+      const st = force ? await S.checkPlugins() : await S.plugins();
+      renderPlugins(st);
+    } catch (e) {
+      plStatus(`出错：${(e && e.message) || e}`);
+    } finally {
+      pluginBusy = false;
+      $("btn-pl-check").disabled = false;
+    }
+  }
+
+  async function doInstallPlugin(name, btn) {
+    if (pluginBusy) return;
+    pluginBusy = true;
+    btn.disabled = true;
+    $("pl-row-prog").style.display = "";
+    $("pl-fill").style.width = "0%";
+    plProg(`正在准备 ${name}…`);
+    let ok = false;
+    try {
+      const r = await S.installPlugin(name, null);
+      if (!r || !r.ok) {
+        plProg(`失败：${(r && r.errors && r.errors.join("；")) || "未知原因"}`);
+        return;
+      }
+      $("pl-fill").style.width = "100%";
+      plProg(`已装 ${name}${r.version ? " v" + r.version : ""} —— 重启一次客户端才生效`);
+      for (const w of (r.warnings || [])) output.append("sys", `[插件] ${w}\n`);
+      ok = true;
+    } catch (e) {
+      plProg(`出错：${(e && e.message) || e}`);
+    } finally {
+      pluginBusy = false;
+      btn.disabled = false;
+    }
+    // ★ 刷新必须放在 finally **之后**：loadPlugins 开头就有 `if (pluginBusy) return`，
+    //   放在 try 里会被自己刚设上的忙标志挡掉 —— 表现是"装成功了但卡片还是未装"，
+    //   用户会以为失败然后再点一次。（`ui-check plugins` 实测抓到的真 bug）
+    if (ok) await loadPlugins(false);
+  }
+
+  async function doUninstallPlugin(name, btn) {
+    if (pluginBusy) return;
+    pluginBusy = true;
+    btn.disabled = true;
+    $("pl-row-prog").style.display = "";
+    plProg(`正在卸载 ${name}…`);
+    let ok = false;
+    try {
+      const r = await S.uninstallPlugin(name);
+      ok = !!(r && r.ok);
+      plProg(ok
+        ? `已卸载 ${name} —— 重启一次客户端才生效`
+        : `失败：${(r && r.errors && r.errors.join("；")) || "未知原因"}`);
+    } catch (e) {
+      plProg(`出错：${(e && e.message) || e}`);
+    } finally {
+      pluginBusy = false;
+      btn.disabled = false;
+    }
+    if (ok) await loadPlugins(false);   // 同上：解锁之后再刷新
+  }
+
+  function wirePlugins() {
+    $("btn-pl-check").addEventListener("click", () => loadPlugins(true));
+    $("btn-pl-hub").addEventListener("click", () => S.openPluginHub().catch(() => { }));
+
+    // 事件委托：卡片是 innerHTML 画出来的，逐张挂监听会在重画后丢掉
+    $("pl-list").addEventListener("click", (ev) => {
+      const btn = ev.target && ev.target.closest ? ev.target.closest("button[data-pl-act]") : null;
+      if (!btn) return;
+      const act = btn.dataset.plAct;
+      const name = btn.dataset.plName;
+      if (act === "install") doInstallPlugin(name, btn);
+      else if (act === "uninstall") doUninstallPlugin(name, btn);
+    });
+
+    S.onPluginProgress((p) => {
+      if (!p) return;
+      if (p.kind === "start") {
+        $("pl-row-prog").style.display = "";
+        plProg(`正在下载 ${p.name}${p.version ? " v" + p.version : ""}…`);
+      } else if (p.kind === "progress") {
+        const pct = Math.max(0, Math.min(100, p.percent || 0));
+        $("pl-fill").style.width = `${pct}%`;
+        plProg(p.total ? `${fmtBytes(p.got)} / ${fmtBytes(p.total)}（${pct}%）` : fmtBytes(p.got));
+      } else if (p.kind === "end" && !p.ok) {
+        plProg(`${p.name} 安装失败`);
+      }
+    });
   }
 
   // ── 关于 ──────────────────────────────────────────────────────────
@@ -232,6 +435,8 @@
 
     wire();
     wireUpdate();
+    wirePlugins();
+    loadPlugins(false);
 
     await ShellUI.mountActions($("actions"), { output, verdictEl: $("verdict") });
   }

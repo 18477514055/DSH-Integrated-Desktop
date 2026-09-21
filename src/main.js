@@ -45,6 +45,8 @@ const diagnostics = require("./diagnostics");
 const P = require("./plugins");
 const SITES = require("./sites");
 const U = require("./update");
+const PC = require("./plugin-catalog");
+const PI = require("./plugin-install");
 const WHALE = require("./whale-path.json");
 
 // ── 最早期的错误捕获 ──────────────────────────────────────────────
@@ -1163,6 +1165,55 @@ function updateEmit(payload) {
   }
 }
 
+/** 插件下载/安装进度只推给外壳自有窗口（设置页 / 首启向导）。 */
+function pluginsEmit(payload) {
+  for (const w of [mainWindow, settingsWindow]) {
+    if (w && !w.isDestroyed()) {
+      try { w.webContents.send("dsh:plugins:progress", payload); } catch { /* 窗口正在关 */ }
+    }
+  }
+}
+
+/**
+ * 「集成版插件」现在的全貌：**远端清单 × 本机已装**。
+ *
+ * ★ 这一份是**主进程算出来的唯一真相**，界面只负责画。
+ *   渲染进程不许自己拼"要装哪个 URL、哈希是多少" —— 那些只从清单里取。
+ */
+async function pluginState({ force = false } = {}) {
+  const dshHome = getDshHome();
+  const profile = (settings && settings.profile) || "web";
+
+  const inst = PI.listInstalled({ dshHome, profile });
+  const cat = await PC.fetchIndex({ force });
+  const rows = cat.ok ? PC.mergeInstalled(cat.groups, inst.plugins) : [];
+
+  return {
+    ok: cat.ok,
+    error: cat.error || "",
+    stale: !!cat.stale,
+    source: cat.source || "",
+    fetchedAt: cat.fetchedAt || "",
+    schema: cat.index ? cat.index.schema : "",
+    knownSchema: cat.index ? cat.index.knownSchema : true,
+    updatedAt: cat.index ? cat.index.updatedAt : "",
+    warnings: cat.index ? cat.index.warnings : [],
+    skipped: cat.index ? cat.index.skipped : [],
+    rows,
+    installed: inst.plugins,
+    installErrors: inst.errors,
+    repo: PC.HUB_REPO,
+    dshHome,
+    profile,
+    counts: {
+      total: rows.length,
+      installed: rows.filter((r) => r.state === "installed" || r.state === "update" || r.state === "disabled").length,
+      updatable: rows.filter((r) => r.state === "update").length,
+      broken: rows.filter((r) => r.state === "broken").length,
+    },
+  };
+}
+
 function communityExe() {
   const r = diagnostics.findCommunityExe();
   return r.ok ? r.path : null;
@@ -1353,6 +1404,94 @@ function registerIpc() {
   ipcMain.handle("dsh:update:open-page", (e) => {
     assertShellSender(e);
     return U.openReleasesPage();
+  });
+
+  // ── 集成版插件（清单 src/plugin-catalog.js；装/卸 src/plugin-install.js）──
+  //
+  // ⚠️ 这一组**会往用户家里装东西、还会改 profile** ⇒ 只放行**外壳自有页面**
+  //    （设置页、首启向导）。官方 UI 与两个外部站点调它一律被 `assertShellSender` 拒掉。
+  //
+  // ★ 安装时**每次都重新拉一次清单再挑版本**，不接受渲染进程递过来的下载地址或哈希。
+  //   否则"装插件"就变成了"从任意 URL 装任意代码"的通道 —— 那正是这套东西最危险的地方。
+  ipcMain.handle("dsh:plugins:list", async (e) => {
+    assertShellSender(e);
+    return pluginState({ force: false });
+  });
+
+  ipcMain.handle("dsh:plugins:check", async (e) => {
+    assertShellSender(e);
+    log("检查插件更新…");
+    const st = await pluginState({ force: true });
+    log(`插件清单：ok=${st.ok} 条目=${st.counts.total} 可更新=${st.counts.updatable} ${st.error || ""}`);
+    return st;
+  });
+
+  ipcMain.handle("dsh:plugins:install", async (e, name, version) => {
+    assertShellSender(e);
+    const want = String(name || "").trim();
+    if (!want) return { ok: false, errors: ["没给插件名"] };
+
+    const st = await pluginState({ force: true });
+    if (!st.ok) return { ok: false, errors: [st.error || "取插件清单失败"] };
+    const row = st.rows.find((r) => r.name === want);
+    if (!row) return { ok: false, errors: [`清单里没有 ${want}`] };
+    const entry = version
+      ? row.versions.find((v) => v.version === String(version))
+      : row.latest;
+    if (!entry) return { ok: false, errors: [`清单里没有 ${want}@${version}`] };
+
+    log(`安装插件 ${entry.name}@${entry.version}（来自 ${entry.repo}）`);
+    pluginsEmit({ kind: "start", name: entry.name, version: entry.version });
+
+    const dl = await PC.downloadArchive(entry, (p) => pluginsEmit({ kind: "progress", name: entry.name, ...p }));
+    if (!dl.ok) {
+      pluginsEmit({ kind: "end", name: entry.name, ok: false });
+      log(`下载插件失败：${dl.error}`);
+      return { ok: false, errors: [dl.error] };
+    }
+
+    let r;
+    try {
+      r = PI.installFromArchive({
+        dshHome: st.dshHome,
+        profile: st.profile,
+        tgz: dl.path,
+        // 索引给了哈希就一定要对得上；没给则 installFromArchive 会走"未校验"的降级路径并留警告
+        expectedSha256: entry.sha256 || undefined,
+        name: entry.name,
+        log: (m) => log(`[插件] ${m}`),
+      });
+    } catch (err) {
+      r = { ok: false, errors: [`安装出错：${(err && err.message) || err}`], warnings: [], changed: [] };
+    } finally {
+      // 下载的那个 tgz 装完就没用了：插件本体已经拷进 <DSH_HOME>\plugins\<名字>，
+      // profile 里写的是 link 指过去 —— **不留悬空引用**（与上传器的 file: 方案不同）。
+      PC.cleanupArchive(dl.path);
+    }
+
+    pluginsEmit({ kind: "end", name: entry.name, ok: !!r.ok });
+    log(`安装插件 ${entry.name}@${entry.version}：ok=${r.ok} changed=${JSON.stringify(r.changed || [])} ${(r.errors || []).join("；")}`);
+    return { ...r, version: entry.version, needsRestart: !!r.ok };
+  });
+
+  ipcMain.handle("dsh:plugins:uninstall", async (e, name) => {
+    assertShellSender(e);
+    const want = String(name || "").trim();
+    if (!want) return { ok: false, errors: ["没给插件名"] };
+    const st = await pluginState({ force: false });
+    const r = PI.uninstall({
+      dshHome: st.dshHome,
+      profile: st.profile,
+      name: want,
+      log: (m) => log(`[插件] ${m}`),
+    });
+    log(`卸载插件 ${want}：ok=${r.ok} ${(r.errors || []).join("；")}`);
+    return { ...r, needsRestart: !!r.ok };
+  });
+
+  ipcMain.handle("dsh:plugins:open-page", (e) => {
+    assertShellSender(e);
+    return shell.openExternal(`https://github.com/${PC.HUB_REPO}`);
   });
 }
 
