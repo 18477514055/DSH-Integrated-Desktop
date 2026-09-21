@@ -29,7 +29,10 @@ const path = require("node:path");
 const { createRequire } = require("node:module");
 
 const ROOT = path.join(__dirname, "..");
-const QR_PATH = path.join(ROOT, "plugin", "dsh-mobile-remote", "lib", "qr.cjs");
+// ★ 2026-09-21 插件包内分层（desktop/ = 电脑侧，phone/ = 手机侧）后，qr.cjs 归入 desktop/。
+//   下面这条路径走的是 ② 里的**联接**（plugin\dsh-mobile-remote → ③\3.dsh-mobile-remote），
+//   联接会兜住，所以 ② 这边不用关心本体在哪个工作区。
+const QR_PATH = path.join(ROOT, "plugin", "dsh-mobile-remote", "desktop", "qr.cjs");
 // 解码器是**另一份独立实现**（Apache-2.0），只用于验证，不随插件发布。
 // 放在 scripts/vendor/ 而不是临时目录：验证脚本必须能重复跑，不能依赖一个会被删掉的目录。
 const DECODER = path.join(ROOT, "scripts", "vendor", "jsqr.cjs");

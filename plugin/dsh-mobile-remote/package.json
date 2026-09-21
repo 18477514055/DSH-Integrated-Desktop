@@ -1,13 +1,13 @@
 {
   "name": "dsh-mobile-remote",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "手机遥控：电脑端显示二维码，手机扫码后经局域网远程查看会话、看流式输出、发消息、中断。 · Scan a QR code on the desktop and drive this DSH from your phone over LAN.",
   "type": "module",
-  "main": "lib/index.js",
+  "main": "desktop/index.js",
   "exports": {
-    ".": "./lib/index.js",
-    "./client": "./lib/client.js",
+    ".": "./desktop/index.js",
+    "./client": "./desktop/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
@@ -28,6 +28,12 @@
       ]
     }
   },
+  "files": [
+    "desktop/**",
+    "phone/**",
+    "cordis.patch.yml",
+    "README.md"
+  ],
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1"
   }

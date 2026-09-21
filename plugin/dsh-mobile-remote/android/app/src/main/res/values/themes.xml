@@ -3,12 +3,35 @@
   主题：刻意只用**平台自带**的 DeviceDefault。
   为什么不用 Material/AppCompat：那会引入第三方依赖，破坏本工程
   "任何装了 SDK 的机器都能直接编"的前提。
-  深色是为了和手机端页面（#0f1115）接得上，避免白闪。
+
+  ★ 2026-09-20 改成**浅色**：手机端页面已改为白底（用户要求），
+    壳的窗口背景必须跟着白，否则启动瞬间会闪一下黑。
+    状态栏/导航栏也用白色，并让系统按浅色背景画图标
+    （windowLightStatusBar=true ⇒ 深色图标，白底上才看得见）。
 -->
 <resources>
-    <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
-        <item name="android:windowBackground">#0f1115</item>
-        <item name="android:statusBarColor">#0f1115</item>
-        <item name="android:navigationBarColor">#0f1115</item>
+    <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+        <item name="android:windowBackground">#ffffff</item>
+        <item name="android:statusBarColor">#ffffff</item>
+        <item name="android:navigationBarColor">#ffffff</item>
+        <item name="android:windowLightStatusBar">true</item>
+
+        <!--
+          ★ 键盘弹出时不要遮住输入框（2026-09-21 用户报的问题）。
+
+          ① windowSoftInputMode：Activity 清单里也写了 adjustResize。
+             ⚠️ **但 targetSdk ≥ 35（Android 15）时系统会忽略它** ——
+             那是平台强制的 edge-to-edge 行为，不是配置写错。
+             所以真正的兜底在 MainActivity.installKeyboardInsetHandler()（原生 inset），
+             以及网页里的 visualViewport 逻辑（web/app.js 的 syncViewport）。三处一起才够。
+
+          ② windowLightNavigationBar：导航栏也用深色图标，白底上才看得见。
+          ③ windowNoTitle / windowActionBar：NoActionBar 父主题已保证，这里显式写一遍，
+             免得将来换父主题时冒出标题栏把高度吃掉一截。
+        -->
+        <item name="android:windowSoftInputMode">adjustResize</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
     </style>
 </resources>

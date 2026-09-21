@@ -55,12 +55,59 @@ public class MainActivity extends Activity {
     private ValueCallback<Uri[]> fileCallback;
     private static final int REQ_FILE = 1001;
 
+    /**
+     * 键盘遮挡的兜底（配上网页里的 visualViewport 逻辑，两侧一起才治得住）。
+     *
+     * ═══════════════════════════════════════════════════════════════════
+     * 为什么 Manifest 里写了 adjustResize 还不够（真因，2026-09-21 查证）
+     * ═══════════════════════════════════════════════════════════════════
+     * 用户报："手机上点击输入框弹出键盘之后，键盘会把那个输入框挡住，整个页面也会被挡住一半。"
+     *
+     * 本 App 的 targetSdk 是 **37**。而 **Android 15（API 35）起强制 edge-to-edge**：
+     * `windowSoftInputMode="adjustResize"` 对 targetSdk ≥ 35 的应用**不再生效** ——
+     * 系统不再因为键盘而缩小窗口，键盘是**盖**上来的。窗口高度不变 ⇒
+     * 网页里 `100dvh` 量到的仍是"没有键盘"的高度 ⇒ 底部输入框正好落在键盘底下。
+     *
+     * 所以两侧都要做，缺一不可：
+     *   · 网页侧：跟 visualViewport 写 `--app-h`（见 web/app.js 的 syncViewport）；
+     *   · 原生侧：把**键盘让出的高度**做成 root 的底部 padding ——
+     *     这一层在有些 ROM 上比网页侧更可靠（能拿到系统给的真实 inset，
+     *     不必依赖 WebView 是否正确实现 visualViewport）。
+     *
+     * ⚠️ 本工程**零第三方依赖**（没有 androidx），所以不能用 WindowInsetsCompat，
+     *    直接用 API 20+ 就有的 `View.OnApplyWindowInsetsListener`。
+     *    `Type.ime()` 需要 API 30+；更低版本拿不到键盘高度就只避让导航栏（无害）。
+     */
+    @SuppressWarnings("deprecation")
+    private void installKeyboardInsetHandler() {
+        root.setOnApplyWindowInsetsListener((v, insets) -> {
+            int bottom;
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                // ① 键盘（IME）高度：真正要躲开的那一块
+                android.graphics.Insets ime = insets.getInsets(android.view.WindowInsets.Type.ime());
+                // ② 系统手势条 / 导航栏：键盘没弹出时也要避让
+                android.graphics.Insets sys = insets.getInsets(android.view.WindowInsets.Type.systemBars());
+                bottom = Math.max(ime.bottom, sys.bottom);
+            } else {
+                bottom = insets.getSystemWindowInsetBottom();
+            }
+            // 把底部让出来 ⇒ WebView 的可用高度随之变小，输入框被顶到键盘之上
+            if (v.getPaddingBottom() != bottom) {
+                v.setPadding(v.getPaddingLeft(), v.getPaddingTop(), v.getPaddingRight(), bottom);
+            }
+            return insets;
+        });
+        root.requestApplyInsets();
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
         root = new FrameLayout(this);
         setContentView(root);
+        // ★ 键盘让位（Android 15 起 adjustResize 失效，见 installKeyboardInsetHandler 的注释）
+        installKeyboardInsetHandler();
 
         // 若被 dshmr:// 唤起，直接用那个地址；否则用上次存的
         String target = urlFromIntent(getIntent());

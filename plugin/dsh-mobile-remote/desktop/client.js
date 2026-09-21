@@ -93,6 +93,13 @@ window.__ModuleLoader__.load({
   padding:9px 14px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,rgba(255,255,255,.05));
   border:1px solid var(--dsw-alias-border-l2,#3a3f4b)}
 .mmr-line{font-size:12.5px;opacity:.72;text-align:center;word-break:break-all;line-height:1.6}
+/* 备选地址：首选连不上时的落点（见 Panel 里的注释） */
+.mmr-alts{width:100%;background:var(--dsw-alias-bg-layer-2,rgba(255,255,255,.05));
+  border:1px solid var(--dsw-alias-border-l2,#3a3f4b);border-radius:10px;padding:9px 11px;box-sizing:border-box}
+.mmr-alts-title{font-size:12px;opacity:.75;margin-bottom:6px}
+.mmr-alt{display:flex;align-items:baseline;gap:8px;padding:3px 0;font-size:12.5px}
+.mmr-alt-ip{font:600 13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
+.mmr-alt-if{opacity:.6;font-size:11.5px}
 .mmr-timer{font-size:12.5px;opacity:.72}
 .mmr-actions{display:flex;gap:8px;width:100%;flex-wrap:wrap}
 .mmr-btn{flex:1;min-width:104px;padding:9px 12px;border-radius:9px;cursor:pointer;font-size:13.5px;
@@ -199,6 +206,27 @@ window.__ModuleLoader__.load({
                     ? '手机连同一个 Wi-Fi，扫码或访问 ' + state.ip + ':' + state.port
                     : '未找到局域网地址：确认电脑已连上 Wi-Fi / 网线')
                 : ''),
+
+            // ── 备选地址：首选连不上时换一个 ──
+            //
+            // 为什么需要它（用户 2026-09-21 报的问题，已实测复现）：
+            // 「电脑连手机热点反而无法扫描连接上，两个连同一个 WiFi 反而能连上。」
+            // 真因有两个，都会让**首选地址**不可达：
+            //   ① 热点一开，Windows 的 Wi-Fi Direct 虚拟网卡会拿到 192.168.137.1，
+            //      它与 WLAN 的真实地址**同属私网** ⇒ 旧排序平局、听天由命
+            //      （同一台机器两次启动可能给出不同地址；实测两种枚举顺序会选出不同结果）；
+            //   ② Clash / Meta 之类的 TUN 虚拟网卡会抢默认路由。
+            // 现在 lanAddresses() 已排除虚拟网卡、把 192.168.137.* 压到最后，
+            // 但"哪个地址手机真能连上"终究只有试过才知道 ⇒ 把备选直接摆出来。
+            state && state.alternates && state.alternates.length
+              ? h('div', { className: 'mmr-alts' },
+                  h('div', { className: 'mmr-alts-title' }, '连不上？换下面这个地址再扫'),
+                  ...state.alternates.map((a) => h('div', { className: 'mmr-alt' },
+                    h('span', { className: 'mmr-alt-ip' }, a.ip),
+                    h('span', { className: 'mmr-alt-if' }, a.ifName || ''),
+                  )),
+                )
+              : null,
 
             state ? h('div', { className: 'mmr-timer' },
               left > 0 ? '配对码 ' + Math.ceil(left / 1000) + ' 秒后自动更换' : '正在更换…') : null,

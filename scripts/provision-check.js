@@ -121,7 +121,12 @@ try {
   for (const p of srcPlugins) {
     const dest = path.join(home, "plugins", p.name);
     ok(fs.existsSync(path.join(dest, "package.json")), `[${p.name}] 副本有 package.json`);
-    ok(fs.existsSync(path.join(dest, "lib", "client.js")), `[${p.name}] 副本有 lib/client.js`);
+    // ★ 2026-09-21 插件包内分层（desktop/ 电脑侧 / phone/ 手机侧）后，客户端半边
+    //   在 desktop/client.js。不再写死 lib/ —— 那会在下一次整理时又把这把尺子弄过时。
+    //   判据改为"按 package.json 的 exports["./client"] 解析，解析出的文件必须存在"。
+    const cRel = String((p.pkg && p.pkg.exports && p.pkg.exports["./client"]) || "").replace(/^\.\//, "");
+    ok(!!cRel && fs.existsSync(path.join(dest, cRel)),
+      `[${p.name}] 副本有客户端半边（exports["./client"] = ${cRel || "(未声明)"}）`);
     ok(P.fingerprint(dest) === P.fingerprint(p.dir), `[${p.name}] 副本与源**逐字节同指纹**`);
     ok(P.fingerprint(dest) !== null, `[${p.name}] 指纹可算（非 null）`);
   }
@@ -136,11 +141,14 @@ try {
 
   const jx = junctions(home, names);
   const clientAt = (n) => {
-    try { return fs.existsSync(path.join(jx[n], "lib", "client.js")); } catch { return false; }
+    // ★ 分层后按 exports["./client"] 解析，不写死 lib/
+    const p = srcPlugins.find((x) => x.name === n);
+    const rel = p ? String(p.pkg?.exports?.["./client"] || "").replace(/^\.\//, "") : "lib/client.js";
+    try { return fs.existsSync(path.join(jx[n], rel)); } catch { return false; }
   };
   for (const n of names) {
     ok(!!jx[n], `[${n}] ③ node_modules 联接存在`);
-    ok(clientAt(n), `[${n}] ③ 联接里**真能读到** lib/client.js`);
+    ok(clientAt(n), `[${n}] ③ 联接里**真能读到**客户端半边（desktop/client.js）`);
   }
 
   ok(fs.existsSync(path.join(home, "safety", "plugin-provision-backup")), "改 package.json 前留了备份目录");
@@ -223,11 +231,41 @@ try {
   ok(!!junctions(home4, [A])[A], `[${A}] 联接被重建`);
 
   // ── ⑦ 打包形态 ──
-  console.log("\n⑦ 打包形态（srcRoot = 模拟的 <resources>/plugins）");
+  console.log("\n⑦ 打包形态（物化 → 模拟 electron-builder → 落位）");
+  //
+  // ★ 这一段以前是 `for (const p of srcPlugins) fs.cpSync(p.dir, …, {recursive:true})`，
+  //   **它对本仓库当前的形态直接崩掉**（实测 2026-09-21，node 24：53 OK / 1 FAIL）：
+  //   只要 plugin/ 下有插件是"本体在别的工作区、这里只留 Junction"，cpSync 就抛
+  //   EPERM: operation not permitted, symlink。
+  //   两个真因叠在一起，现在都验：
+  //     ① `plugin/` 是**联接** ⇒ 必须先走 materializePlugins 解引用
+  //        （这也是打包脚本 scripts/materialize-plugins.js 做的事）
+  //     ② electron-builder 的 copyDir **不解引用联接**，会把联接原样复制成
+  //        指向开发机的**死链** ⇒ 物化产物必须是真实目录，下面逐条查
+  const matRoot = path.join(root, "materialized");
+  const mat = P.materializePlugins(SRC_REPO, matRoot, P.DEFAULT_EXCLUDES);
+  ok(mat.ok && !mat.errors.length, "物化成功", mat.errors.join(" | "));
+  const linkNames = [];
+  for (const name of mat.copied) {
+    const st = fs.lstatSync(path.join(matRoot, name));
+    if (st.isSymbolicLink()) linkNames.push(name);
+  }
+  ok(!linkNames.length, "物化产物里没有联接（否则打包会带死链）", linkNames.join(","));
+  if (mat.links.length) {
+    ok(mat.copied.length === names.length,
+      `物化了 ${mat.links.length} 个联接形态的插件，数量与来源一致`, mat.copied.join(","));
+  }
+
   const resRoot = path.join(root, "resources", "plugins");
   fs.mkdirSync(resRoot, { recursive: true });
-  for (const p of srcPlugins) fs.cpSync(p.dir, path.join(resRoot, p.name), { recursive: true });
-  // 模拟 electron-builder 的 filter：_retired 不该出现在 resources/plugins 里，这里也不放
+  for (const name of mat.copied) {
+    // 物化后都是真实目录 ⇒ cpSync 不再需要 dereference，正好模拟 electron-builder
+    fs.cpSync(path.join(matRoot, name), path.join(resRoot, name), { recursive: true });
+  }
+  // 排除规则必须真的生效（构建产物里那 232 字符深的路径不许进来）
+  ok(!fs.existsSync(path.join(resRoot, "dsh-mobile-remote", "android", "build")),
+    "android/build（232 字符深路径）没进打包产物");
+
   const home2 = makeHome(path.join(root, "packaged"), { withProfile: true });
   const r5 = P.provision({ dshHome: home2, profile: "web", srcRoot: resRoot, appVersion: "0.2.2-test", log: () => {} });
   ok(r5.ok, "打包形态 provision 成功", JSON.stringify(r5.errors));

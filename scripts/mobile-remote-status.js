@@ -66,32 +66,59 @@ const NEW_METHODS = ["workspace.list", "modelCatalog", "session.titles", "sessio
     process.exit(3);
   }
 
+  /**
+   * 探一个方法在**运行中的宿主**里存不存在。
+   *
+   * ★ 判据必须是 `unknown_method`，不能是 `ok === true`（2026-09-21 修的真 bug）。
+   *   有些方法**需要参数**（`session.selectModel` 要 sessionId/provider/model，
+   *   `approval.answer` 要 id）。探针不传参数时它们必然返回
+   *     `{ ok:false, error:'rpc_failed', message:'缺少 sessionId …' }`
+   *   —— 那是「**方法在、参数不对**」，恰恰证明它**存在**。
+   *   旧写法把 `ok!==true` 一律算成"不支持"，于是把「已支持」误报成「旧版」，
+   *   进而建议用户去重启一个**根本不需要重启**的客户端。
+   *   实测（2026-09-21 12:5x）：`workspace.list` / `modelCatalog` / `session.titles`
+   *   都是 ✓，只有那两个需要参数的是 ✗ —— 而它们其实早就在了。
+   */
   const probe = async (method) => {
+    const params = method === "session.titles" ? { sessionIds: [] } : {};
     const r = await fetch(`${LAN}/api/rpc`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: "Bearer " + pr.token },
-      body: JSON.stringify({ method, params: method === "session.titles" ? { sessionIds: [] } : {} }),
+      body: JSON.stringify({ method, params }),
     });
     const j = await r.json();
-    return { ok: j.ok === true, err: j.error || "", status: r.status };
+    // unknown_method = 真的没这个方法（旧宿主）；其余错误 = 方法在、只是这次调用没成
+    const missing = j.error === "unknown_method";
+    return { ok: j.ok === true, missing, err: j.error || "", message: j.message || "", status: r.status };
   };
 
   console.log("\n  方法支持情况（新版才有的那几个是关键）：");
   const base = await probe("session.list");
-  console.log(`    ${"session.list".padEnd(20)} ${base.ok ? "✓" : "✗"}   （旧版也有，作对照）`);
+  console.log(`    ${"session.list".padEnd(20)} ${base.ok || !base.missing ? "✓" : "✗"}   （旧版也有，作对照）`);
 
   let newOk = 0;
   for (const m of NEW_METHODS) {
     const r = await probe(m);
-    if (r.ok) newOk++;
-    console.log(`    ${m.padEnd(20)} ${r.ok ? "✓" : "✗  " + r.err}`);
+    // 存在即算通过（哪怕这次调用因为参数不全而 rpc_failed）
+    if (!r.missing) newOk++;
+    const mark = r.missing ? "✗  " + (r.err || "unknown_method")
+      : (r.ok ? "✓" : "✓ 存在（本次调用: " + (r.message || r.err || "rpc_failed") + "）");
+    console.log(`    ${m.padEnd(20)} ${mark}`);
   }
 
   // ── ③ 磁盘 vs 运行中：是不是"改了但没重启" ──
   const plug = path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"),
     "DSH Integrated", "dsh-home", "profiles", "web", "node_modules", "dsh-mobile-remote");
   let diskMtime = null;
-  try { diskMtime = fs.statSync(path.join(plug, "lib", "index.js")).mtime; } catch { }
+  try {
+    // ★ 2026-09-21 插件包内分层（desktop/ 电脑侧 / phone/ 手机侧）后，
+    //   宿主半边在 desktop/index.js（不再有 lib/）。按 exports["." ] 解析才不会过时。
+    const pkg = JSON.parse(fs.readFileSync(path.join(plug, "package.json"), "utf8").replace(/^\uFEFF/, ""));
+    const entry = String(
+      (pkg.exports && pkg.exports["."]) || pkg.main || "desktop/index.js"
+    ).replace(/^\.\//, "");
+    diskMtime = fs.statSync(path.join(plug, entry)).mtime;
+  } catch { }
 
   console.log("");
   if (newOk === NEW_METHODS.length) {
@@ -102,7 +129,7 @@ const NEW_METHODS = ["workspace.list", "modelCatalog", "session.titles", "sessio
 
   console.log(`✗ 运行中的是**旧版**宿主半边：${NEW_METHODS.length - newOk}/${NEW_METHODS.length} 个新方法不存在。`);
   if (diskMtime) {
-    console.log(`  磁盘上的 lib/index.js 修改于 ${diskMtime.toLocaleString("zh-CN")}`);
+    console.log(`  磁盘上的宿主半边修改于 ${diskMtime.toLocaleString("zh-CN")}`);
   }
   console.log("");
   console.log("  ⇒ 这是「改了源码但没重启客户端」的典型状态：");

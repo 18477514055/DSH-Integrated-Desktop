@@ -1,0 +1,18 @@
+# ============================================================================
+# dsh-archive-manager —— DSH bundle patch
+# ============================================================================
+# ★ 这一行是**必须**的，不是装饰。
+#   实测（2026-09-21，`5.DSH集成桌面端\scripts\plugin-check.js` 第一次跑就抓到）：
+#   只在 package.json 里写 `dsh.client` **不够** —— 内核组合 profile 时直接失败：
+#     Error: dsh: profile bundle "dsh-archive-manager" declares no dsh.bundle in its package.json
+#   ⇒ 没有这一行，包根本没资格当 bundle，`exports["./client"]` 也永远不会被
+#     `dsh-client-modules` 发现并下发，浏览器半边完全没有机会被加载。
+#   本机四个第三方插件（dsh-plugin-install / dsh-crosshub / dsh-qoder-connect /
+#   dsh-connect-workbuddy）无一例外都有这个文件。
+#
+# ★ id 用包名（dsh-crosshub 也是这么写的）。
+# ============================================================================
+
+- insert:
+    - id: dsh-archive-manager
+      name: 'dsh-archive-manager'

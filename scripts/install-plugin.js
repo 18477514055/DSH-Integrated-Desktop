@@ -113,8 +113,28 @@ say(`  插件源码      : ${PLUGIN_SRC}\n`);
 if (STATUS || (!APPLY && !REVERT)) {
   const st = report(readPkg());
   const wantDep = "link:" + PLUGIN_SRC;
-  const already = st.dep === wantDep && st.inBundles && !!st.target
-    && path.resolve(st.target).toLowerCase() === path.resolve(PLUGIN_SRC).toLowerCase();
+  // ★ 2026-09-21 修：原来拿 `st.target`（联接**真实解析后**的路径）直接比 `PLUGIN_SRC`。
+  //   归档管理器是**双层联接**：
+  //     profiles\web\node_modules\dsh-archive-manager
+  //       → 5.DSH集成桌面端\plugin\dsh-archive-manager   （junction）
+  //         → D:\DSH工作区002\2.归档管理器                （junction，源码真身）
+  //   那么 realpath 出来是第三工作区那个路径，与 PLUGIN_SRC 字符串当然不等
+  //   ⇒ 三处契约明明都 ✓，状态却报"还没装"（**假阴性**，会误导人反复重装）。
+  //   正确判据：**两边都 realpath 之后再比** —— 比的是"最终是不是同一份源码"。
+  const sameTarget = (() => {
+    if (!st.target) return false;
+    const a = path.resolve(st.target).toLowerCase();
+    const b = path.resolve(PLUGIN_SRC).toLowerCase();
+    if (a === b) return true;
+    try {
+      const ra = fs.existsSync(st.target) ? fs.realpathSync(st.target).toLowerCase() : a;
+      const rb = fs.existsSync(PLUGIN_SRC) ? fs.realpathSync(PLUGIN_SRC).toLowerCase() : b;
+      return ra === rb || a === rb || ra === b;
+    } catch {
+      return false;
+    }
+  })();
+  const already = st.dep === wantDep && st.inBundles && sameTarget;
 
   if (already) {
     say("\n  ✓ 这个插件**已经装好了**，而且指向的就是本仓库。");

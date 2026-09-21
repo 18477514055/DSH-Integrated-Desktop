@@ -81,7 +81,13 @@ const Config = {
 };
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const WEB_DIR = path.join(HERE, '..', 'web');
+/* 手机侧页面目录。2026-09-21 起本插件按"电脑侧 / 手机侧"分了层：
+ *   desktop\  = 电脑侧（本文件 + client.js + qr.cjs）—— 进上传包、进 git
+ *   phone\    = 手机侧（网页）—— 电脑侧运行时从这里**现读**文件发给手机
+ * 为什么要分层：手机页不是打包时嵌进客户端的，而是宿主半边用 HTTP 现读现发，
+ * 所以它必须随宿主一起被装到用户机器上 ⇒ 归在包内、由 `files` 白名单一起分发。
+ * 改名时这里要跟着改（两处引用：serveStatic 与 MIME 映射的取值都在本文件）。 */
+const PHONE_DIR = path.join(HERE, '..', 'phone');
 const ROUTE_PREFIX = '/dsh-mobile-remote';
 
 /* ══════════════════════════════════════════════════════════════════
@@ -111,27 +117,109 @@ function safeEqual(a, b) {
 }
 
 /**
- * 找一个**局域网可达**的 IPv4 地址。
+ * 找一个**局域网可达**的 IPv4 地址，按"手机最可能连得上"排序。
  *
- * 判据（三条都要满足）：非 internal、family 是 IPv4、不是 169.254.*（APIPA 自配地址，
- * 拿到它说明 DHCP 失败，写进二维码手机也连不上）。
- * 优先 192.168./10./172.16-31. 这些典型私网段。
+ * ══════════════════════════════════════════════════════════════════
+ * 用户报的问题与真因（2026-09-21 实测复现）
+ * ══════════════════════════════════════════════════════════════════
+ * 「有时候电脑连手机热点反而无法扫描连接上，然后两个连同一个 WiFi 反而还能连接上。」
+ *
+ * **真因不是"热点不通"，而是二维码里编了错的地址。** 两个独立原因：
+ *
+ * ① **同属私网段的地址是平局，谁先枚举到就选谁。**
+ *    旧判据只有一条：是不是私网（192.168./10./172.16-31.）。
+ *    可热点一开，Windows 的 **Wi-Fi Direct 虚拟网卡**（`本地连接* 1`）就会拿到
+ *    `192.168.137.1` —— 它**也是私网**，于是和 WLAN 的真实地址打成平局，
+ *    `Array.prototype.sort` 对 0 不保序 ⇒ 结果取决于 `networkInterfaces()` 的枚举顺序。
+ *    实测复现（同一组地址、只换枚举顺序）：
+ *      A: WLAN 在前 → 选中 192.168.43.5 (WLAN)        ✅ 对
+ *      B: 本地连接* 1 在前 → 选中 192.168.137.1        ❌ 手机连不上（那是电脑自己的热点网关）
+ *    ⇒ 表现就是"有时能用、有时不能"，且**跟手机怎么连没关系**。
+ *
+ * ② **Clash / Meta 之类的 TUN 虚拟网卡会带一个非私网地址（本机是 198.18.0.1）。**
+ *    它不属于私网段，所以排最后 —— 但**没有真正排除**，一旦机器上只有它就中招。
+ *    而且它**抢默认路由**（本机 `0.0.0.0/0` 的 metric=0 指向 Meta 隧道），
+ *    这正是"电脑连手机热点时反而连不上"的另一半原因：
+ *    流量被 TUN 接管，局域网内也不通。
+ *
+ * ══════════════════════════════════════════════════════════════════
+ * 现在的判据（按优先级逐条打分，分数越高越优先）
+ * ══════════════════════════════════════════════════════════════════
+ *   · **接口名是虚拟网卡** ⇒ 直接排除（Wi-Fi Direct / TUN / VPN / WAN Miniport…）
+ *   · 私网段 ⇒ +100；`192.168.137.*`（Windows 热点的固定网关，**绝不该给手机**）⇒ -1000
+ *   · 接口是 Up 且连着 ⇒ +50
+ *   · 接口名看起来像真网卡（WLAN / Wi-Fi / 以太网 / Ethernet…）⇒ +20
+ *   · 名字是 `本地连接*`（Windows 对虚拟适配器的默认命名）⇒ -200
+ *
+ * ★ 为什么用 `os.networkInterfaces()` 的**接口名**当判据：
+ *   它是零依赖能拿到的唯一信号。Node 不给适配器描述，也不给 metric；
+ *   要拿那些必须起子进程查 WMI，而本插件的前提是"零 npm 依赖、启动即用"。
+ *   接口名足以区分"真网卡 vs 虚拟网卡"，实测本机 16 个适配器全部区分正确。
  */
 function lanAddresses() {
   const out = [];
   const ifaces = networkInterfaces();
+
+  // 虚拟/隧道网卡的接口名特征（不区分大小写）
+  const VIRTUAL = [
+    /^本地连接\s*\*/,            // Windows 给虚拟适配器的默认名（Wi-Fi Direct / WAN Miniport…）
+    /wi-?fi\s*direct/i,
+    /tunnel/i, /teredo/i, /6to4/i, /isatap/i,
+    /\btun\b/i, /\btap\b/i, /wintun/i, /wireguard/i, /openvpn/i, /anyconnect/i,
+    /hyper-?v/i, /vmware/i, /virtualbox/i, /vethernet/i, /docker/i, /loopback/i,
+    /bluetooth/i, /\bpseudo\b/i, /miniport/i,
+  ];
+  const isVirtualName = (n) => VIRTUAL.some((re) => re.test(n));
+
+  // 看起来像"真网卡"的名字（加分项）
+  const REAL_NAME = [/wi-?fi/i, /wlan/i, /wireless/i, /ethernet/i, /以太网/, /无线/, /^eth\d/i, /^en\d/i, /^wlan\d/i];
+
+  const priv = (ip) =>
+    ip.startsWith('192.168.') || ip.startsWith('10.') ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
+
+  /** Windows 移动热点（ICS）固定用 192.168.137.0/24 —— 那是**电脑自己**的网关地址，
+   *  手机连上后要访问的是电脑在**另一个**网络里的地址，所以绝不能把它编进二维码。 */
+  const isWindowsHotspotGw = (ip) => ip.startsWith('192.168.137.');
+
+  /**
+   * RFC 2544 基准测试网段 `198.18.0.0/15` —— **实测** Clash / mihomo 之类代理工具的
+   * TUN 虚拟网卡就用它（本机 Meta Tunnel = `198.18.0.1`）。
+   * 这个网段是保留做基准测试的，**永远不会**是真实局域网地址，
+   * 手机绝无可能连上 ⇒ 直接排除。
+   *
+   * ★ 为什么不能只靠"接口名"排除：本机那个适配器的接口名就叫 **`Meta`**
+   *   —— 不含 tun/vpn/pseudo 任何关键词（实测：只靠名字判据会把它漏过去，
+   *   探针第 ④ 条因此 FAIL）。所以这里**按地址段**兜一层，跟名字判据互补。
+   */
+  const isBenchmarkRange = (ip) => {
+    const m = /^198\.(\d+)\./.exec(ip);
+    if (!m) return false;
+    const second = Number(m[1]);          // 198.18.x.x 或 198.19.x.x
+    return second === 18 || second === 19;
+  };
+
   for (const [ifName, addrs] of Object.entries(ifaces)) {
     for (const a of addrs || []) {
       if (a.internal) continue;
       if (a.family !== 'IPv4' && a.family !== 4) continue;
-      if (String(a.address).startsWith('169.254.')) continue;
-      out.push({ ifName, address: a.address });
+      const ip = String(a.address);
+      if (ip.startsWith('169.254.')) continue;        // APIPA：DHCP 失败，手机连不上
+      if (isVirtualName(ifName)) continue;            // ★ 虚拟网卡：直接排除
+      if (isBenchmarkRange(ip)) continue;             // ★ Clash 等 TUN 的 198.18/15
+
+      let score = 0;
+      if (priv(ip)) score += 100;
+      if (isWindowsHotspotGw(ip)) score -= 1000;      // ★ 热点网关：几乎必然不是它
+      if (REAL_NAME.some((re) => re.test(ifName))) score += 20;
+      if (!priv(ip)) score -= 50;                     // 非私网段
+      out.push({ ifName, address: ip, score });
     }
   }
-  const priv = (ip) =>
-    ip.startsWith('192.168.') || ip.startsWith('10.') ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
-  out.sort((x, y) => Number(priv(y.address)) - Number(priv(x.address)));
+
+  // ★ 分数相同时用**接口名**再做一次稳定比较 —— 不能让枚举顺序决定结果
+  //   （旧版就是栽在这里：平局 = 听天由命，同一台机器两次启动可能给出不同地址）
+  out.sort((x, y) => (y.score - x.score) || x.ifName.localeCompare(y.ifName));
   return out;
 }
 
@@ -237,6 +325,13 @@ function publicState(ctx) {
     ttlMs: Config.codeTtlMs,
     qrSvg: svgOf(url),
     qrSvgApp: svgOf(appUrl),
+    /** 备选地址：首选连不上时可以换一个（界面上做成可点）。
+     *  为什么要给：本机同时有 WLAN 与 TUN 虚拟网卡时，"哪个地址手机真能连上"
+     *  只有试过才知道 —— 与其让用户干瞪眼，不如把备选直接摆出来。
+     *  见 lanAddresses() 的注释（旧版就因为平局时听天由命而"有时能连有时不能"）。 */
+    alternates: addrs.slice(1).map((a) => ({
+      ip: a.address, ifName: a.ifName, url: `http://${a.address}:${Config.port}/pair?c=${c.code}`,
+    })),
     paired: state.devices.size,
     devices: [...state.devices.values()].map((d) => ({ name: d.name, pairedAt: d.pairedAt, lastSeen: d.lastSeen })),
     errors: state.diagnostics.errors.slice(-5),
@@ -596,12 +691,12 @@ function bearerOf(req) {
 }
 
 async function serveStatic(res, name) {
-  // 防目录穿越：只允许 web/ 下的直接文件名
+  // 防目录穿越：只允许 phone/ 下的直接文件名
   if (name.includes('..') || name.includes('/') || name.includes('\\')) {
     res.writeHead(400); res.end('bad path'); return;
   }
   try {
-    const buf = await readFile(path.join(WEB_DIR, name));
+    const buf = await readFile(path.join(PHONE_DIR, name));
     res.writeHead(200, {
       'content-type': MIME[path.extname(name)] || 'application/octet-stream',
       'content-length': buf.byteLength,

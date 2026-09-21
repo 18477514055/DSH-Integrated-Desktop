@@ -65,6 +65,10 @@ function isDir(p) {
   try { return fs.statSync(p).isDirectory(); } catch { return false; }
 }
 
+function isFile(p) {
+  try { return fs.statSync(p).isFile(); } catch { return false; }
+}
+
 function readJson(p) {
   try {
     let raw = fs.readFileSync(p, "utf8");
@@ -88,9 +92,12 @@ function fingerprint(dir) {
     try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch { return; }
     for (const e of entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
       const p = path.join(cur, e.name);
-      if (e.isDirectory()) {
+      // ★ 与 listBundledPlugins 同一个坑：Dirent 对联接 isDirectory()=false。
+      //   指纹必须用**跟随联接**的 statSync 判，否则联接里的文件一个都不进指纹
+      //   ⇒ 内容变了判不出"变了"，落位逻辑会漏更新。
+      if (isDir(p)) {
         if (e.name !== "node_modules") walk(p);
-      } else if (e.isFile()) {
+      } else if (isFile(p)) {
         files.push(p);
       }
     }
@@ -116,13 +123,21 @@ function listBundledPlugins(srcRoot) {
   let entries;
   try { entries = fs.readdirSync(srcRoot, { withFileTypes: true }); } catch { return out; }
   for (const e of entries) {
-    if (!e.isDirectory() || e.name.startsWith("_") || e.name.startsWith(".")) continue;
+    if (e.name.startsWith("_") || e.name.startsWith(".")) continue;
+    // ★ 目录联接（junction）必须**当成目录**，不能信 Dirent。
+    //   实测（2026-09-21，本机 node 24）：readdirSync 的 Dirent 对联接返回
+    //     isDirectory()=false / isSymbolicLink()=true
+    //   而 lstatSync 同样 isDirectory()=false —— 只有 statSync（跟随联接）才是 true。
+    //   原写法 `!e.isDirectory()` 会因此把"本体在别处、这里只留联接"的插件
+    //   **整批静默跳过** ⇒ 打包版里少插件，且不报错。
+    //   活例：plugin/dsh-archive-manager 是联接 → D:\DSH工作区002\2.归档管理器。
+    if (!isDir(path.join(srcRoot, e.name))) continue;
     const dir = path.join(srcRoot, e.name);
     const j = readJson(path.join(dir, "package.json"));
     if (!j) continue;
     const dsh = j.dsh || {};
     if (!dsh.bundle && !dsh.client) continue;
-    out.push({ name: j.name || e.name, dir, version: j.version || "0.0.0" });
+    out.push({ name: j.name || e.name, dir, version: j.version || "0.0.0", pkg: j });
   }
   return out;
 }
@@ -164,17 +179,151 @@ function ensureJunction(linkPath, target, { ownNames = [] } = {}) {
   if (r.status !== 0 || !linkTarget(linkPath)) {
     // 退路：复制（与 install-plugin.js 同一套退路）
     fs.rmSync(linkPath, { recursive: true, force: true });
-    fs.cpSync(target, linkPath, { recursive: true });
+    // ★ dereference 同上：target 可能是联接（本体在别的工作区），默认 cpSync 会 EPERM。
+    fs.cpSync(target, linkPath, { recursive: true, dereference: true });
     return true;
   }
   return true;
+}
+
+/**
+ * 物化时**必须**排除的路径（与打包流程的排除规则一一对应）。
+ * 定义在这里而不是打包脚本里，是为了让"打包产物该有什么"只有一处定义。
+ *
+ * ⚠️ 这份清单与 `scripts/materialize-plugins.js` 的调用点绑在一起 ——
+ * 打包的 extraResources 现在读 `runtime/materialized-plugins`，
+ * 排除**只在这里做**（见 materialize-plugins.js 文件头）。
+ */
+const DEFAULT_EXCLUDES = [
+  "_retired", "_retired/**",
+  "**/.gradle/**", "**/android/build/**", "**/android/app/build/**",
+];
+
+/**
+ * 路径是否命中排除规则。
+ *
+ * 为什么不直接用 `minimatch`：`src/plugins.js` 会被打包版在**运行时** require
+ * （src/main.js → provision），而 build.files 里排除了整个 node_modules
+ * 且 dependencies 为空 ⇒ 打包产物里**没有** minimatch，顶层 require 会直接
+ * ERR_MODULE_NOT_FOUND。所以这里自带一个极小的等价实现。
+ */
+function isExcluded(rel, globs = DEFAULT_EXCLUDES) {
+  if (!rel || rel === "") return false;
+  const r = rel.replace(/\\/g, "/");
+  for (const raw of globs) {
+    if (raw.startsWith("!")) continue;            // filter 里只用到排除项
+    const g = raw.replace(/\\/g, "/");
+    if (globToRegExp(g).test(r)) return true;
+    // `android/build/**` 这类写法也要命中的**目录本身**（否则 cpSync 会照样走进去、
+    // 建出一个空目录；更糟的是白白遍历那些 232 字符深的路径）
+    if (g.endsWith("/**") && globToRegExp(g.slice(0, -3)).test(r)) return true;
+  }
+  return false;
+}
+
+/**
+ * 把带 `*` / `**` 的模式转成正则。
+ *
+ * ★ `**` 的语义与 minimatch 一致：匹配**零个或多个**路径段
+ *   （写成"至少一个"是本文件踩过的真错 —— 那样 `**\/android/build/**`
+ *    就匹配不上 `android/build/x.txt`，排除规则整个失效）。
+ */
+function globToRegExp(pattern) {
+  let rx = "";
+  let i = 0;
+  while (i < pattern.length) {
+    const c = pattern[i];
+    if (c === "*") {
+      if (pattern[i + 1] === "*") {
+        i += 2;
+        if (pattern[i] === "/") { i += 1; rx += "(?:.*/)?"; }   // `**/` 可匹配零段
+        else { rx += ".*"; }
+      } else {
+        i += 1; rx += "[^/]*";
+      }
+    } else if (c === "?") {
+      i += 1; rx += "[^/]";
+    } else {
+      rx += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+      i += 1;
+    }
+  }
+  return new RegExp("^" + rx + "$");
+}
+
+/**
+ * 物化：把 `plugin/` 里所有**目录联接**展开成真实目录，写到一个临时目录。
+ *
+ * ══════════════════════════════════════════════════════════════════
+ * 为什么需要它（2026-09-21 实测，不是理论问题）
+ * ══════════════════════════════════════════════════════════════════
+ * 2026-09-21 起，插件的**本体搬到了第三工作区**（`D:\DSH工作区002\`），
+ * 仓库里的 `plugin/<名字>` 只是一个 **Junction**。而 electron-builder 拷
+ * `extraResources` 时用的 `copyDir` **不解引用联接** —— 它走的是
+ * `lstat().isSymbolicLink()` 分支，把联接**原样重建**在产物里：
+ *
+ *   实测（用与 package.json **完全相同**的 filter 跑 builder-util 的 copyDir）：
+ *     dest/dsh-mobile-remote 存在 = true
+ *     它是符号链接（Junction）    = true
+ *     → 指向 C:\Users\...\WORKSPACE3\1.手机遥控     ← **开发机专属绝对路径**
+ *
+ * ⇒ 别人装完，`<安装目录>\resources\plugins\<名字>` 是**指向我机器的死链**，
+ *   落位逻辑一个插件都找不到，界面上什么都没有。
+ *   （同一个坑 `provision-check.js` 第 ⑦ 段也踩到了：`fs.cpSync` 对联接默认抛 EPERM。）
+ *
+ * 所以打包**之前**先物化：只有这一处实现，`scripts/materialize-plugins.js` 与
+ * `scripts/provision-check.js` 都调它，避免两处实现悄悄分叉。
+ *
+ * @param {string} srcRoot 仓库里的 `plugin/` 目录
+ * @param {string} destRoot 目标目录（会被创建；调用方负责清理）
+ * @param {string[]} [excludeGlobs] 排除规则（与 electron-builder 的 filter 同一套；
+ *        物化必须**沿用**它，否则被排除的构建产物会被物化进来 ——
+ *        实测 `dsh-mobile-remote` 5.18 MB / 179 文件里，有 4.04 MB / 141 个文件
+ *        是 `android/build/**`，而那里有 **232 字符深**的路径，超过 Windows 260 的
+ *        经典上限，`cpSync` 有真实失败风险，AGENTS.md §7 点过名）。
+ * @returns {{ok:boolean, copied:string[], links:string[], errors:string[]}}
+ *          `links` = 被解引用展开的联接名字（没物化到东西时就是空数组）
+ */
+function materializePlugins(srcRoot, destRoot, excludeGlobs = DEFAULT_EXCLUDES) {
+  const out = { ok: true, copied: [], links: [], errors: [] };
+  if (!isDir(srcRoot)) {
+    out.ok = false;
+    out.errors.push(`来源目录不存在：${srcRoot}`);
+    return out;
+  }
+  const plugins = listBundledPlugins(srcRoot);
+  fs.mkdirSync(destRoot, { recursive: true });
+  for (const p of plugins) {
+    const dest = path.join(destRoot, p.name);
+    try {
+      const st = fs.lstatSync(p.dir);
+      if (st.isSymbolicLink()) out.links.push(p.name);
+      // dereference:true —— 联接（和符号链接）都按真实目录展开
+      fs.cpSync(p.dir, dest, {
+        recursive: true,
+        dereference: true,
+        filter: (src) => !isExcluded(path.relative(p.dir, src), excludeGlobs),
+      });
+      out.copied.push(p.name);
+    } catch (e) {
+      out.ok = false;
+      out.errors.push(`${p.name}: ${(e && e.message) || e}`);
+    }
+  }
+  return out;
 }
 
 /** 原子替换目录：先拷到同级 .tmp 再改名（中途失败不会留下半个插件）。 */
 function replaceDir(src, dest) {
   const tmp = dest + ".tmp-" + process.pid + "-" + Date.now();
   fs.rmSync(tmp, { recursive: true, force: true });
-  fs.cpSync(src, tmp, { recursive: true });
+  // ★ `dereference: true` 是必需的，不是优化。
+  //   实测（2026-09-21，本机 node 24）：源目录若是**目录联接**（本体在别的盘/工作区，
+  //   这里只留一个 junction），`fs.cpSync` **默认直接抛 EPERM**；加了 dereference
+  //   才把联接当目录展开、把真实文件拷出来。
+  //   两个后果都验过：不加 ⇒ 打包版落位失败（进 catch 变成 errors、插件缺失）；
+  //   加了 ⇒ 落位出来的是**真实目录**（正确 —— 用户数据目录下不该留指向开发机的联接）。
+  fs.cpSync(src, tmp, { recursive: true, dereference: true });
   fs.rmSync(dest, { recursive: true, force: true });
   fs.renameSync(tmp, dest);
 }
@@ -345,4 +494,7 @@ function provision(opts = {}) {
   return result;
 }
 
-module.exports = { provision, listBundledPlugins, fingerprint, ensureJunction, STATE_FILE };
+module.exports = {
+  provision, listBundledPlugins, fingerprint, ensureJunction,
+  materializePlugins, isExcluded, DEFAULT_EXCLUDES, STATE_FILE,
+};

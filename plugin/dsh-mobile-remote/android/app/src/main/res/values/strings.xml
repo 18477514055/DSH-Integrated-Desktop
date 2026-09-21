@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">手机遥控</string>
+    <!-- 用户 2026-09-20 指定：应用名改成「dsh手机遥控」 -->
+    <string name="app_name">dsh手机遥控</string>
 </resources>
