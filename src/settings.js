@@ -101,18 +101,33 @@
     return `${(n / 1024 / 1024).toFixed(1)} MB`;
   }
 
+  // ★ 「同时看本机」那一段：线上没发不等于本机没有（自己打的包一直没发出去时就是这样）
+  function renderLocal(r) {
+    const loc = r && r.localNewer ? r.localNewer : null;
+    if (!loc) { $("up-row-local").style.display = "none"; return; }
+    $("up-local-ver").textContent = `v${loc.version}`;
+    $("up-local-path").textContent = loc.path;
+    $("up-row-local").style.display = "";
+  }
+
   async function doCheck() {
-    upStatus("正在查 GitHub…");
+    upStatus("正在查 GitHub 与本机…");
     $("btn-up-check").disabled = true;
     try {
       const r = await S.checkUpdate();
       lastCheck = r;
+      renderLocal(r);
       if (!r || !r.ok) {
-        upStatus(`检查失败：${(r && r.reason) || "未知原因"}`);
+        // 线上查不到**不代表本机没有** —— 本地那一段照样显示
+        upStatus(`检查失败：${(r && r.reason) || "未知原因"}`
+          + (r && r.localNewer ? "（不过本机扫到了更新的安装包，见下）" : ""));
+        $("up-row-new").style.display = "none";
         return;
       }
       if (!r.hasUpdate) {
-        upStatus(`已是最新（v${r.current}）`);
+        upStatus(r.localNewer
+          ? `线上已是最新（v${r.current}），但本机有更新的安装包 v${r.localNewer.version}`
+          : `已是最新（v${r.current}）`);
         $("up-row-new").style.display = "none";
         return;
       }
@@ -128,6 +143,26 @@
       upStatus(`检查出错：${(e && e.message) || e}`);
     } finally {
       $("btn-up-check").disabled = false;
+    }
+  }
+
+  /** 用本机扫到的那一个安装包升级。路径是**主进程自己发现的**，页面只是回传它。 */
+  async function doInstallLocal() {
+    const loc = lastCheck && lastCheck.localNewer;
+    if (!loc) return;
+    $("btn-up-local").disabled = true;
+    upStatus(`正在启动本地安装包 v${loc.version}…`);
+    try {
+      const r = await S.installUpdate(loc.path);
+      if (!r || !r.ok) {
+        upStatus(`启动失败：${(r && r.reason) || "未知"}`);
+        $("btn-up-local").disabled = false;
+        return;
+      }
+      upStatus("安装器已启动。外壳随即退出 —— 装完安装器会自己把新版本打开。");
+    } catch (e) {
+      upStatus(`出错：${(e && e.message) || e}`);
+      $("btn-up-local").disabled = false;
     }
   }
 
@@ -163,6 +198,7 @@
     $("btn-up-check").addEventListener("click", doCheck);
     $("btn-up-page").addEventListener("click", () => S.openReleases().catch(() => { }));
     $("btn-up-go").addEventListener("click", doInstall);
+    $("btn-up-local").addEventListener("click", doInstallLocal);
 
     S.onUpdateProgress((p) => {
       if (!p) return;

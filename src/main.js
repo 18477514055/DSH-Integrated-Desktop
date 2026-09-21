@@ -1165,6 +1165,30 @@ function updateEmit(payload) {
   }
 }
 
+/**
+ * 「检查更新」要顺带扫的本地目录 —— **只列目录、只 stat，不执行、不写**。
+ *
+ * ★ 为什么要有这一步（用户原话）：
+ *   「检查更新，同时检查仓库的情况和本地的情况，说不定他们是本地安装包呢。」
+ *   本机真实场景：自己 `npm run dist` 打出了新版本，但因为工作区不干净一直没发到
+ *   GitHub ⇒ 线上还停在旧版本，只查线上就永远报「已是最新」。
+ *
+ *   ① 下载临时目录 —— 更新流程自己下过的那些；
+ *   ② 设置里那个工作目录下的 `release\` —— 开发机上 `npm run dist` 的产出就在那儿。
+ */
+function localInstallerDirs() {
+  const dirs = [app.getPath("temp")];
+  if (settings && settings.workspace) dirs.push(path.join(settings.workspace, "release"));
+  return dirs;
+}
+
+/**
+ * 上一次「检查更新」在本机扫到的那个安装包路径。
+ * ★ 装机那一步只认**主进程自己发现的这个路径** —— 渲染进程递进来的任意路径一律不接受，
+ *   否则「检查更新」就成了一个"运行任意 exe"的通道。
+ */
+let localInstallerFound = null;
+
 /** 插件下载/安装进度只推给外壳自有窗口（设置页 / 首启向导）。 */
 function pluginsEmit(payload) {
   for (const w of [mainWindow, settingsWindow]) {
@@ -1369,9 +1393,11 @@ function registerIpc() {
   // 这三条会下载文件、启动安装包 ⇒ 只放行**外壳自有页面**（也就是设置页）。
   ipcMain.handle("dsh:update:check", async (e) => {
     assertShellSender(e);
-    log("检查更新…");
-    const r = await U.check();
-    log(`检查更新：ok=${r.ok} 当前=${r.current} 最新=${r.latest || "-"} 有更新=${r.hasUpdate} ${r.reason || ""}`);
+    log("检查更新…（同时看线上与本机）");
+    const r = await U.check({ localDirs: localInstallerDirs() });
+    localInstallerFound = (r && r.localNewer && r.localNewer.path) ? r.localNewer.path : null;
+    log(`检查更新：ok=${r.ok} 当前=${r.current} 线上最新=${r.latest || "-"} 线上有更新=${r.hasUpdate}`
+      + ` 本地有更新=${localInstallerFound ? r.localNewer.version : "无"} ${r.reason || ""}`);
     return r;
   });
 
@@ -1388,11 +1414,16 @@ function registerIpc() {
   ipcMain.handle("dsh:update:install", async (e, file) => {
     assertShellSender(e);
     const f = typeof file === "string" ? file : "";
-    // ★ 只允许启动**我们自己下到临时目录**里的那个安装包，不接受任意路径 ——
-    //   否则"检查更新"就变成了一个"运行任意 exe"的通道。
+    // ★ 只允许两条路启动安装包：
+    //   ① 我们自己**下到临时目录**里的那一个；
+    //   ② 上一次「检查更新」**主进程自己**在本机扫到的那个本地安装包。
+    //   除此之外一律拒 —— 否则"检查更新"就变成了一个"运行任意 exe"的通道。
     const tmp = path.resolve(app.getPath("temp")).toLowerCase();
-    if (!f || path.dirname(path.resolve(f)).toLowerCase() !== tmp) {
-      return { ok: false, reason: "拒绝：安装包不在本应用的临时目录里" };
+    const inTemp = !!f && path.dirname(path.resolve(f)).toLowerCase() === tmp;
+    const isDiscovered = !!f && !!localInstallerFound
+      && path.resolve(f).toLowerCase() === path.resolve(localInstallerFound).toLowerCase();
+    if (!inTemp && !isDiscovered) {
+      return { ok: false, reason: "拒绝：这个安装包既不是本应用下载的，也不是「检查更新」扫出来的那一个" };
     }
     const r = await U.launchInstaller(f);
     if (r.ok) {

@@ -66,48 +66,97 @@ function pickInstaller(assets) {
   return install || exes.find((a) => !/portable/i.test(a.name)) || null;
 }
 
+/** 从安装包文件名里读版本：`DSH-Integrated-0.2.5-x64.exe` → `0.2.5`。portable 不算。 */
+function versionFromInstallerName(name) {
+  const n = String(name || "");
+  if (/portable/i.test(n)) return "";
+  const m = /^DSH-Integrated-(.+?)-x64\.exe$/i.exec(n);
+  return m ? m[1] : "";
+}
+
+/**
+ * 在给定的几个目录里找**本机已有的、比当前更新的**安装包。
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 为什么要有这一步（用户原话）
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 「检查更新，同时检查仓库的情况和本地的情况，说不定他们是本地安装包呢。」
+ *
+ * 真实场景就是本机：自己 `npm run dist` 打出了 0.2.5，但因为工作区不干净
+ * （另一个会话还在改）**一直没发到 GitHub** ⇒ 线上还停在 0.2.2。
+ * 只查线上，它就永远报「已是最新」，而更新的安装包其实就躺在 `release\` 里。
+ *
+ * **只读**：只列目录、只 stat，不写、不执行。
+ * 目录由调用方给（主进程从设置里的工作目录 + 下载临时目录算出来），本模块自己不猜路径。
+ */
+function findLocalInstaller(dirs, current) {
+  let best = null;
+  for (const dir of Array.isArray(dirs) ? dirs : []) {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { continue; }   // 目录不存在就算没有
+    for (const n of names) {
+      const ver = versionFromInstallerName(n);
+      if (!ver) continue;
+      if (cmpVersion(ver, current) <= 0) continue;             // 不比当前新就不提
+      const abs = path.join(dir, n);
+      let size = 0;
+      try { size = fs.statSync(abs).size; } catch { continue; }
+      // 太小的多半是半个下载 / 占位文件 —— 别把一个残包当成"可以升级"
+      if (size < 1024 * 1024) continue;
+      if (!best || cmpVersion(ver, best.version) > 0) best = { version: ver, path: abs, size, dir };
+    }
+  }
+  return best;
+}
+
 /**
  * 查最新 Release。**只读**，不写任何东西。
+ *
+ * @param {{localDirs?:string[]}} [opts] 顺带扫这几个本地目录里有没有更新的安装包
  * @returns {Promise<{ok:boolean, reason?:string, current:string, latest?:string,
- *                    hasUpdate?:boolean, asset?:object, notes?:string, page?:string}>}
+ *                    hasUpdate?:boolean, asset?:object, notes?:string, page?:string,
+ *                    localNewer:?{version:string,path:string,size:number,dir:string}}>}
  */
-async function check() {
+async function check(opts = {}) {
   const current = app.getVersion();
+  // ★ 先看**本机**有没有更新的安装包 —— 线上没有不等于本机没有
+  const localNewer = findLocalInstaller(opts.localDirs, current);
+  const withLocal = (o) => ({ ...o, current, localNewer });
+
   let res;
   try {
     res = await net.fetch(API_LATEST, {
       headers: { "User-Agent": UA, Accept: "application/vnd.github+json" },
     });
   } catch (e) {
-    return { ok: false, reason: `连不上 GitHub：${(e && e.message) || e}`, current };
+    return withLocal({ ok: false, reason: `连不上 GitHub：${(e && e.message) || e}` });
   }
   if (res.status === 404) {
-    return { ok: false, reason: "仓库上还没有任何 Release", current, page: RELEASES_PAGE };
+    return withLocal({ ok: false, reason: "仓库上还没有任何 Release", page: RELEASES_PAGE });
   }
   if (!res.ok) {
-    return { ok: false, reason: `GitHub 返回 HTTP ${res.status}`, current, page: RELEASES_PAGE };
+    return withLocal({ ok: false, reason: `GitHub 返回 HTTP ${res.status}`, page: RELEASES_PAGE });
   }
 
   let rel;
   try { rel = await res.json(); } catch (e) {
-    return { ok: false, reason: `返回内容不是 JSON：${(e && e.message) || e}`, current };
+    return withLocal({ ok: false, reason: `返回内容不是 JSON：${(e && e.message) || e}` });
   }
 
   const latest = String(rel.tag_name || rel.name || "").replace(/^v/i, "");
-  if (!latest) return { ok: false, reason: "Release 里没有版本号", current, page: RELEASES_PAGE };
+  if (!latest) return withLocal({ ok: false, reason: "Release 里没有版本号", page: RELEASES_PAGE });
 
   const asset = pickInstaller(rel.assets);
   const hasUpdate = cmpVersion(latest, current) > 0;
-  return {
+  return withLocal({
     ok: true,
-    current,
     latest,
     hasUpdate,
     asset: asset ? { name: asset.name, url: asset.browser_download_url, size: asset.size } : null,
     notes: typeof rel.body === "string" ? rel.body.slice(0, 4000) : "",
     page: rel.html_url || RELEASES_PAGE,
     publishedAt: rel.published_at || "",
-  };
+  });
 }
 
 /** 下载目标路径：临时目录下、按版本命名（已存在且大小一致就直接复用）。 */
@@ -204,4 +253,8 @@ function openReleasesPage() {
   return shell.openExternal(RELEASES_PAGE);
 }
 
-module.exports = { check, download, launchInstaller, openReleasesPage, cmpVersion, pickInstaller, RELEASES_PAGE, REPO };
+module.exports = {
+  check, download, launchInstaller, openReleasesPage,
+  cmpVersion, pickInstaller, versionFromInstallerName, findLocalInstaller,
+  RELEASES_PAGE, REPO,
+};

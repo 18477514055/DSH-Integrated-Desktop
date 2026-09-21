@@ -35,7 +35,7 @@
     "plugin:revert": "node scripts/install-plugin.js --revert",
     "provision:check": "node scripts/provision-check.js",
     "verify:asar": "node scripts/asar-check.js",
-    "update:check": "electron scripts/update-check.js",
+    "update:check": "node scripts/run-electron.js scripts/update-check.js",
     "postinstall": "node scripts/check-kernel.js"
   },
   "devDependencies": {

@@ -785,6 +785,16 @@ async function verifyPages(tmpDir) {
       check("设置页里有「更新」这一栏", s2.hasNav && s2.hasPane, JSON.stringify(s2));
       check("更新栏显示了当前版本（v 开头）", /^v\d/.test(s2.current), s2.current);
 
+      // ★ 往系统临时目录里放一个"更新的安装包"，把「本机已有新包」那一路**真的跑出来**。
+      //   为什么放这儿：主进程扫的两个目录之一就是 `app.getPath("temp")`
+      //   （另一个是 settings.workspace\release）—— 这是唯一能在隔离环境里触发它、
+      //   又不用去改 settings.workspace（那会影响页面加载）的干净办法。
+      const fakeExe = path.join(os.tmpdir(), "DSH-Integrated-9.9.9-x64.exe");
+      try { fs.rmSync(fakeExe, { force: true }); } catch { /* 先清掉上次可能残留的 */ }
+      let fakeMade = false;
+      try { fs.writeFileSync(fakeExe, Buffer.alloc(1200 * 1024)); fakeMade = true; } catch { /* 忽略 */ }
+      if (fakeMade) console.log(`  已放一个假的本地新包: ${fakeExe}`);
+
       // 真点一次「检查更新」—— 这一步要联网
       await cdpEval(setT.webSocketDebuggerUrl,
         `(() => { document.getElementById('btn-up-check').click(); return 'ok'; })()`, 20000);
@@ -800,6 +810,31 @@ async function verifyPages(tmpDir) {
       check("点「检查更新」真拿到了结论（不是停在「正在查」）",
         /已是最新|发现新版本|检查失败|检查出错/.test(after), after);
       check("结论里带版本号（说明真解析了 Release）", /v\d+\.\d+\.\d+/.test(after), after);
+
+      // ★★ 「同时看本机」那一路（用户 2026-09-21 提的：
+      //    「检查更新，同时检查仓库的情况和本地的情况，说不定他们是本地安装包呢。」）
+      if (fakeMade) {
+        const locRaw = await cdpEval(setT.webSocketDebuggerUrl, `(() => {
+          const row = document.getElementById('up-row-local');
+          return JSON.stringify({
+            display: row ? getComputedStyle(row).display : null,
+            ver: (document.getElementById('up-local-ver')||{}).textContent||'',
+            p: (document.getElementById('up-local-path')||{}).textContent||'',
+            btn: !!document.getElementById('btn-up-local'),
+          });
+        })()`, 20000);
+        const lr = JSON.parse(locRaw);
+        console.log(`  本机新包那一行: ${locRaw.slice(0, 170)}`);
+        check("★ 本机有更新的安装包时，「本机已有新包」那一行真的显示出来了",
+          !!lr.display && lr.display !== "none", locRaw.slice(0, 170));
+        check("★ 它报的是**本机那个包**的版本 v9.9.9（不是线上的）", /v9\.9\.9/.test(lr.ver), lr.ver);
+        check("★ 它把那个包的完整路径给出来了",
+          /DSH-Integrated-9\.9\.9-x64\.exe/.test(lr.p), lr.p.slice(0, 130));
+        check("有个「安装这个本地包」按钮", lr.btn === true, String(lr.btn));
+        try { fs.rmSync(fakeExe, { force: true }); } catch { /* 忽略 */ }
+      } else {
+        console.log("  SKIP  造不出假的本地安装包 —— 这一段没验到，**不算通过**");
+      }
     }
   } finally {
     await stopApp(child);

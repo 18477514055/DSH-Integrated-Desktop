@@ -70,8 +70,73 @@ app.whenReady().then(async () => {
   }
   out(bad ? `  ✗ 版本比较 ${bad} 条不对` : `  ✓ 版本比较 6 条全对（含 0.2.10 > 0.2.9、预发布 < 正式版）`);
 
+  // ── ★「同时看本地」那把尺子也要当场验（用户 2026-09-21 提的那条）──
+  //    用户原话：「检查更新，同时检查仓库的情况和本地的情况，说不定他们是本地安装包呢。」
+  const os = require("node:os");
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const ck = (cond, label) => { if (cond) out(`  ✓ ${label}`); else { bad += 1; out(`  ✗ ${label}`); } };
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-upd-local-"));
+  try {
+    const big = Buffer.alloc(1200 * 1024);   // 太小的会被当成残包跳过，所以造够 1.2 MB
+    for (const n of [
+      "DSH-Integrated-0.1.0-x64.exe",           // 比当前旧 ⇒ 不该报
+      "DSH-Integrated-9.9.8-x64.exe",           // 次新
+      "DSH-Integrated-9.9.9-x64.exe",           // 最高 ⇒ 应该挑它
+      "DSH-Integrated-9.9.9-portable-x64.exe",  // portable ⇒ 不算
+      "随便一个文件.exe",
+    ]) {
+      try { fs.writeFileSync(path.join(tmp, n), big); } catch { /* 忽略 */ }
+    }
+
+    out("");
+    out("=== 找本地安装包（只读，临时目录）===");
+    ck(U.versionFromInstallerName("DSH-Integrated-0.2.5-x64.exe") === "0.2.5", "能从文件名读出版本");
+    ck(U.versionFromInstallerName("DSH-Integrated-0.2.5-portable-x64.exe") === "", "portable 不算");
+    ck(U.versionFromInstallerName("别的名字.exe") === "", "别的名字不算");
+
+    const found = U.findLocalInstaller([tmp, path.join(tmp, "不存在的目录")], "0.2.5");
+    ck(!!found && found.version === "9.9.9", "★ 挑出**最高**的那个本地包（不是次新的 9.9.8）",
+      found ? found.version : "没找到");
+    ck(!!found && path.isAbsolute(found.path), "返回的是绝对路径");
+    ck(U.findLocalInstaller([tmp], "99.0.0") === null, "★ 本地没有更高的 ⇒ null（不瞎报「有更新」）");
+    ck(U.findLocalInstaller([path.join(tmp, "根本没有这个目录")], "0.1.0") === null, "目录不存在 ⇒ null（不抛错）");
+    ck(U.findLocalInstaller([], "0.1.0") === null, "空目录表 ⇒ null");
+    ck(U.findLocalInstaller(undefined, "0.1.0") === null, "没给目录 ⇒ null");
+  } finally {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  }
+
+  // ── 真的扫一次本仓库的 release\ —— 这就是用户要的那件事 ──
+  out("");
+  out("=== 顺带：真的扫一下本仓库 release\\ ===");
+  const relDir = path.join(__dirname, "..", "release");
+  // ★★ 这里**不能**用 `U.check({ localDirs })` 来验：
+  //    用 `electron 脚本.js` 跑时 `app.getVersion()` 是 **Electron 的版本**（37.10.3），
+  //    于是一个真实的 0.2.5 会被判成"比当前旧"、根本扫不出来。
+  //    （本文件开头那条"探针自己也会撒谎"的坑，这是**第二处**咬人 —— 第一版就是这么假 FAIL 的。）
+  //    所以直接调 findLocalInstaller 并**显式**传真实外壳版本。
+  const foundInRelease = U.findLocalInstaller([relDir], "0.2.4");
+  out(`  扫的目录: ${relDir}`);
+  out(`  基准     : v0.2.4（假装装着的是它 —— 真实场景就是"装着的比 release\\ 里的旧"）`);
+  out(`  真实外壳 : v${pkgVersion}（注意不能用 app.getVersion()，它是 ${app.getVersion()}）`);
+  out(`  扫到     : ${foundInRelease ? `v${foundInRelease.version}（${foundInRelease.size} 字节）` : "没有比它更新的"}`);
+  // ★ 条件式判据：只有 release\ 里**确实**躺着当前版本的安装包时才判 ——
+  //   否则"忘了出包"会变成一条假 FAIL（外部状态不该写死进断言）
+  const exe = path.join(relDir, `DSH-Integrated-${pkgVersion}-x64.exe`);
+  if (fs.existsSync(exe)) {
+    ck(!!foundInRelease && foundInRelease.version === pkgVersion,
+      `★ 以 v0.2.4（装着的那一版）为基准，扫出本机 release\\ 里的 v${pkgVersion}（线上还停在 ${r.latest || "?"}）`);
+    // 「不比自己新就不报」这条同样要钉住 —— 否则会一直催你升到**同一个**版本
+    ck(U.findLocalInstaller([relDir], pkgVersion) === null,
+      "★ 与当前**同版本**的安装包不算「有更新」（否则会一直催你升到同一个版本）");
+  } else {
+    out(`  （release\\ 里没有 v${pkgVersion} 的安装包，这一条不判）`);
+  }
+
   // 版本比较不过 ⇒ 就算连上也判失败（尺子错了，结论不可信）
   const code = (!r.ok || bad) ? 1 : 0;
-  out(code ? "结果：✗ 链路或尺子有问题" : "结果：✓ 链路通、尺子对");
+  out(code ? "结果：✗ 链路或尺子有问题" : "结果：✓ 链路通、尺子对、本地扫描对");
   app.exit(code);
 });

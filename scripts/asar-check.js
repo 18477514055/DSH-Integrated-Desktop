@@ -37,11 +37,13 @@ const CHECKS = [
   },
   {
     file: "src/settings.html",
-    marks: ['data-pane="update"', 'data-pane="plugins"', 'data-pane="diag"', "up-current", "pl-list", "btn-pl-check"],
+    marks: ['data-pane="update"', 'data-pane="plugins"', 'data-pane="diag"',
+      "up-current", "pl-list", "btn-pl-check", "up-row-local", "btn-up-local"],
   },
   {
     file: "src/settings.js",
-    marks: ["wireUpdate()", "wirePlugins()", "loadPlugins(false)", "doInstallPlugin", "doUninstallPlugin", "ShellUI.esc"],
+    marks: ["wireUpdate()", "wirePlugins()", "loadPlugins(false)", "doInstallPlugin",
+      "doUninstallPlugin", "ShellUI.esc", "doInstallLocal", "localNewer", "sourceLabel"],
   },
   {
     file: "src/sites.js",
@@ -54,11 +56,12 @@ const CHECKS = [
       "dsh:update:check",
       "dsh:plugins:list", "dsh:plugins:check", "dsh:plugins:install", "dsh:plugins:uninstall",
       "pluginState", "pluginsEmit",
+      "localInstallerDirs", "localInstallerFound",
     ],
   },
   {
     file: "src/update.js",
-    marks: ["cmpVersion", "releases/latest", "pickInstaller"],
+    marks: ["cmpVersion", "releases/latest", "pickInstaller", "findLocalInstaller", "versionFromInstallerName"],
   },
   {
     file: "src/preload.js",

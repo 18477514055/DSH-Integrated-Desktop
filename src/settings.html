@@ -172,6 +172,21 @@
           <span class="note" id="up-status">还没检查</span>
         </div>
       </div>
+      <!-- ★ 本机已有的、比当前更新的安装包（线上可能还没发出去） -->
+      <div class="row" id="up-row-local" style="display:none">
+        <div class="k">本机已有新包</div>
+        <div class="v" style="flex-direction:column;align-items:stretch;gap:8px">
+          <div><b id="up-local-ver"></b>
+            <span class="note">线上还没发出去，但本机已经有更新的安装包</span></div>
+          <div class="mono" id="up-local-path"
+               style="font-size:11.5px;color:var(--fg-faint);word-break:break-all"></div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button class="btn" id="btn-up-local">安装这个本地包</button>
+            <span class="note">装完外壳会退出，安装器随后把新版本拉起来</span>
+          </div>
+        </div>
+      </div>
+
       <div class="row" id="up-row-new" style="display:none">
         <div class="k">新版本</div>
         <div class="v" style="flex-direction:column;align-items:stretch;gap:8px">
