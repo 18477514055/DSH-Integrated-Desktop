@@ -83,6 +83,26 @@ contextBridge.exposeInMainWorld("dshShell", {
   /** 打开外壳设置窗口（切换面板最后那一栏用；与 switchPage 同一套来源判定）。 */
   openShellSettings: () => ipcRenderer.invoke("dsh:page:open-settings"),
 
+  // ── 侧边栏文件树：真打开（注入脚本 src/inject/sidebar-open.js）──────
+  //
+  // 用户要的：侧栏里点文件/文件夹，除了「在侧栏读它」（内核自带），
+  // 还能**像在文件管理器里点它**——用默认应用打开、在资源管理器里选中。
+  //
+  // ⚠️ 这一组**只放行本机内核界面**（主进程的 `assertLocalFileUi` 按
+  //    `event.senderFrame.url` 的 origin 判）。两个外部站点视图**共用本 preload**
+  //    ⇒ 它们那里也能看到这个函数，但一调就被拒 —— 这是刻意的：
+  //    否则第三方页面就拿到了"启动本机程序"的能力。
+  // ⚠️ 路径还要过第二道闸：必须落在**已注册的工作区**里（`guardWorkspaceFilePath`），
+  //    不是"页面说是什么就是什么"。
+  /**
+   * 打开一个工作区里的文件/文件夹。
+   * @param {string} path 绝对路径
+   * @param {"open"|"reveal"} action open=默认应用／reveal=在资源管理器中选中
+   * @returns {Promise<{ok:boolean, path?:string, action?:string, reason?:string}>}
+   */
+  openWorkspaceFile: (p, action) => ipcRenderer.invoke(
+    "dsh:file:open-workspace", String(p), action === "reveal" ? "reveal" : "open"),
+
   // ── 检查更新（实现全在主进程 src/update.js）────────────────────
   //
   // ⚠️ 这一组会**下载文件并启动安装包** ⇒ 主进程只放行**外壳自有页面**
@@ -99,6 +119,32 @@ contextBridge.exposeInMainWorld("dshShell", {
   onUpdateProgress: (cb) => subscribe("dsh:update:progress", cb),
   /** 托盘「检查更新…」让设置页跳到某一栏：pane 名 */
   onFocusPane: (cb) => subscribe("dsh:settings:focus-pane", cb),
+
+  // ── 检查内核更新（实现全在 src/kernel-update.js）──────────────────
+  //
+  // 用户要求：「加一个检查按钮，可以检测内核更新，要从官方渠道下载。」
+  //
+  // ⚠️ 这一组**只放行外壳自有页面**（设置页）——
+  //    它会往 userData 里写下载的包、并给出一条"装内核"的命令。
+  //
+  // ★★ 这里**故意没有「安装内核」这个通道**：装内核 = 往外壳此刻正在运行的
+  //    目录（全局 npm）里换代码，而 2026-09-19 那次事故正是"无人值守地升级内核"
+  //    （升级失败 → 回滚也失败 → 客户端完全起不来）。
+  //    所以本组能做到的最大程度是「检查 + 下载 + 按官方 sha512 校验 + 给你命令」，
+  //    **那条命令由用户自己在终端里执行**。
+  /** 查官方渠道上的内核最新版。只读，不写任何东西。 */
+  checkKernel: () => ipcRenderer.invoke("dsh:kernel:check"),
+  /** 下载官方内核包到 userData\kernel-update\。进度通过 onKernelProgress 推。 */
+  downloadKernel: (dist, version) => ipcRenderer.invoke(
+    "dsh:kernel:download", dist || null, version ? String(version) : null),
+  /** 给出那条**由你自己执行**的安装命令。返回 { ok, command, dir }。 */
+  kernelCommand: (file) => ipcRenderer.invoke("dsh:kernel:command", file ? String(file) : ""),
+  /** 在资源管理器里打开内核包下载目录。 */
+  openKernelDir: () => ipcRenderer.invoke("dsh:kernel:open-dir"),
+  /** 用系统浏览器打开官方 npm 页面（自己看版本历史时用）。 */
+  openKernelPage: () => ipcRenderer.invoke("dsh:kernel:open-page"),
+  /** 内核包下载进度：{ kind, got, total, percent } */
+  onKernelProgress: (cb) => subscribe("dsh:kernel:progress", cb),
 
   // ── 集成版插件（清单 src/plugin-catalog.js；装/卸 src/plugin-install.js）──
   //

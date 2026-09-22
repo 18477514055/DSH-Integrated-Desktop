@@ -41,6 +41,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 
 const K = require("./kernel");
+const KU = require("./kernel-update");
 const diagnostics = require("./diagnostics");
 const P = require("./plugins");
 const SITES = require("./sites");
@@ -513,13 +514,14 @@ function trayIconPath() {
   return fs.existsSync(p) ? p : iconPath();
 }
 
-// ── 页面注入（模型搜索框 + 页面切换把手）──────────────────────────
+// ── 页面注入（模型搜索框 + 页面切换把手 + 侧栏文件真打开）──────────
 //
-// 两份脚本都是「读一次就缓存 → 页面加载完成后 executeJavaScript」，失败只记日志：
+// 三份脚本都是「读一次就缓存 → 页面加载完成后 executeJavaScript」，失败只记日志：
 // 注入挂掉不该影响页面本身（最坏是少个功能，官方界面照常用）。
 const INJECT_FILES = {
   model: path.join(__dirname, "inject", "model-search.js"),
   pages: path.join(__dirname, "inject", "page-switch.js"),
+  files: path.join(__dirname, "inject", "sidebar-open.js"),
 };
 const injectSources = {};
 
@@ -556,6 +558,9 @@ function injectLocalUi() {
   if (NO_INJECT) log("已按 --no-inject 跳过模型搜索框注入");
   else injectInto("model", mainWindow.webContents, "模型搜索框");
   injectInto("pages", mainWindow.webContents, "页面切换把手");
+  // ★ 侧栏文件「真打开」只注入**本机内核界面**：两个外部站点没有这个通道
+  //   （主进程的 `assertLocalFileUi` 也不放行它们），注了也只是白画。
+  injectInto("files", mainWindow.webContents, "侧栏文件真打开");
 }
 
 // ── 快捷键（无菜单栏，替代原生菜单）──────────────────────────────
@@ -643,6 +648,106 @@ function assertPageSender(event) {
     throw new Error("拒绝：不是本应用的页面");
   }
   return true;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 「侧边栏文件树：真打开」（注入脚本 src/inject/sidebar-open.js）
+// ══════════════════════════════════════════════════════════════════
+//
+// 用户要的是：侧栏里点文件夹/文件，除了**在侧栏读它**（内核自带，一个字没改），
+// 还能**像在文件管理器里点它**——真用默认应用打开、真在资源管理器里选中。
+//
+// 这件事**只有外壳做得到**（网页拿不到 Electron 的 `shell`），所以走注入 + IPC。
+//
+// ⚠️ 三条边界，缺一条这功能就变成"从任意网页启动任意程序"：
+//   ① **来源**必须是**本机内核界面**那几个 frame —— 两个外部站点（chat / platform）
+//      用的是**同一个 preload**，所以 `window.dshShell.openWorkspaceFile` 在它们那儿
+//      也**存在**；光靠"有 preload"判来源会被第三方站点白拿这个通道。
+//   ② **路径**必须落在**已注册的工作区**里（读 `$DSH_HOME/storages/workspace.json`），
+//      而不是"渲染进程说是什么就是什么"。
+//   ③ 只认 `open` / `reveal` 两个动作，别的一律拒。
+
+/** 只有这两个动作存在，别的一律拒（边界靠"取值写死"）。 */
+const FILE_OPEN_ACTIONS = new Set(["open", "reveal"]);
+
+/**
+ * 来源判定：只有**主窗口正在显示的、本机内核界面**才能调。
+ *
+ * ★ 为什么不能用"有没有 preload"或者 `assertShellSender`：
+ *   · 两个外部站点视图**共用同一份 preload** ⇒ 通道在它们那里也存在；
+ *   · `assertShellSender` 只放行 `file://` 的外壳自有页面，而侧栏在
+ *     `http://127.0.0.1:<内核端口>` 的官方 UI 里 ⇒ 两个都不适用。
+ *   判据用"已提交的 URL 是不是本机内核的 origin"——渲染进程伪造不了
+ *   `event.senderFrame.url`，而且它天然等于"屏幕上现在是什么"。
+ */
+function assertLocalFileUi(event) {
+  if (!mainWindow || mainWindow.isDestroyed()) throw new Error("拒绝：窗口还没建好");
+  if (event.sender !== mainWindow.webContents) {
+    throw new Error("拒绝：只有本机内核界面能打开工作区文件");
+  }
+  let url = "";
+  try {
+    url = (event.senderFrame && event.senderFrame.url) || event.sender.getURL() || "";
+  } catch { /* 取不到就当不是 */ }
+  const base = serverUrl ? serverUrl.split("?")[0] : "";
+  if (!base || !url.startsWith(base)) {
+    throw new Error(`拒绝：当前页面不是本机内核界面（${url || "未知地址"}）`);
+  }
+  return true;
+}
+
+/**
+ * 本机**已注册的工作区**根目录清单。
+ *
+ * 权威来源是 `$DSH_HOME/storages/workspace.json` 的 `tables.workspaces.<id>.path`
+ * （见全局 AGENTS.md：注册表才是真值）。再并上设置里那个工作目录，作为兜底。
+ * 读不到就**只认设置里那个**——宁可少放行，不可多放行。
+ */
+function workspaceRoots() {
+  const out = [];
+  try {
+    const f = path.join(getDshHome(), "storages", "workspace.json");
+    let raw = fs.readFileSync(f, "utf8");
+    if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+    const j = JSON.parse(raw);
+    const ws = (j && j.tables && j.tables.workspaces) || {};
+    for (const id of Object.keys(ws)) {
+      const p = ws[id] && ws[id].path;
+      if (typeof p === "string" && p.trim()) out.push(p);
+    }
+  } catch (e) {
+    log("读工作区注册表失败（只认设置里那个工作目录）:", (e && e.message) || e);
+  }
+  if (settings && typeof settings.workspace === "string" && settings.workspace.trim()) {
+    out.push(settings.workspace);
+  }
+  return out;
+}
+
+/**
+ * 校验一个待打开的路径，返回**解析过符号联接的真实路径**。
+ *
+ * ★ `realpathSync` 是刻意的：本机 `plugin/` 下有 Junction 指到别的工作区
+ *   （见项目 AGENTS.md §7），解析完再判"在不在工作区里"，才不会漏判或误判。
+ *   解析后落在工作区之外的一律拒 —— **fail closed**。
+ */
+function guardWorkspaceFilePath(target) {
+  if (typeof target !== "string" || !target.trim()) throw new Error("拒绝：路径为空");
+  if (target.indexOf("\0") >= 0) throw new Error("拒绝：路径含空字符");
+  let real;
+  try {
+    real = fs.realpathSync(target);
+  } catch (e) {
+    throw new Error("这个文件不在了（可能已被移动或删除）");
+  }
+  const norm = (s) => path.resolve(s).replace(/[\\/]+$/, "").toLowerCase();
+  const mine = norm(real);
+  const hit = workspaceRoots()
+    .map(norm)
+    .filter((r) => r && r.length > 1)
+    .some((r) => mine === r || mine.startsWith(r + "\\") || mine.startsWith(r + "/"));
+  if (!hit) throw new Error("拒绝：这个路径不在任何已注册的工作区里");
+  return real;
 }
 
 // ── 内核生命周期 ──────────────────────────────────────────────────
@@ -1305,6 +1410,21 @@ function localInstallerDirs() {
  */
 let localInstallerFound = null;
 
+/**
+ * 上一次「检查内核更新」查到的那个官方 dist（tarball + 校验值）。
+ * ★ 同理：下载那一步只认**主进程自己查到的这个地址**，
+ *   渲染进程递进来的任意 URL 一律拒 —— 否则就成了"从任意地址下任意文件"的通道。
+ */
+let lastKernelDist = null;
+let lastKernelVersion = null;
+
+/** 内核包下载进度只推给外壳自有窗口（设置页）。 */
+function kernelUpdateEmit(payload) {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    try { settingsWindow.webContents.send("dsh:kernel:progress", payload); } catch { /* 忽略 */ }
+  }
+}
+
 /** 插件下载/安装进度只推给外壳自有窗口（设置页 / 首启向导）。 */
 function pluginsEmit(payload) {
   for (const w of [mainWindow, settingsWindow]) {
@@ -1669,6 +1789,46 @@ function registerIpc() {
     return { ok: true };
   });
 
+  // ── 侧边栏文件树：真打开（注入脚本 src/inject/sidebar-open.js）──
+  //
+  // 三个动作各自都有边界（详见 `assertLocalFileUi` / `guardWorkspaceFilePath`）：
+  //   来源 = 本机内核界面；路径 = 必须在已注册工作区里；动作 = open|reveal 之一。
+  // ★ 一律用 Electron 的 `shell`，**不拼命令行**：路径里带空格、中文、`&` 都安全。
+  // ★ 三个动作都**只读**：不写文件、不删文件、不改任何东西。
+  ipcMain.handle("dsh:file:open-workspace", async (e, target, action) => {
+    assertLocalFileUi(e);
+    const act = FILE_OPEN_ACTIONS.has(String(action)) ? String(action) : "open";
+    let real;
+    try {
+      real = guardWorkspaceFilePath(target);
+    } catch (err) {
+      const reason = (err && err.message) || String(err);
+      log(`侧栏打开被拒：${reason}`);
+      return { ok: false, reason };
+    }
+    try {
+      if (act === "reveal") {
+        // 在资源管理器里**选中**它（不是只打开上级目录）。
+        // ★ 与内核 `revealNativePath` 同一口径：Explorer 收下请求后常常返回非 0
+        //   退出码，那**不代表失败**（请求已经交出去了），所以这里用它、
+        //   并且不把返回值当判据。
+        shell.showItemInFolder(real);
+      } else {
+        const err = await shell.openPath(real);
+        if (err) {
+          log(`用默认应用打开失败：${err}（${real}）`);
+          return { ok: false, reason: err };
+        }
+      }
+      log(`侧栏${act === "reveal" ? "在资源管理器中显示" : "用默认应用打开"}：${real}`);
+      return { ok: true, path: real, action: act };
+    } catch (err) {
+      const reason = (err && err.message) || String(err);
+      log(`侧栏打开异常：${reason}`);
+      return { ok: false, reason };
+    }
+  });
+
   // ── 检查更新（实现全在 src/update.js；这里只做来源判定与转发）──
   // 这三条会下载文件、启动安装包 ⇒ 只放行**外壳自有页面**（也就是设置页）。
   ipcMain.handle("dsh:update:check", async (e) => {
@@ -1718,6 +1878,65 @@ function registerIpc() {
   ipcMain.handle("dsh:update:open-page", (e) => {
     assertShellSender(e);
     return U.openReleasesPage();
+  });
+
+  // ── 检查内核更新（实现全在 src/kernel-update.js）────────────────────
+  //
+  // 用户要求：「加一个检查按钮，可以检测内核更新，要从官方渠道下载。」
+  //
+  // ★ 只放行**外壳自有页面**（设置页）：这几条会给用户一条"装内核"的命令、
+  //   并往 userData 里写下载的包 ⇒ 官方 UI 与两个外部站点一律不许碰。
+  // ★ **这里没有「安装内核」这个通道** —— 装内核是往外壳此刻正在运行的目录里
+  //   换代码（2026-09-19 那次事故就是这么来的），所以命令交给用户自己执行。
+  //   本模块能做到的最大程度是「下载 + 按官方 sha512 校验 + 给命令」。
+  ipcMain.handle("dsh:kernel:check", async (e) => {
+    assertShellSender(e);
+    log("检查内核更新…（官方渠道 = npm registry）");
+    const r = await KU.check();
+    // ★ 记下**主进程自己查到的**那个 dist 与版本号 —— 下载那一步只认它
+    lastKernelDist = (r && r.ok && r.dist) ? r.dist : null;
+    lastKernelVersion = (r && r.ok && r.latest) ? r.latest : null;
+    log(`检查内核更新：ok=${r.ok} 本机=${(r.installed && r.installed.version) || "-"}`
+      + `（${(r.installed && r.installed.source) || "-"}） 官方最新=${r.latest || "-"}`
+      + ` 有更新=${r.hasUpdate} ${r.reason || ""}`);
+    return r;
+  });
+
+  ipcMain.handle("dsh:kernel:download", async (e, dist, version) => {
+    assertShellSender(e);
+    // ★ 只接受"主进程上一次检查拿到的那个 dist" —— 不接受渲染进程递来的任意 URL，
+    //   否则这个通道就成了"从任意地址下载任意文件"。比对 tarball 地址即可。
+    const d = dist && typeof dist === "object" ? dist : null;
+    if (!d || !d.tarball) return { ok: false, reason: "没有可下载的地址" };
+    if (!lastKernelDist || d.tarball !== lastKernelDist.tarball) {
+      return { ok: false, reason: "拒绝：这个下载地址不是「检查内核更新」查到的那一个" };
+    }
+    log(`开始下载内核包：${d.tarball}`);
+    const r = await KU.download(lastKernelDist, String(version || lastKernelVersion || ""),
+      (p) => kernelUpdateEmit({ kind: "progress", ...p }));
+    log(`下载内核包结果：ok=${r.ok} ${r.reason || r.path}`
+      + `${r.verified ? ` 校验=${r.verified}` : ""}`);
+    return r;
+  });
+
+  /** 那条安装命令（**给用户自己执行**，不是替用户执行）。 */
+  ipcMain.handle("dsh:kernel:command", (e, file) => {
+    assertShellSender(e);
+    // ★ 只认**我们自己下载目录里**的文件；递别的路径进来只当没给
+    const f = typeof file === "string" && file ? file : "";
+    const dir = path.resolve(KU.downloadDir()).toLowerCase();
+    const inside = !!f && path.resolve(f).toLowerCase().startsWith(dir + path.sep);
+    return { ok: true, command: KU.installHint(inside ? f : ""), dir: KU.downloadDir() };
+  });
+
+  ipcMain.handle("dsh:kernel:open-dir", async (e) => {
+    assertShellSender(e);
+    return KU.openDownloadDir();
+  });
+
+  ipcMain.handle("dsh:kernel:open-page", (e) => {
+    assertShellSender(e);
+    return KU.openOfficialPage();
   });
 
   // ── 集成版插件（清单 src/plugin-catalog.js；装/卸 src/plugin-install.js）──

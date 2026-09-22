@@ -216,6 +216,69 @@
           </details>
         </div>
       </div>
+
+      <!-- ── 内核（另一回事，单独一节）───────────────────────────────
+           用户原话：「加一个检查按钮，可以检测内核更新，要从官方渠道下载。」
+           ★ 与上面「外壳更新」刻意分开：升外壳是换我们自己那个 exe；
+             升内核是换 %APPDATA%\npm 里的 @deepseek-ai/dsh。
+             两件事互不影响 —— 这正是本版要证明的（见下面那三条）。 -->
+      <h3 style="margin:26px 0 6px;font-size:14px">内核</h3>
+      <p class="hint">
+        内核是官方的 <span class="mono">@deepseek-ai/dsh</span>，由<b>外部独立安装</b>，
+        外壳只管把它拉起来。所以<b>升内核不会动到外壳</b>，升外壳也不会动到内核。
+        这里查的是<b>官方渠道</b>（npm registry）。
+      </p>
+
+      <div class="row">
+        <div class="k">本机内核</div>
+        <div class="v" style="flex-direction:column;align-items:flex-start;gap:4px">
+          <span><b class="mono" id="kn-current">—</b> <span class="note" id="kn-source"></span></span>
+          <span class="mono" id="kn-dir"
+                style="font-size:11.5px;color:var(--fg-faint);word-break:break-all"></span>
+        </div>
+      </div>
+      <div class="row">
+        <div class="k">检查内核更新</div>
+        <div class="v">
+          <button class="btn" id="btn-kn-check">检查内核更新</button>
+          <button class="btn" id="btn-kn-page">官方页面</button>
+          <span class="note" id="kn-status">还没检查</span>
+        </div>
+      </div>
+
+      <div class="row" id="kn-row-new" style="display:none">
+        <div class="k">官方最新</div>
+        <div class="v" style="flex-direction:column;align-items:stretch;gap:8px">
+          <div><b id="kn-latest"></b> <span class="note" id="kn-meta"></span></div>
+          <div id="kn-bar" style="display:none;height:8px;background:var(--line-soft);border-radius:6px;overflow:hidden">
+            <i id="kn-fill" style="display:block;height:100%;width:0;background:var(--accent);transition:width .15s"></i>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button class="btn" id="btn-kn-go">下载官方内核包</button>
+            <button class="btn" id="btn-kn-dir">打开下载目录</button>
+            <span class="note" id="kn-prog"></span>
+          </div>
+          <div id="kn-cmd-box" style="display:none">
+            <div class="note" style="margin:8px 0 4px">
+              装内核这一步<b>交给你自己执行</b>（在你自己的终端里，看得见每一步）：
+            </div>
+            <pre id="kn-cmd"
+                 style="white-space:pre-wrap;font-size:11.5px;background:var(--line-soft);padding:8px;border-radius:6px;margin:0"></pre>
+            <div style="display:flex;gap:8px;margin-top:6px">
+              <button class="btn" id="btn-kn-copy">复制命令</button>
+              <span class="note" id="kn-copy-note"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="note" style="margin-top:10px;line-height:1.7">
+        <b>为什么升级内核不会跟外壳冲突</b>（三条都能自己查）：
+        <br>① 安装包里<b>没有内核</b> —— 只有外壳自己的 <span class="mono">src/</span>，升外壳不会碰到内核；
+        <br>② 外壳<b>只</b>把内核当外部程序拉起来（读它的启动地址），不引用它任何内部模块；
+        <br>③ 内核启动时会重建 <span class="mono">profiles\node_modules</span> 这一层，
+        而我们的插件落在 <span class="mono">profiles\&lt;档案&gt;\node_modules</span>，是<b>另一层</b>，碰不到。
+      </div>
     </section>
 
     <!-- ── 首次安装向导 ───────────────────────────────────────

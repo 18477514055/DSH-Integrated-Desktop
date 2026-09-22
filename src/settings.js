@@ -248,6 +248,128 @@
     if (pendingPane) { const p = pendingPane; pendingPane = null; paneHandler(p); }
   }
 
+  // ── 检查内核更新（实现全在 src/kernel-update.js）────────────────────
+  //
+  // 用户原话：「加一个检查按钮，可以检测内核更新，要从官方渠道下载。」
+  //
+  // ★ 与上面「外壳更新」是**两件不同的事**：升外壳 = 换我们自己那个 exe；
+  //   升内核 = 换 %APPDATA%\npm 里的 @deepseek-ai/dsh。两件互不影响。
+  // ★★ 这里**没有**「安装内核」按钮，是刻意的：装内核 = 往外壳此刻正在运行的
+  //    目录里换代码，而 2026-09-19 那次事故正是"无人值守地升级内核"
+  //    （升级失败 → 回滚也失败 → 客户端完全起不来）。
+  //    所以流程到「下载 + 按官方 sha512 校验 + 给你命令」为止；
+  //    **那条命令由用户自己在终端里敲**。
+  let lastKernel = null;
+
+  const knStatus = (t) => { $("kn-status").textContent = t; };
+  const knProg = (t) => { $("kn-prog").textContent = t; };
+
+  function renderKernelInstalled(k) {
+    $("kn-current").textContent = (k && k.found) ? `v${k.version}` : "找不到内核";
+    $("kn-source").textContent = (k && k.found) ? `（来自：${k.source}）` : "";
+    $("kn-dir").textContent = (k && k.dir) || "";
+  }
+
+  async function doKernelCheck() {
+    knStatus("正在查官方渠道（npm registry）…");
+    $("btn-kn-check").disabled = true;
+    try {
+      const r = await S.checkKernel();
+      lastKernel = r;
+      renderKernelInstalled(r && r.installed);
+      if (!r || !r.ok) {
+        knStatus(`检查失败：${(r && r.reason) || "未知原因"}`);
+        $("kn-row-new").style.display = "none";
+        return;
+      }
+      const cur = r.installed && r.installed.version;
+      $("kn-latest").textContent = `v${r.latest}`;
+      $("kn-meta").textContent = r.dist && r.dist.unpackedSize
+        ? `官方包 ${(r.dist.unpackedSize / 1024 / 1024).toFixed(1)} MB（解压后）`
+        : "官方包";
+      if (r.hasUpdate === null) {
+        // 本机内核都找不到 ⇒ **不能**断言"有更新"，说清楚
+        knStatus(`官方最新是 v${r.latest}，但本机没找到内核，没法比 · 下面可以直接下载`);
+        $("kn-row-new").style.display = "";
+        return;
+      }
+      if (!r.hasUpdate) {
+        knStatus(`已是最新（v${cur}）`);
+        $("kn-row-new").style.display = "none";
+        return;
+      }
+      knStatus(`发现新内核 v${r.latest}（本机 v${cur}）`);
+      $("kn-row-new").style.display = "";
+    } catch (e) {
+      knStatus(`检查出错：${(e && e.message) || e}`);
+    } finally {
+      $("btn-kn-check").disabled = false;
+    }
+  }
+
+  async function doKernelDownload() {
+    const r = lastKernel;
+    if (!r || !r.ok || !r.dist) return;
+    $("btn-kn-go").disabled = true;
+    $("kn-bar").style.display = "";
+    knStatus(`正在下载官方内核包 v${r.latest}…`);
+    try {
+      const d = await S.downloadKernel(r.dist, r.latest);
+      if (!d || !d.ok) {
+        knStatus(`下载失败：${(d && d.reason) || "未知"}`);
+        $("btn-kn-go").disabled = false;
+        return;
+      }
+      const mb = d.bytes ? `${(d.bytes / 1024 / 1024).toFixed(1)} MB` : "";
+      knStatus(d.reused
+        ? `本地已有这个包且校验通过（${mb}）—— 下面是安装命令`
+        : `下载完成并通过官方校验（${mb}）—— 下面是安装命令`);
+      knProg.textContent = "";
+      // 拿那条"由你自己执行"的命令
+      const c = await S.kernelCommand(d.path);
+      if (c && c.ok && c.command) {
+        $("kn-cmd").textContent = c.command;
+        $("kn-cmd-box").style.display = "";
+      }
+    } catch (e) {
+      knStatus(`出错：${(e && e.message) || e}`);
+      $("btn-kn-go").disabled = false;
+    }
+  }
+
+  async function doKernelCopy() {
+    const txt = $("kn-cmd").textContent || "";
+    if (!txt) return;
+    try {
+      await navigator.clipboard.writeText(txt);
+      $("kn-copy-note").textContent = "已复制。粘进你自己的终端执行即可。";
+    } catch (e) {
+      $("kn-copy-note").textContent = "复制失败，请手动选中上面的命令";
+    }
+  }
+
+  function wireKernelUpdate() {
+    const k = env && env.kernelVersion
+      ? { found: true, version: env.kernelVersion, source: env.kernelSource, dir: env.kernelDir }
+      : { found: false };
+    renderKernelInstalled(k);
+
+    $("btn-kn-check").addEventListener("click", doKernelCheck);
+    $("btn-kn-go").addEventListener("click", doKernelDownload);
+    $("btn-kn-dir").addEventListener("click", () => S.openKernelDir().catch(() => { }));
+    $("btn-kn-page").addEventListener("click", () => S.openKernelPage().catch(() => { }));
+    $("btn-kn-copy").addEventListener("click", doKernelCopy);
+
+    S.onKernelProgress((p) => {
+      if (!p) return;
+      const pct = Math.max(0, Math.min(100, p.percent || 0));
+      $("kn-fill").style.width = `${pct}%`;
+      knProg.textContent = p.total
+        ? `${fmtBytes(p.got)} / ${fmtBytes(p.total)}（${pct}%）`
+        : fmtBytes(p.got);
+    });
+  }
+
   // ── 集成版插件（清单在主进程 src/plugin-catalog.js；装/卸在 src/plugin-install.js）──
   //
   // 用户原话：「想用的时候打开清单，然后点击检查更新，就可以查到我最新推出来的集成版插件。」
@@ -971,6 +1093,7 @@
 
     wire();
     wireUpdate();
+    wireKernelUpdate();
     wirePlugins();
     wireWizard();
     wirePack();

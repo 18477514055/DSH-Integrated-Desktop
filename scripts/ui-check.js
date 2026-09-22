@@ -34,6 +34,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const zlib = require("node:zlib");
 const { spawn } = require("node:child_process");
 
 const ROOT = path.join(__dirname, "..");
@@ -77,9 +78,89 @@ function cdpEval(wsUrl, expression, timeoutMs = 25000) {
   });
 }
 
+/**
+ * 发一条**任意** CDP 命令（cdpEval 只发 Runtime.evaluate；输入事件要用这个）。
+ * ★ 悬停/点击这类判据**必须用真指针事件**（`Input.dispatchMouseEvent`）：
+ *   `el.click()` 不产生 mouseover，验不出"鼠标移上去才出现"这种东西。
+ */
+function cdpSend(wsUrl, method, params, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    const timer = setTimeout(() => { try { ws.close(); } catch { } reject(new Error(`CDP ${method} 超时`)); }, timeoutMs);
+    ws.onerror = (e) => { clearTimeout(timer); reject(new Error("WebSocket 错误: " + ((e && e.message) || "unknown"))); };
+    ws.onopen = () => ws.send(JSON.stringify({ id: 1, method, params }));
+    ws.onmessage = (ev) => {
+      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.id !== 1) return;
+      clearTimeout(timer);
+      try { ws.close(); } catch { }
+      if (msg.error) return reject(new Error(`${method}: ${JSON.stringify(msg.error).slice(0, 200)}`));
+      resolve(msg.result);
+    };
+  });
+}
+
+/** 把真实指针移到某点（不按下）。 */
+async function realMove(wsUrl, x, y) {
+  await cdpSend(wsUrl, "Input.dispatchMouseEvent",
+    { type: "mouseMoved", x: Math.round(x), y: Math.round(y), button: "none", clickCount: 0 });
+}
+
+/** 在某个点上做一次**真实**左键点击（移动 → 按下 → 抬起）。 */
+async function realClick(wsUrl, x, y) {
+  const cx = Math.round(x), cy = Math.round(y);
+  await realMove(wsUrl, cx, cy);
+  await cdpSend(wsUrl, "Input.dispatchMouseEvent",
+    { type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1 });
+  await cdpSend(wsUrl, "Input.dispatchMouseEvent",
+    { type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1 });
+}
+
+/**
+ * 关掉**本脚本自己打开**的资源管理器窗口。
+ *
+ * ★ 为什么必须有这一步（2026-09-23 实测）：`files` 模式真的调
+ *   `shell.showItemInFolder()` / `shell.openPath()` —— 那是**真的会在用户桌面上
+ *   弹出窗口**的。连跑 4 次 + 前面的调试，用户桌面上堆了 **21 个**资源管理器窗口
+ *   （全是 `%TEMP%\dsh-uicheck-*\ws`）。
+ *   验收要真跑，但**不许把垃圾留在用户桌面上**。
+ *
+ * 只关"位置落在本脚本临时目录里"的那些 —— 用户自己的窗口一个都不动。
+ * 用 PowerShell 的 `Shell.Application` COM（Node 这边没有现成的窗口枚举）。
+ * 失败**只打日志**，绝不影响判据。
+ */
+function closeStrayExplorerWindows(tmpDir) {
+  const ps = [
+    "$ErrorActionPreference='SilentlyContinue'",
+    "$sh = New-Object -ComObject Shell.Application",
+    `$pat = [regex]::Escape(${JSON.stringify(path.basename(tmpDir))})`,
+    "$n = $sh.Windows().Count",
+    "$closed = 0",
+    "for($i = $n - 1; $i -ge 0; $i--){",
+    "  $w = $sh.Windows().Item($i)",
+    "  if($w.LocationURL -match $pat){ try { $w.Quit(); $closed++ } catch { } }",
+    "}",
+    "Write-Output $closed",
+  ].join("\n");
+  const r = spawnSyncPowerShell(ps);
+  return r;
+}
+
+/** 跑一小段 PowerShell（5.1），拿它的 stdout；失败返回 null。 */
+function spawnSyncPowerShell(script) {
+  try {
+    const r = require("node:child_process").spawnSync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+      { encoding: "utf8", timeout: 20000, windowsHide: true },
+    );
+    if (r.status !== 0 && !r.stdout) return null;
+    return (r.stdout || "").trim();
+  } catch { return null; }
+}
+
 /** 等一个满足条件的 page 目标出现。 */
-async function waitForPage(match, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
+async function waitForPage(match, timeoutMs) {  const deadline = Date.now() + timeoutMs;
   let last = [];
   while (Date.now() < deadline) {
     try {
@@ -93,6 +174,34 @@ async function waitForPage(match, timeoutMs) {
 }
 
 // ── 起应用 ────────────────────────────────────────────────────────
+/**
+ * 会话目录名：内核把会话日志按 **cwd** 分目录，目录名是 cwd 的一种转义。
+ *
+ * ★ 这个转义是**实测反推并逐条核对**过的（不是猜的）：
+ *   `:` 丢掉、`\` 与 `/` 变 `-`、ASCII 原样、非 ASCII 写成 `~` + 4 位大写十六进制，
+ *   整体前后包 `--`。三个真目录全部对上：
+ *     `C:\Users\24239\Desktop\DeepSeek-Workspace` → `--C-Users-24239-Desktop-DeepSeek-Workspace--`
+ *     `D:\deepseek-workspace`                     → `--D-deepseek-workspace--`
+ *     `D:\DSH工作区002`                            → `--D-DSH~5DE5~4F5C~533A002--`
+ *   （中文那三个字 工=5DE5 作=4F5C 区=533A ⇒ 是 UTF-16 码元的十六进制，不是 UTF-8。）
+ *   ⚠️ 这里**只用来往临时家里种夹具**；真实会话的定位永远由内核自己算。
+ * @param {string} p 绝对路径
+ * @returns {string} 会话目录名
+ */
+function sessionDirName(p) {
+  let s = "";
+  for (const ch of p) {
+    const c = ch.codePointAt(0);
+    if (ch === ":") continue;
+    if (ch === "\\" || ch === "/") { s += "-"; continue; }
+    if (c < 128) { s += ch; continue; }
+    for (let i = 0; i < ch.length; i++) {
+      s += "~" + ch.charCodeAt(i).toString(16).toUpperCase().padStart(4, "0") + "~";
+    }
+  }
+  return "--" + s + "--";
+}
+
 function launch(_mode, tmpDir, port, opts = {}) {
   fs.writeFileSync(path.join(tmpDir, "settings.json"), JSON.stringify({
     closeToTray: false,
@@ -116,6 +225,67 @@ function launch(_mode, tmpDir, port, opts = {}) {
     } else {
       console.log(`  ⚠ 找不到 ${src}，没有种工作区`);
     }
+  }
+
+  // ★ files 模式专用：**自己造**一个工作区 + 一个真会话 + 几个真文件。
+  //   为什么不能像别的模式那样照抄真实注册表：侧栏文件树的根是**会话的 cwd**，
+  //   而真实注册表指的是真实工作区（`D:\deepseek-workspace` 等）——
+  //   那份目录太大、内容随时会变，判据会锁在"恰好那里有什么"上。
+  //   自己种一个小工作区，判据就只依赖**本次改动**。
+  //   （项目 AGENTS.md §5：判据要锁"本次改动的效果"。）
+  let filesRoot = null;
+  if (opts.filesFixture) {
+    filesRoot = path.join(tmpDir, "ws");
+    fs.mkdirSync(path.join(filesRoot, "sub"), { recursive: true });
+    fs.writeFileSync(path.join(filesRoot, "note.txt"), "hello from ui-check\n", "utf8");
+    fs.writeFileSync(path.join(filesRoot, "readme.md"), "# ui-check fixture\n", "utf8");
+    fs.writeFileSync(path.join(filesRoot, "sub", "deep.txt"), "deep\n", "utf8");
+
+    const home = path.join(tmpDir, "dsh-home");
+    fs.mkdirSync(path.join(home, "storages"), { recursive: true });
+    const sid = "session-00000000-1111-2222-3333-444444444444";
+    const wid = "ffffffff-1111-2222-3333-444444444444";
+    fs.writeFileSync(path.join(home, "storages", "workspace.json"), JSON.stringify({
+      unit: { name: "workspace", version: 2 },
+      global: { initialized: true, workspaceIds: [wid], archivedSessionIds: [] },
+      tables: {
+        workspaces: {
+          [wid]: {
+            path: filesRoot, title: "ui-check-ws", sessionIds: [sid],
+            createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+          },
+        },
+      },
+    }, null, 2), "utf8");
+
+    const sdir = path.join(home, "sessions", sessionDirName(filesRoot), sid);
+    fs.mkdirSync(sdir, { recursive: true });
+    const header = JSON.stringify({
+      type: "session", version: 3, id: sid, createdAt: Date.now(),
+      cwd: filesRoot, isSeeded: false, delegationDepth: 0, agentPreset: "standard",
+    }) + "\n";
+    fs.writeFileSync(path.join(sdir, "session.v3.jsonl.zstd"),
+      zlib.zstdCompressSync(Buffer.from(header, "utf8")));
+
+    // ★ 全新家里官方那个「内测声明」对话框（`position:fixed; z-index:1000` 的遮罩盖满整屏）
+    //   会把整个界面挡住 —— 确认状态**持久化在 `DSH_HOME/settings.yaml`** 的
+    //   `ui-onboarding.welcomeNoticeVersion`（真家里就有这一节，值 2026-08-13.1）。
+    //   先按"已确认"种进去，脚本才能看到真实用户看到的那一屏。
+    fs.writeFileSync(path.join(home, "settings.yaml"),
+      "ui-onboarding:\n  welcomeNoticeVersion: 2026-08-13.1\n", "utf8");
+
+    // ★★ 还要种一份**假凭据**，否则官方那个「添加一个 API Key 开始使用」引导框
+    //    会**反复弹回来**（实测：连点 16 次「稍后配置」它都还在）。
+    //    为什么它会弹：`onboardingReadiness()`（ui-settings-models 的源码）在
+    //    **一个可用 provider 都没有**时，才会走到 `credential-missing` 并弹这个框；
+    //    只要有一个 provider 能说话，它就是 `provider-ready` ⇒ 这一步直接结束。
+    //    空夹具里当然一个可用 provider 都没有 —— 那是**测试环境的假象**，
+    //    真实用户的家里至少有官方通道。
+    //    ⚠️ 这里放的是**假值**（`ui-check-dummy-not-a-real-key`），
+    //       只为让"这个 provider 可用"成立；不读、不打印、不复制任何真实密钥。
+    fs.writeFileSync(path.join(home, ".credentials.yaml"),
+      "version: 1\nrefs:\n  DEEPSEEK_API_KEY: ui-check-dummy-not-a-real-key\n", "utf8");
+    console.log(`  已造一个自足的工作区夹具: ${filesRoot}（1 个子目录 + 3 个文件 + 1 个真会话）`);
   }
 
   const electronExe = path.join(ROOT, "node_modules", "electron", "dist",
@@ -1284,6 +1454,80 @@ async function verifyPlugins(tmpDir) {
     const card2 = after2.cards.find((c) => c.name === pick.name);
     check("★ 卡片状态跟着变成「已装」",
       !!(card2 && card2.tags.includes("已装")), card2 ? JSON.stringify(card2.tags) : "卡片不见了");
+
+    // ══════════════════════════════════════════════════════════════
+    // ⑧ 「检查内核更新」（0.2.9）：真点那个按钮，看它真的做事
+    // ══════════════════════════════════════════════════════════════
+    //
+    // 用户原话：「加一个检查按钮，可以检测内核更新，要从官方渠道下载。」
+    //
+    // ★ 判据不许只看"页面上有个按钮"（项目铁律：DOM 里有按钮 ≠ 点了有用）。
+    //   这一段的硬判据是：**真点** → 文案从「还没检查」变成**带版本号**的结论
+    //   → 且主进程 shell.log 里留下那一行（互不相关的第二份证据）。
+    // ★ 它要联网（查 npm registry）。连不上时**明确标 SKIP**，不当成通过。
+    const knNav = await cdpEval(ws, `(() => {
+      const b = document.querySelector('nav button[data-pane="update"]');
+      if (!b) return 'no-nav';
+      b.click();
+      const p = document.querySelector('.pane[data-pane="update"]');
+      return JSON.stringify({
+        paneOn: p ? p.classList.contains('on') : false,
+        hasCheckBtn: !!document.getElementById('btn-kn-check'),
+        hasCurrent: !!document.getElementById('kn-current'),
+      });
+    })()`, 20000);
+    const knv = JSON.parse(knNav);
+    check("「更新」栏里有内核那一段（按钮 + 本机版本位都在）",
+      knv.paneOn && knv.hasCheckBtn && knv.hasCurrent, knNav);
+
+    // 本机内核版本应该**开机就显示出来**（来自 dsh:env，不用点检查）
+    const knInit = JSON.parse(await cdpEval(ws, `JSON.stringify({
+      current: (document.getElementById('kn-current')||{}).textContent||'',
+      dir: (document.getElementById('kn-dir')||{}).textContent||'',
+      status: (document.getElementById('kn-status')||{}).textContent||'',
+    })`, 20000));
+    console.log(`  内核栏初始: current="${knInit.current}" dir="${knInit.dir}" status="${knInit.status}"`);
+    check("★ 本机内核版本**开机就显示**（不用点检查就有，来自 dsh:env）",
+      /v\d/.test(knInit.current), `current="${knInit.current}"`);
+    check("★ 它说的是**这个客户端正在用的**那一个内核的路径",
+      knInit.dir.includes("dsh"), knInit.dir.slice(0, 90));
+
+    // 真点「检查内核更新」
+    await cdpEval(ws, `(() => { const b=document.getElementById('btn-kn-check'); if(b) b.click(); return 1; })()`, 20000);
+    let kn = null;
+    for (let i = 0; i < 30; i++) {
+      await sleep(1000);
+      kn = JSON.parse(await cdpEval(ws, `JSON.stringify({
+        status: (document.getElementById('kn-status')||{}).textContent||'',
+        latest: (document.getElementById('kn-latest')||{}).textContent||'',
+        rowShown: (() => { const r=document.getElementById('kn-row-new'); return !!r && r.style.display !== 'none'; })(),
+        disabled: !!(document.getElementById('btn-kn-check')||{}).disabled,
+      })`, 20000));
+      // 出现"带版本号"的结论就算有结果了
+      if (/v\d/.test(kn.status) && !kn.disabled) break;
+    }
+    console.log(`  点「检查内核更新」后: status="${kn && kn.status}" latest="${kn && kn.latest}"`);
+    if (kn && /失败/.test(kn.status) && /连不上|HTTP|超时/.test(kn.status)) {
+      console.log("  SKIP  官方渠道此刻连不上（这一条没验到，**不算通过**）");
+    } else {
+      check("★★ 真点之后给出了**带版本号**的结论（不是停在「正在查」）",
+        /v\d/.test(kn.status), `status="${kn.status}"`);
+      check("★ 结论里说清了官方最新版是多少", /v\d/.test(kn.latest), `latest="${kn.latest}"`);
+      check("★ 检查完按钮**恢复可用**（不是永久卡在 disabled）", kn.disabled === false, String(kn.disabled));
+    }
+
+    const knLog = readAppLog(tmpDir, 900).filter((l) => /检查内核更新：/.test(l));
+    check("★★ 主进程日志里留下了这次检查（与页面自述**互相独立**的第二份证据）",
+      knLog.length >= 1, knLog.slice(-1)[0] || "没找到");
+    if (knLog.length) console.log(`  ${knLog.slice(-1)[0]}`);
+
+    // ★ 安全边界：内核那几条通道**只放行外壳自有页面**。
+    //   从官方 UI（http://127.0.0.1）那一侧调必须被拒 —— 否则任何被注入的页面
+    //   都能让外壳去下载任意东西。用主界面那个 webContents 试一次。
+    const denied = String(await cdpEval(mainUrl,
+      `window.dshShell.checkKernel().then(() => 'ALLOWED').catch(e => 'DENIED: ' + (e && e.message || e))`, 20000));
+    check("★★ 从**官方 UI 页面**调内核检查通道被拒（边界没漏）",
+      /DENIED/.test(denied), denied.slice(0, 120));
   } finally {
     await stopApp(child);
   }
@@ -1598,14 +1842,342 @@ async function verifyFirstRun(tmpDir) {
   }
 }
 
+// ── 模式七：侧边栏文件树「真打开」（注入脚本 src/inject/sidebar-open.js）──
+//
+// 用户原话（2026-09-23）：
+//   「点击这个动作，有两个功能，一个功能是打开，然后读它，另外一个功能就是，
+//     相当于在文件管理器中点击他的能力。」
+// ⇒ 单击照旧**在侧栏里读它**（内核自带，一个字没改）；
+//   本模式验的是**第二件事**：真用默认应用打开 / 真在资源管理器里选中。
+//
+// ══════════════════════════════════════════════════════════════════
+// 判据为什么必须是这些（每一条都对应一个会"假 PASS"的写法）
+// ══════════════════════════════════════════════════════════════════
+//   · **真鼠标事件**（`Input.dispatchMouseEvent`），不是 `el.click()`：
+//     悬停这件事只有真指针移动才算数。
+//   · **真点那个图标**，然后回读**注入脚本自己的状态**（`calls` / `last`）
+//     ＋ **主进程的 shell.log** —— 两处都对上才算通。
+//     只看"页面里有个按钮"就是项目铁律里那种"文件存在 ≠ 能用"的假 PASS。
+//   · **越界必须被拒**：直接从页面里调通道，拿三个越界路径打一遍，
+//     并要求主进程日志里留下「拒绝」。
+//   · 位置判据用 `elementFromPoint`：被裁掉 / 被盖住的图标，矩形照样正常。
+async function verifyFiles(tmpDir) {
+  const PORT = 3181;                 // 不与 pages 3178 / plugins 3179 / firstrun 3180 撞
+  const work = path.join(tmpDir, "ws");
+  const { child } = launch("files", tmpDir, PORT, { filesFixture: true });
+  const logFile = path.join(tmpDir, "shell.log");
+
+  try {
+    const target = await waitForPage((t) => t.url.startsWith(`http://127.0.0.1:${PORT}/`), 120000);
+    const ws = target.webSocketDebuggerUrl;
+    console.log(`  已连上官方界面: ${target.url.split("?")[0]}`);
+    await sleep(9000);
+
+    // ① 全新家会弹官方的「内测声明」/「添加一个 API Key」遮罩（`position:fixed; z-index:1000`，
+    //    盖满整屏）。它挡着的话下面每一条都会莫名其妙地失败 —— 先按真实用户的做法关掉。
+    //    （内测声明那条已经在 launch 里种成"已确认"了；这里处理 API Key 那个。）
+    //
+    // ★★ 必须用**真点击**：实测 `el.click()` 能触发 React 的处理函数，
+    //    但那个对话框**不会真的关掉**（遮罩仍在，后面每一条判据都会假 FAIL）。
+    // ★★ 也**不能只看一次**：这些弹窗是异步来的，第一次看时它可能还没渲染出来。
+    //    第一版就是这样假 PASS 的（第一次 root 为 null ⇒ 判"已关"，随后弹窗才出现、
+    //    把整屏盖住，后面每一条判据全线 FAIL）。所以要求**连续几轮都不在**才算真关掉。
+    let calm = 0;
+    for (let i = 0; i < 16 && calm < 3; i++) {
+      const modal = JSON.parse(await cdpEval(ws, `(() => {
+        const root = document.querySelector('div[class*="_root_w1urq"]');
+        if (!root) return JSON.stringify({ gone: true });
+        const b = Array.from(root.querySelectorAll('button'))
+          .find(x => /稍后配置|继续/.test((x.textContent || '')));
+        if (!b) return JSON.stringify({ gone: false, stubborn: (root.querySelector('h2') || {}).textContent || '' });
+        const r = b.getBoundingClientRect();
+        return JSON.stringify({ gone: false, x: r.left + r.width / 2, y: r.top + r.height / 2,
+          label: (b.textContent || '').trim(), title: (root.querySelector('h2') || {}).textContent || '' });
+      })()`).catch(() => ({ gone: false })));
+      if (modal.gone) { calm += 1; await sleep(900); continue; }
+      calm = 0;
+      if (modal.x === undefined) {
+        console.log(`  ⚠ 弹窗「${modal.stubborn}」没有可点的按钮，关不掉`);
+        await sleep(900);
+        continue;
+      }
+      console.log(`  关官方弹窗「${modal.title}」→ 点「${modal.label}」`);
+      await realClick(ws, modal.x, modal.y);
+      await sleep(1800);
+    }
+    const maskGone = await cdpEval(ws, `!document.querySelector('div[class*="_root_w1urq"]')`).catch(() => false);
+    check("官方首屏遮罩已关掉（否则后面每条都会被它挡住）", maskGone === true, String(maskGone));
+    await sleep(1200);
+
+    // ② 打开那个真会话（会话列表是异步来的 ⇒ 轮询等，别睡固定秒数）
+    let opened = null;
+    for (let i = 0; i < 30; i++) {
+      const raw = await cdpEval(ws, `(() => {
+        const b = document.querySelector('button[aria-label^="会话"]');
+        const it = b && (b.closest('div[role="treeitem"]') || b.parentElement);
+        if (!it) return JSON.stringify({ ok: false });
+        const r = it.getBoundingClientRect();
+        return JSON.stringify({ ok: true, x: r.left + r.width / 2, y: r.top + r.height / 2 });
+      })()`).catch(() => null);
+      opened = raw ? JSON.parse(raw) : null;
+      if (opened && opened.ok) break;
+      await sleep(1000);
+    }
+    check("会话列表里能找到刚种进去的那个会话", !!(opened && opened.ok), JSON.stringify(opened));
+    if (!opened || !opened.ok) return;
+    await realClick(ws, opened.x, opened.y);
+    await sleep(6000);
+
+    // ③ 确保右侧边栏是**展开**的
+    //
+    // ★★ 这里原来写的是"无脑点一下 toggle"，是 flaky 的真根源：
+    //    面板的展开状态是**按会话**存的（`state.bySession[sessionId].layout.expanded`），
+    //    而 toggle 是**开关**不是"打开" ⇒ 如果它本来就开着，我这一点反而把它**关上了**，
+    //    于是后面整片判据全 FAIL（实测 4 跑里挂 1～2 次，失败时"没等到行就位"）。
+    //    ⇒ 必须**先读状态、只在不展开时才点**，点完再回读确认，并允许重试。
+    let panelOpen = false;
+    for (let i = 0; i < 12 && !panelOpen; i++) {
+      const st = JSON.parse(await cdpEval(ws, `(() => {
+        const p = document.querySelector('[data-sidebar-right-panel]');
+        const openAttr = p ? p.getAttribute('data-sidebar-right-open') : null;
+        const exp = !!document.querySelector('[data-sidebar-right-expand]');
+        const tog = !!document.querySelector('[data-sidebar-right-toggle]');
+        return JSON.stringify({ open: openAttr === "true", openAttr, exp, tog });
+      })()`).catch(() => ({ open: false })));
+      if (st.open) { panelOpen = true; break; }
+      // 收起态：优先按「打开右侧边栏」（只在收起时渲染），退回 toggle
+      const clicked = await cdpEval(ws, `(() => {
+        const b = document.querySelector('[data-sidebar-right-expand]')
+               || document.querySelector('[data-sidebar-right-toggle]');
+        if (!b) return "none";
+        b.click();
+        return b.getAttribute('data-sidebar-right-expand') !== null ? "expand" : "toggle";
+      })()`).catch(() => "err");
+      console.log(`  展开右侧边栏（第 ${i + 1} 次，点的是 ${clicked}）`);
+      await sleep(1500);
+    }
+    check("右侧边栏真的展开了（面板 data-sidebar-right-open=true）", panelOpen, String(panelOpen));
+    await sleep(1500);
+
+    // ④ 文件树出来了没有 —— 根必须是**这个会话的 cwd**，路径必须是**绝对路径**
+    const tree = JSON.parse(await cdpEval(ws, `(() => JSON.stringify({
+      state: (document.querySelector('[data-files-state]') || { getAttribute: () => null }).getAttribute('data-files-state'),
+      root: (document.querySelector('[data-files-root]') || { getAttribute: () => null }).getAttribute('data-files-root'),
+      rows: document.querySelectorAll('[data-files-entry]').length,
+      files: Array.from(document.querySelectorAll('[data-files-entry="file"]')).map(e => e.getAttribute('data-files-path')),
+      dirs: Array.from(document.querySelectorAll('[data-files-entry="directory"]')).map(e => e.getAttribute('data-files-path')),
+    }))()`));
+    console.log(`  文件树: state=${tree.state} root=${tree.root}`);
+    check("侧栏文件树真的画出来了", tree.state === "tree" && tree.rows > 0, JSON.stringify(tree).slice(0, 200));
+    check("★ 树的根就是这个会话的 cwd（不是别的目录）",
+      String(tree.root || "").replace(/[\\/]+$/, "").toLowerCase() === work.replace(/[\\/]+$/, "").toLowerCase(),
+      `root=${tree.root} 期望=${work}`);
+    check("★ 每一行带的 `data-files-path` 是**绝对路径**（外壳据此打开）",
+      tree.files.length + tree.dirs.length >= 3
+      && [...tree.files, ...tree.dirs].every((p) => /^[A-Za-z]:[\\/]/.test(String(p))),
+      JSON.stringify([...tree.files, ...tree.dirs]).slice(0, 200));
+    check("注入脚本真的装上了（窗口上有了钩子）",
+      await cdpEval(ws, `!!window.__dshSidebarOpen`));
+
+    // ⑤ 真鼠标移到第一个**文件**行上 ⇒ 行尾应该浮出图标
+    //
+    // ★★ 这一段踩过 flaky（首轮 4 跑 2 过），根因是**右侧边栏还没滑进来**：
+    //    面板一展开就立刻取行的矩形，取到的是动画中途的位置 —— 实测抓到过
+    //    `left=1273` 而视口只有 1264 宽 ⇒ **那一行还在屏幕右侧外面**。
+    //    鼠标按那个坐标移过去，指针底下当然不是那一行（`rowVisible` 的
+    //    elementFromPoint 判据正确地拒绝了它）。判据没错，是**取样太早**。
+    // ⇒ 要同时满足两件事才算"就位"：矩形**连续两次不变**（动画停了）
+    //   **且**它的中心真的落在视口里（不是停在屏幕外）。
+    let stable = 0, prevRect = "", ready = null;
+    for (let i = 0; i < 40 && stable < 2; i++) {
+      const r = await cdpEval(ws, `(() => {
+        const row = document.querySelector('[data-files-entry="file"]');
+        if (!row) return null;
+        const b = row.querySelector(':scope > button') || row.querySelector('button');
+        if (!b) return null;
+        const q = b.getBoundingClientRect();
+        const cx = q.left + q.width / 2, cy = q.top + q.height / 2;
+        return { key: [q.left, q.top, q.width, q.height].map((n) => Math.round(n)).join(","),
+          onScreen: cx >= 0 && cx <= innerWidth && cy >= 0 && cy <= innerHeight };
+      })()`).catch(() => null);
+      if (r && r.onScreen && r.key === prevRect) { stable += 1; ready = r.key; }
+      else stable = 0;
+      prevRect = r ? r.key : "";
+      await sleep(350);
+    }
+    console.log(`  文件行已就位且矩形稳定: ${ready || "（没等到，后面会 FAIL）"}`);
+
+    let hov = null;
+    let hit0 = null;
+    for (let i = 0; i < 10; i++) {
+      const hit = JSON.parse(await cdpEval(ws, `(() => {
+        const row = document.querySelector('[data-files-entry="file"]');
+        if (!row) return JSON.stringify({ ok: false });
+        const b = row.querySelector(':scope > button') || row.querySelector('button');
+        const r = b.getBoundingClientRect();
+        return JSON.stringify({ ok: true, x: r.left + 12, y: r.top + r.height / 2, path: row.getAttribute('data-files-path') });
+      })()`));
+      if (!hit.ok) { await sleep(500); continue; }
+      await realMove(ws, hit.x, hit.y);
+      await sleep(700);
+      hov = JSON.parse(await cdpEval(ws, `(() => {
+        const s = document.querySelector('[data-dsh-file-open="strip"]');
+        return JSON.stringify({
+          display: s ? s.style.display : null,
+          icons: Array.from(document.querySelectorAll('[data-dsh-file-action]')).map(b => b.getAttribute('data-dsh-file-action')),
+          labels: Array.from(document.querySelectorAll('[data-dsh-file-action]')).map(b => b.title),
+          state: window.__dshSidebarOpen.state(),
+        });
+      })()`));
+      if (hov.display === "flex") { hit0 = hit; break; }
+      hit0 = hit;
+      await sleep(600);
+    }
+    const hit = hit0 || { path: "" };
+    console.log(`  悬停: display=${hov && hov.display} 图标=${JSON.stringify(hov && hov.icons)}`);
+    check("★ 鼠标移到**文件**行上，行尾浮出图标（真指针事件）",
+      hov.display === "flex" && hov.icons.includes("open") && hov.icons.includes("reveal"),
+      JSON.stringify(hov.icons));
+    check("★ 图标指向的正是**鼠标下那一行**的文件（不是别的行）",
+      hov.state && hov.state.hoverPath === hit.path,
+      `hoverPath=${hov.state && hov.state.hoverPath} 行=${hit.path}`);
+    check("两个动作都是中文标题（说得清点了会发生什么）",
+      Array.isArray(hov.labels) && hov.labels.length === 2
+      && hov.labels.every((s) => /[\u4e00-\u9fa5]/.test(s)),
+      JSON.stringify(hov.labels));
+
+    // ★ 位置判据用 elementFromPoint：被裁掉 / 被盖住的控件，矩形照样正常（假 PASS）
+    const vis = JSON.parse(await cdpEval(ws, `(() => {
+      const b = document.querySelector('[data-dsh-file-open="strip"] [data-dsh-file-action="open"]');
+      if (!b) return JSON.stringify({ ok: false });
+      const r = b.getBoundingClientRect();
+      const el = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return JSON.stringify({ ok: true, w: r.width, h: r.height,
+        inViewport: r.left >= 0 && r.top >= 0 && r.right <= innerWidth && r.bottom <= innerHeight,
+        hitSelf: !!el && (el === b || b.contains(el)),
+        top: el ? el.tagName.toLowerCase() : null });
+    })()`));
+    check("★ 图标**真的看得见**（elementFromPoint 命中的就是它，不是被裁/被盖）",
+      vis.ok && vis.hitSelf && vis.inViewport && vis.w > 8 && vis.h > 8, JSON.stringify(vis));
+
+    // ⑥ 真点「在文件资源管理器中显示」 ⇒ 回读注入状态 + 主进程日志
+    //    ★ 先重新悬停一次再点：图标可能在上面那几条判据的间隙里被
+    //      scroll/resize 监听收掉了（那段代码是刻意这么写的），
+    //      直接按旧坐标点会点到空气上。这一条与"取样太早"是同一类坑。
+    let icon = { ok: false };
+    for (let i = 0; i < 8; i++) {
+      const row = JSON.parse(await cdpEval(ws, `(() => {
+        const row = document.querySelector('[data-files-entry="file"]');
+        if (!row) return JSON.stringify({ ok: false });
+        const b = row.querySelector(':scope > button') || row.querySelector('button');
+        const r = b.getBoundingClientRect();
+        return JSON.stringify({ ok: true, x: r.left + 12, y: r.top + r.height / 2 });
+      })()`));
+      if (!row.ok) { await sleep(400); continue; }
+      await realMove(ws, row.x, row.y);
+      await sleep(600);
+      icon = JSON.parse(await cdpEval(ws, `(() => {
+        const b = document.querySelector('[data-dsh-file-open="strip"] [data-dsh-file-action="reveal"]');
+        if (!b) return JSON.stringify({ ok: false });
+        const r = b.getBoundingClientRect();
+        const el = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        return JSON.stringify({ ok: true, x: r.left + r.width / 2, y: r.top + r.height / 2,
+          hitSelf: !!el && (el === b || b.contains(el)) });
+      })()`));
+      if (icon.ok && icon.hitSelf) break;
+      await sleep(500);
+    }
+    check("能找到「在文件资源管理器中显示」那个图标且它就在指针下",
+      icon.ok && icon.hitSelf === true, JSON.stringify(icon));
+    if (icon.ok && icon.hitSelf) {
+      await realClick(ws, icon.x, icon.y);
+      await sleep(3000);
+    }
+    const st = JSON.parse(await cdpEval(ws, `JSON.stringify(window.__dshSidebarOpen.state())`));
+    console.log(`  点后: calls=${st.calls} last=${JSON.stringify(st.last)}`);
+    check("★ 真点一下之后，注入脚本记录了一次**成功**的打开",
+      st.calls >= 1 && st.last && st.last.ok === true && st.last.action === "reveal",
+      JSON.stringify(st.last));
+    check("★ 它打开的就是那一行的文件（路径逐字符对上）",
+      st.last && st.last.path === hit.path, `${st.last && st.last.path} vs ${hit.path}`);
+    check("注入脚本自己没有报错", Array.isArray(st.errors) && st.errors.length === 0, JSON.stringify(st.errors));
+
+    // ★ 主进程侧的**独立证据**：不看页面自述，去 shell.log 里找那一行
+    //
+    // ⚠️ 比路径时**必须把分隔符归一**：日志里是 Windows 的原生反斜杠
+    //   （`…\ws\note.txt`），而页面给的 `data-files-path` 是斜杠混排
+    //   （`…\ws/note.txt` —— 内核用 `/` 拼的）。第一版直接 includes(hit.path)
+    //   就是这么假 FAIL 的：同一条日志，看着一模一样却对不上。
+    const samePath = (a, b) => String(a).replace(/[\\/]+/g, "/").toLowerCase()
+      === String(b).replace(/[\\/]+/g, "/").toLowerCase();
+    const logLines = readAppLog(tmpDir, 600).filter((l) => /侧栏在资源管理器中显示/.test(l));
+    check("★★ 主进程日志里留下了这次打开（与页面自述**互相独立**的第二份证据）",
+      logLines.some((l) => samePath(l.slice(l.indexOf("：") + 1), hit.path)),
+      `${logLines.length} 条 ／ 末条=${logLines.slice(-1)[0] || "无"}`);
+
+    // ⑦ 右键那一行 ⇒ 应该出菜单（含「复制路径」）
+    //    ★ 同样先重新悬停/取一次坐标，别用早就过期的那份
+    const ctx = JSON.parse(await cdpEval(ws, `(() => {
+      const row = document.querySelector('[data-files-entry="file"]');
+      const b = row && (row.querySelector(':scope > button') || row.querySelector('button'));
+      if (!b) return JSON.stringify({ ok: false });
+      const r = b.getBoundingClientRect();
+      const x = r.left + 12, y = r.top + r.height / 2;
+      b.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
+      const m = document.querySelector('[data-dsh-file-open="menu"]');
+      return JSON.stringify({ ok: true,
+        display: m ? m.style.display : null,
+        items: m ? Array.from(m.querySelectorAll('[data-dsh-file-action]')).map(e => e.getAttribute('data-dsh-file-action')) : [],
+        labels: m ? Array.from(m.querySelectorAll('[data-dsh-file-action]')).map(e => (e.textContent || '').trim()) : [] });
+    })()`));
+    console.log(`  右键菜单: display=${ctx.display} 项=${JSON.stringify(ctx.labels)}`);
+    check("★ 右键文件行弹出菜单（不是页面自己的菜单）",
+      ctx.display === "block" && ctx.items.length >= 3, JSON.stringify(ctx.items));
+    check("菜单里有「复制路径」（用户有时只要路径）",
+      ctx.items.includes("copy"), JSON.stringify(ctx.items));
+
+    // ⑧ ★★ 安全边界：**这些路径一律不许被打开**
+    //
+    // 判据从页面里直接调那个受限通道 —— 它就是第三方脚本能碰到的边界。
+    // 三条越界：工作区外的真实文件 / 用 `..` 穿越 / 空路径。
+    const outside = path.join(tmpDir, "outside-secret.txt");
+    fs.writeFileSync(outside, "should never be opened\n", "utf8");
+    const call = async (p, action) => JSON.parse(await cdpEval(ws,
+      `window.dshShell.openWorkspaceFile(${JSON.stringify(p)}, ${JSON.stringify(action)}).then(r => JSON.stringify(r))`, 20000));
+
+    const okInside = await call(path.join(work, "note.txt"), "reveal");
+    check("（正对照）工作区**内**的文件能打开", okInside.ok === true, JSON.stringify(okInside));
+    const badOutside = await call(outside, "reveal");
+    check("★★ 工作区**外**的真实文件被拒", badOutside.ok === false, JSON.stringify(badOutside));
+    const badTraverse = await call(path.join(work, "..", "outside-secret.txt"), "reveal");
+    check("★★ 用 `..` 穿越到工作区外被拒", badTraverse.ok === false, JSON.stringify(badTraverse));
+    const badEmpty = await call("", "reveal");
+    check("空路径被拒", badEmpty.ok === false, JSON.stringify(badEmpty));
+    const unknown = await call(path.join(work, "note.txt"), "delete");
+    check("★ 未知动作被归一成 open（不会变成「删文件」之类第三件事）",
+      unknown.ok === true && unknown.action === "open", JSON.stringify(unknown));
+
+    const denied = readAppLog(tmpDir, 600).filter((l) => /侧栏打开被拒/.test(l));
+    check("★★ 越界尝试在主进程日志里留下了「拒绝」记录（3 次以上）",
+      denied.length >= 3, `${denied.length} 条`);
+    fs.rmSync(outside, { force: true });
+  } finally {
+    await stopApp(child);
+    // ★ 收尾：把这次真跑留在用户桌面上的资源管理器窗口关掉（只关临时目录那些）
+    const closed = closeStrayExplorerWindows(tmpDir);
+    console.log(`  收尾：关掉本次在桌面上打开的资源管理器窗口 ${closed === null ? "（无法查询，可能有残留）" : closed + " 个"}`);
+    if (!fs.existsSync(logFile)) console.log("  ⚠ shell.log 不在，日志判据没验到");
+  }
+}
+
 // ── 主流程 ────────────────────────────────────────────────────────
 (async () => {
   if (typeof WebSocket === "undefined") {
     console.error("这个 node 没有全局 WebSocket，无法走 CDP（需要 Node 22+）");
     process.exit(1);
   }
-  if (!["loading", "inject", "probe", "reuse", "pages", "plugins", "firstrun"].includes(MODE)) {
-    console.error("用法: node scripts/ui-check.js <loading|inject|probe|reuse|pages|plugins|firstrun>");
+  if (!["loading", "inject", "probe", "reuse", "pages", "plugins", "firstrun", "files"].includes(MODE)) {
+    console.error("用法: node scripts/ui-check.js <loading|inject|probe|reuse|pages|plugins|firstrun|files>");
     process.exit(1);
   }
 
@@ -1622,7 +2194,8 @@ async function verifyFirstRun(tmpDir) {
           : MODE === "pages" ? verifyPages(tmpDir)
             : MODE === "plugins" ? verifyPlugins(tmpDir)
               : MODE === "firstrun" ? verifyFirstRun(tmpDir)
-                : verifyInject(tmpDir));
+                : MODE === "files" ? verifyFiles(tmpDir)
+                  : verifyInject(tmpDir));
   } catch (e) {
     console.error(`\n[ui-check] 无法完成检查: ${(e && e.stack) || e}`);
     failures.push("执行异常: " + ((e && e.message) || e));
