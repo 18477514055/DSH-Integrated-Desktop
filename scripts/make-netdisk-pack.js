@@ -117,6 +117,56 @@ function copyTree(src, dest) {
   }
 }
 
+/**
+ * **自己读 zip 的中央目录**，返回成员名（文件与目录都算）。
+ *
+ * 为什么不 shell 出去让 `tar -tf` 列：Windows 自带的 bsdtar 在中文 Windows 上
+ * 把成员名按 **GBK** 写进 stdout（实测逐字节确认），拿 utf8 解码会**全部认不出**
+ * ⇒ 判据会被一个编码问题带偏（2026-09-22 实测：zip 明明 13 个成员齐全，
+ * 却报"缺 6 个文件"）。自己读中央目录就没有这一层。
+ *
+ * 名字解码规则（zip 规范）：general purpose bit 11 置位 ⇒ 名字是 UTF-8；
+ * 否则是老式 CP437/本地代码页，中文环境下退化为 GBK。
+ */
+function readZipMembers(zipPath) {
+  const buf = fs.readFileSync(zipPath);
+  // ① 从尾部找 End Of Central Directory（0x06054b50），最多回退 64KB 注释
+  let eocd = -1;
+  const from = Math.max(0, buf.length - 65558);
+  for (let i = buf.length - 22; i >= from; i -= 1) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return [];
+  const count = buf.readUInt16LE(eocd + 10);
+  let off = buf.readUInt32LE(eocd + 16);
+
+  const out = [];
+  for (let n = 0; n < count; n += 1) {
+    if (off + 46 > buf.length) break;
+    if (buf.readUInt32LE(off) !== 0x02014b50) break;      // 中央目录条目签名
+    const flags = buf.readUInt16LE(off + 8);
+    const nameLen = buf.readUInt16LE(off + 28);
+    const extraLen = buf.readUInt16LE(off + 30);
+    const commentLen = buf.readUInt16LE(off + 32);
+    const raw = buf.subarray(off + 46, off + 46 + nameLen);
+    let name;
+    if (flags & 0x800) {
+      name = raw.toString("utf8");                        // bit 11 ⇒ UTF-8
+    } else {
+      // 没有 UTF-8 标志：先按 UTF-8 试；出现替换字符说明不是 UTF-8，退 UTF-16LE → GBK
+      const asUtf8 = raw.toString("utf8");
+      if (asUtf8.includes("\uFFFD")) {
+        name = new TextDecoder("gbk").decode(raw);
+      } else {
+        name = asUtf8;
+      }
+    }
+    out.push(name);
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
+
 /** npm pack 一个插件目录 → 返回打出来的 tgz 绝对路径。 */
 function packPlugin(dir) {
   const nodeDir = path.dirname(process.execPath);
@@ -321,27 +371,40 @@ if (!NO_ZIP) {
       const bytes = fs.statSync(zipPath).size;
       say(`   → ${zipPath}  ${human(bytes)}`);
 
-      // ★ 回读：不信 tar 的自述。查魔数 + 列出成员数
-      const head = Buffer.alloc(4);
-      const fd = fs.openSync(zipPath, "r");
-      try { fs.readSync(fd, head, 0, 4, 0); } finally { fs.closeSync(fd); }
-      if (head[0] !== 0x50 || head[1] !== 0x4b) problems.push("产物不是合法 zip（魔数不对）");
-      const lt = spawnSync(tar, ["-tf", zipPath], { encoding: "utf8", timeout: 120000 });
-      const members = (lt.stdout || "").split(/\r?\n/).filter(Boolean);
-      say(`   回读：${members.length} 个成员，前 3 个 = ${members.slice(0, 3).join(" | ")}`);
+      // ★ 回读：不信 tar 的自述。查魔数 + 列出成员名并核对。
+      //
+      // ⚠️ 2026-09-22 实测踩到的坑（**量具自己撒谎**）：Windows 自带的 bsdtar
+      //   在**中文 Windows** 上把成员名按 **GBK(936)** 写进 stdout（实测逐字节
+      //   `44 53 48 2d bc af b3 c9 d7 c0 c3 e6 b6 cb 2d ...` = "DSH-集成桌面端-"），
+      //   同时它把**参数**按 UTF-8 输出（所以 ASCII 的 `-tf` 没事）。
+      //   于是拿 utf8 解码去比对中文成员名 ⇒ **全部认不出**，
+      //   报一堆"zip 里缺 xxx"，而 zip 其实完全正常（13 个成员一个不少）。
+      //   ⇒ 判据不能用子进程的输出编码，必须**自己从 zip 的中央目录读**：
+      //     zip 的 general purpose bit 11 置位时名字是 UTF-8，否则按 GBK 兜。
+      const members = readZipMembers(zipPath);
+      say(`   回读（直接读 zip 中央目录，不经过子进程编码）：${members.length} 个成员`);
+      for (const m of members.slice(0, 4)) say(`     · ${m}`);
+
+      const base = path.basename(packRoot);
+      const norm = (s) => s.replace(/\\/g, "/").replace(/\/+$/, "");
+      const have = new Set(members.map(norm));
       const must = [
-        `${path.basename(packRoot)}/00-先看我.md`,
-        `${path.basename(packRoot)}/插件包/plugin-index.json`,
-        `${path.basename(packRoot)}/校验/SHA256SUMS.txt`,
+        `${base}/00-先看我.md`,
+        `${base}/插件包/plugin-index.json`,
+        `${base}/校验/SHA256SUMS.txt`,
       ];
       for (const m of must) {
-        if (!members.some((x) => x.replace(/\\/g, "/") === m)) problems.push(`zip 里缺 ${m}`);
+        if (!have.has(m)) problems.push(`zip 里缺 ${m}`);
       }
-      // 每个插件 tgz 都得在
       for (const en of entries) {
-        const m = `${path.basename(packRoot)}/插件包/plugins/${en.file}`;
-        if (!members.some((x) => x.replace(/\\/g, "/") === m)) problems.push(`zip 里缺插件包 ${en.file}`);
+        const m = `${base}/插件包/plugins/${en.file}`;
+        if (!have.has(m)) problems.push(`zip 里缺插件包 ${en.file}`);
       }
+      for (const n of artifacts) {
+        const m = `${base}/安装包/${n}`;
+        if (!have.has(m)) problems.push(`zip 里缺安装包 ${n}`);
+      }
+      if (members.length === 0) problems.push("zip 中央目录读不出任何成员");
     }
   }
 } else {
