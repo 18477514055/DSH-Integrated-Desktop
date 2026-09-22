@@ -250,7 +250,23 @@ function rpc(token, method, params) {
   console.log(`  官方界面   : 127.0.0.1:${FREE_PORT}   CDP: ${CDP_PORT}`);
   console.log(`  局域网服务 : 127.0.0.1:${LAN_PORT}（刻意不用 3110，避免撞上真实实例）`);
 
-  for (const f of ["lib/index.js", "lib/client.js", "lib/qr.cjs", "cordis.patch.yml", "package.json", "web/index.html", "web/app.js"]) {
+  // ★ 2026-09-22：这份清单必须跟着包内结构走。
+  //   插件已经分层成 desktop/（电脑侧宿主+界面）与 phone/（手机页面，由宿主现读磁盘托管），
+  //   而这里原来还写着改名前的 `lib/*` 与 `web/*` ⇒ 一进门就报
+  //   「插件源码不完整：缺 lib/index.js」，**看起来像插件坏了，其实是清单过时**。
+  //   现在按 package.json 的 exports 解析入口，不再写死路径。
+  const pkgNow = JSON.parse(fs.readFileSync(path.join(PLUGIN_DIR, "package.json"), "utf8").replace(/^\uFEFF/, ""));
+  const entryOf = (k, fallback) => String((pkgNow.exports && pkgNow.exports[k]) || fallback).replace(/^\.\//, "");
+  const REQUIRED = [
+    entryOf(".", "desktop/index.js"),        // 宿主半边（exports["."] 是真值）
+    entryOf("./client", "desktop/client.js"),
+    "desktop/qr.cjs",
+    "cordis.patch.yml",
+    "package.json",
+    "phone/index.html",
+    "phone/app.js",
+  ];
+  for (const f of REQUIRED) {
     if (!fs.existsSync(path.join(PLUGIN_DIR, f))) throw new Error(`插件源码不完整：缺 ${f}`);
   }
 
