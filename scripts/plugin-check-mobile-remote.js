@@ -16,7 +16,7 @@
  * ══════════════════════════════════════════════════════════════════
  * 四层证据，一层比一层硬（后三层刻意**不看插件自己的说法**）
  * ══════════════════════════════════════════════════════════════════
- *  ① 结构：`window.__DSH_BOOT__.entries` 里有 `dsh-mobile-remote`
+ *  ① 结构：`window.__DSH_BOOT__.entries` 里有 `dsh-int-mobile-remote`
  *  ② 动态：页面里出现插件注入的 `<style data-plugin-css>`，且调试钩子存在
  *     ⇒ `apply()` 真的跑了（"bundle 被下载"不算）
  *  ③ **端到端（真 HTTP）**：配对 → 列会话 → 新建会话 → 发消息 → 中断，
@@ -45,8 +45,18 @@ const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 
 const ROOT = path.join(__dirname, "..");
-const PLUGIN_NAME = "dsh-mobile-remote";
-const PLUGIN_DIR = path.join(ROOT, "plugin", PLUGIN_NAME);
+/**
+ * ★ 包名与目录名**必须分开**（2026-09-22 改名时踩到的分界）：
+ *   · 包名 = dsh-int-mobile-remote —— profile 的 dependencies 键、bundles 条目、
+ *     node_modules 里的联接名、启动图 entries、CSS 标记，全都用它。
+ *   · 目录名 = dsh-mobile-remote —— **不动**。仓库里的 `plugin\<目录>` 是个指向
+ *     `D:\DSH工作区002\3.dsh-mobile-remote` 的**目录联接**，且已装插件的 `link:` 与
+ *     联接都是**写死的绝对路径**，改目录名 = 当场弄坏这个插件（全局规矩）。
+ *   合成一个常量就会出现"改包名把路径一起改掉、脚本再也找不到源码"这种静默故障。
+ */
+const PLUGIN_NAME = "dsh-int-mobile-remote";
+const PLUGIN_DIR_NAME = "dsh-mobile-remote";
+const PLUGIN_DIR = path.join(ROOT, "plugin", PLUGIN_DIR_NAME);
 const CDP_PORT = Number(process.env.DSH_MMR_CDP || 9346);
 const FREE_PORT = Number(process.env.DSH_MMR_PORT || 3181);      // 官方界面
 const LAN_PORT = Number(process.env.DSH_MMR_LAN || 3182);        // 本插件的局域网服务
@@ -346,7 +356,7 @@ function rpc(token, method, params) {
     check("未配对请求被拒（401）", noAuth.status === 401, `HTTP ${noAuth.status} ${noAuth.json && noAuth.json.error}`);
 
     // 从官方界面拿到当前配对码（这就是用户扫码时看到的那个码）
-    const stateRaw = await cdpEval(ws, `fetch('/dsh-mobile-remote/state').then(r=>r.json()).then(j=>JSON.stringify(j.data))`);
+    const stateRaw = await cdpEval(ws, `fetch('/dsh-int-mobile-remote/state').then(r=>r.json()).then(j=>JSON.stringify(j.data))`);
     const st = JSON.parse(stateRaw);
     check("同源路由 /state 可用，且带二维码与配对码",
       !!(st && st.qrSvg && st.code), `code=${st && st.code}, qrSvg=${st && st.qrSvg.length} 字节`);

@@ -1,7 +1,7 @@
-# 2. 归档管理器 —— DSH 插件 `dsh-archive-manager`
+# 2. 归档管理器 —— DSH 插件 `dsh-int-archive-manager`
 
 > **位置**：第三工作区 `D:\DSH工作区002\2.归档管理器\`（2026-09-21 从第二工作区 `7.归档管理器` 搬来）。
-> 包名仍是 `dsh-archive-manager`（内核靠它识别，与项目目录名无关）。
+> 包名仍是 `dsh-int-archive-manager`（内核靠它识别，与项目目录名无关）。
 
 在侧边栏新增**第 4 个顶层分组**「已归档」，里面是已归档的对话：可搜索、可按天筛选、可"永久删除"腾空间。
 
@@ -179,8 +179,8 @@ e2e 全部在**临时目录**里跑，真实 DSH 家一个字节没碰。
 
 | 契约 | 值 |
 |---|---|
-| `dependencies` | `link:D:\deepseek-workspace\5.DSH集成桌面端\plugin\dsh-archive-manager` |
-| `dsh.profile.bundles` | 含 `dsh-archive-manager`（共 12 项） |
+| `dependencies` | `link:D:\deepseek-workspace\5.DSH集成桌面端\plugin\dsh-int-archive-manager` |
+| `dsh.profile.bundles` | 含 `dsh-int-archive-manager`（共 12 项） |
 | `node_modules` 联接 | → `D:\DSH工作区002\2.归档管理器` |
 
 **源码真身在第 3 工作区**，`5.DSH集成桌面端\plugin\` 下是个 junction 指过去
@@ -188,9 +188,9 @@ e2e 全部在**临时目录**里跑，真实 DSH 家一个字节没碰。
 
 ```powershell
 cd D:\deepseek-workspace\5.DSH集成桌面端
-npm.cmd run plugin:status -- --plugin dsh-archive-manager   # 查状态
+npm.cmd run plugin:status -- --plugin dsh-int-archive-manager   # 查状态
 npm.cmd run plugin:check:archive                            # 真跑 14 条断言
-npm.cmd run plugin:revert  -- --plugin dsh-archive-manager  # 不满意就撤
+npm.cmd run plugin:revert  -- --plugin dsh-int-archive-manager  # 不满意就撤
 ```
 
 > ⚠️ **装完要你重启一次客户端才生效**（宿主启动快照客户端 bundle）。
@@ -199,7 +199,7 @@ npm.cmd run plugin:revert  -- --plugin dsh-archive-manager  # 不满意就撤
 ### 真跑证据（plugin-check:archive，14/14）
 
 ```
-PASS  ① 启动图里有 dsh-archive-manager（共 60 条）
+PASS  ① 启动图里有 dsh-int-archive-manager（共 60 条）
 PASS  ② 插件注入了自己的 <style>（说明 apply() 真的跑了）
 PASS  ② 调试钩子存在 / 两个槽位都注册成功（没有静默失败）
 PASS  ③ 侧边栏出现了「已归档」这一行      ← 真的在 DOM 里找到了
@@ -240,7 +240,7 @@ D:\DSH工作区002\2.归档管理器\
    └─ install-dry.mjs     真跑 23 条断言（内核契约前置检查）
 ```
 
-> 注：搬来时**去掉了外面一层 `plugin\dsh-archive-manager\`**。原来那个层级是给
+> 注：搬来时**去掉了外面一层 `plugin\dsh-int-archive-manager\`**。原来那个层级是给
 > `5.DSH集成桌面端\plugin\` 的自动发现机制用的（那边 `plugin/` 下每个目录=一个插件）；
 > 本工作区是**薄层 + 指针**（见 `00-先看我` §六），没有那套机制，多一层只是让人多点一次。
 

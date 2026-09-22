@@ -276,7 +276,7 @@ section("⑧ 拿线上真实索引跑一遍（连不上就 SKIP，不当成通�
 
     const g = C.groupByName(idx.entries);
     const names = g.map((x) => x.name);
-    chk(names.includes("dsh-multi-session") && names.includes("dsh-archive-manager"),
+    chk(names.includes("dsh-multi-session") && names.includes("dsh-int-archive-manager"),
       "★ 我们刚发的两个插件出现在清单里", JSON.stringify(names));
     const ms = g.find((x) => x.name === "dsh-multi-session");
     chk(ms && ms.latest.version === "0.1.1", "dsh-multi-session 最新版 = 0.1.1", ms ? ms.latest.version : "无");

@@ -1,5 +1,5 @@
 /**
- * dsh-mobile-remote —— 浏览器半边（客户端插件）。
+ * dsh-int-mobile-remote —— 浏览器半边（客户端插件）。
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * 它做什么
@@ -33,7 +33,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: 'dsh-mobile-remote',
+  id: 'dsh-int-mobile-remote',
   factory: (require) => {
     'use strict';
 
@@ -42,11 +42,11 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const { useState, useEffect, useCallback } = React;
 
-    const PLUGIN_ID = 'dsh-mobile-remote';
+    const PLUGIN_ID = 'dsh-int-mobile-remote';
     const CSS_ID = PLUGIN_ID + '/styles.css';
     const TRIGGER_SLOT = 'shell.overlay';
     const TRIGGER_ID = 'mobile-remote-trigger';
-    const ROUTE = '/dsh-mobile-remote';
+    const ROUTE = '/dsh-int-mobile-remote';
 
     /** 诊断：槽位挂没挂上必须看得见，不许静默吞（dsh-crosshub 源码里的事故）。 */
     const diagnostics = { slots: {}, errors: [], at: new Date().toISOString() };
@@ -287,7 +287,7 @@ window.__ModuleLoader__.load({
      * 这是本次实测踩到的坑（2026-09-20，临时环境真跑）：
      *   写成 `['@deepseek-ai/dsh-client-ui-slots']` ⇒ 插件**永远停在 pending**：
      *     Error: web boot: 1 entry did not activate
-     *       dsh-mobile-remote: pending (waiting for service: @deepseek-ai/dsh-client-ui-slots)
+     *       dsh-int-mobile-remote: pending (waiting for service: @deepseek-ai/dsh-client-ui-slots)
      *   ⇒ 界面里什么都没有，而插件自己的代码**一行都没跑**（所以也不会报错）。
      *   包名只属于 `dsh.client.inject`（那份是给 `dsh-client-modules` 组合 bundle 用的）；
      *   这里的 `inject` 是 cordis 的依赖声明，`slots` 才是服务名

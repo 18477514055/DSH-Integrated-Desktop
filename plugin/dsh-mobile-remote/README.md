@@ -1,4 +1,4 @@
-# dsh-mobile-remote —— dsh手机遥控
+# dsh-int-mobile-remote —— dsh手机遥控
 
 > 电脑右下角一个「手机」按钮 → 点开是二维码 → **手机扫一下**就能看会话、看流式输出、
 > 发消息、发图片、切模型、中断任务、批准/拒绝审批。
@@ -9,8 +9,8 @@
 > 图标全部是**单色线性 SVG**（2026-09-21 从 emoji 换掉，见下）。
 >
 > 📁 **本目录是插件的"本体"**。2026-09-21 起它住在**第三工作区**
-> （`D:\DSH工作区002\3.dsh-mobile-remote\`），而集成板仓库里的
-> `5.DSH集成桌面端\plugin\dsh-mobile-remote` 是一个**指向这里的 Junction（目录联接）** ——
+> （`D:\DSH工作区002\3.dsh-int-mobile-remote\`），而集成板仓库里的
+> `5.DSH集成桌面端\plugin\dsh-int-mobile-remote` 是一个**指向这里的 Junction（目录联接）** ——
 > 已装插件的 `link:` 与 `node_modules` junction 因此**一字未改**就照样能用。
 > ⚠️ 由此带来一个包装配要求：`plugin\` 下的联接**不能直接交给 electron-builder**
 > （它不解引用，会把联接原样复制成指向开发机的死链）。
@@ -228,9 +228,9 @@ node scripts/plugin-check-mobile-remote.js
 node scripts/plugin-check-mobile-remote.js --keep   # 保留临时目录（排查用）
 
 # 2) 预演 / 落盘 / 查状态 / 回滚（★ 注意要带 --plugin）
-node scripts/install-plugin.js --plugin dsh-mobile-remote --status    # 只读：装没装、联接指向哪
-node scripts/install-plugin.js --plugin dsh-mobile-remote --apply     # 落盘（先自动备份 profile 的 package.json）
-node scripts/install-plugin.js --plugin dsh-mobile-remote --revert    # 回滚
+node scripts/install-plugin.js --plugin dsh-int-mobile-remote --status    # 只读：装没装、联接指向哪
+node scripts/install-plugin.js --plugin dsh-int-mobile-remote --apply     # 落盘（先自动备份 profile 的 package.json）
+node scripts/install-plugin.js --plugin dsh-int-mobile-remote --revert    # 回滚
 
 # 3) 二维码单独体检（编码 → 用**另一个独立解码器**读回来）
 node scripts/qr-check.js
@@ -252,8 +252,8 @@ node scripts/mobile-remote-status.js          # 退出码 0=新版 2=需重启 3
 
 装完改的是 **profile**（B 环境 `profiles/web`）三处，缺一处都是"文件都在、界面什么都没有"：
 
-1. `package.json` → `dependencies` 里加 `"dsh-mobile-remote": "link:<本仓库路径>"`
-2. `package.json` → `dsh.profile.bundles` 末尾追加 `"dsh-mobile-remote"`
+1. `package.json` → `dependencies` 里加 `"dsh-int-mobile-remote": "link:<本仓库路径>"`
+2. `package.json` → `dsh.profile.bundles` 末尾追加 `"dsh-int-mobile-remote"`
 3. `node_modules` 里建**目录联接**指向本仓库
 
 **脚本不会重启内核。** 装完要由人按一次重启（托盘 → 退出 → 重新打开）。
@@ -355,7 +355,7 @@ node scripts/mobile-remote-status.js     # 退出码 2 = 需要重启
 
 | 坑 | 表现 | 怎么抓到的 |
 |---|---|---|
-| `cordis.patch.yml` 的 `name` 写成显示名 `'Mobile Remote Plugin'` | **整个 profile 起不来**、界面退到状态页：`failed to import loader entry dsh-mobile-remote (Mobile Remote Plugin): Cannot find package 'Mobile Remote Plugin'` —— `name` 是 loader 用来 `import` 的**模块标识符**，不是给人看的 | 真跑第一次就抓到，日志原文在 `shell.log` |
+| `cordis.patch.yml` 的 `name` 写成显示名 `'Mobile Remote Plugin'` | **整个 profile 起不来**、界面退到状态页：`failed to import loader entry dsh-int-mobile-remote (Mobile Remote Plugin): Cannot find package 'Mobile Remote Plugin'` —— `name` 是 loader 用来 `import` 的**模块标识符**，不是给人看的 | 真跑第一次就抓到，日志原文在 `shell.log` |
 | 客户端 `inject` 写成**包名** `['@deepseek-ai/dsh-client-ui-slots']` | 插件**永远停在 pending**、界面里什么都没有、**自己一行代码都没跑所以也不报错**：`web boot: 1 entry did not activate / pending (waiting for service: …)`。这里要的是 **cordis 服务名**（`'slots'`） | 写了个探针脚本接 CDP 抓 `Runtime.exceptionThrown` 与控制台 |
 | 悬浮按钮**只把弹窗 portal 到 body**，按钮本身留在 `shell.overlay` 里 | 按钮被关在 `shell.overlay` 的 **z-index:20** 层叠上下文里 ⇒ 自己写 `z-index:9998` 也没用，官方那个 `z-index:1000` 的根遮罩盖在它上面。**用 `getBoundingClientRect()` 判是假 PASS**（矩形完全正常） | `document.elementFromPoint(按钮中心)` 命中的是 `_mask_w1urq_14`（别的元素）⇒ 与项目 AGENTS.md §5 那条完全吻合 |
 | **测试夹具**里那个 1×1 PNG 是坏的 | 内核报 `Unsupported or malformed image data.`，我一度以为是插件的问题 | 用 sharp 逐步复现：`metadata()` **能过**、`raw().toBuffer()` **失败**（`vipspng: libpng read error`）⇒ 那个流传很广的 base64 的 IDAT 其实是坏的。换成 sharp 现生成的 PNG 即通过 |

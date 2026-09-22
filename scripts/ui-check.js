@@ -1537,7 +1537,7 @@ async function verifyFirstRun(tmpDir) {
       await sleep(1000);
     }
     check("手动打开的向导同样渲染出了清单", fr2.items.length > 0, `items=${fr2.items.length} status=${fr2.status}`);
-    const target0 = fr2.items.find((x) => !x.disabled && x.name === "dsh-archive-manager")
+    const target0 = fr2.items.find((x) => !x.disabled && x.name === "dsh-int-archive-manager")
       || fr2.items.find((x) => !x.disabled);
     check("清单里至少有一条现在能装", !!target0, JSON.stringify(fr2.items.map((x) => x.name)));
     if (!target0) return;

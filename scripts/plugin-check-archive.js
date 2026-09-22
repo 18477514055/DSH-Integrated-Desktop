@@ -34,7 +34,12 @@ import { fileURLToPath } from "node:url";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const PLUGIN_NAME = "dsh-archive-manager";
+const PLUGIN_NAME = "dsh-int-archive-manager";
+/** ★ 目录名**不动**（2026-09-22 改名）：仓库里 `plugin\<目录>` 是指向
+ *  `D:\DSH工作区002\2.归档管理器` 的目录联接，而已装插件的 link: 与 node_modules
+ *  联接都是**写死的绝对路径** ⇒ 改目录名就当场弄坏这个插件。
+ *  包名与目录名必须分成两个常量，否则会出现"改包名把源码路径一起改掉"的静默故障。 */
+const PLUGIN_DIR_NAME = "dsh-archive-manager";
 const CSS_ID = PLUGIN_NAME + "/archive-manager.css";
 const KEEP = process.argv.includes("--keep");
 const CDP_PORT = 9355;
@@ -136,7 +141,7 @@ function buildTempHome(base, port) {
   }, null, 2) + "\n", "utf8");
 
   // ④ 本插件联接进去
-  junction(path.join(web, "node_modules", PLUGIN_NAME), path.join(ROOT, "plugin", PLUGIN_NAME));
+  junction(path.join(web, "node_modules", PLUGIN_NAME), path.join(ROOT, "plugin", PLUGIN_DIR_NAME));
 
   // ⑤ 外壳设置
   fs.mkdirSync(userData, { recursive: true });
@@ -191,7 +196,7 @@ async function main() {
   const { userData, home: tempHome, bundles, mirrored } = buildTempHome(runDir, port);
 
   console.log("=== plugin-check-archive：" + PLUGIN_NAME + " ===");
-  console.log("  插件源码 : " + path.join(ROOT, "plugin", PLUGIN_NAME));
+  console.log("  插件源码 : " + path.join(ROOT, "plugin", PLUGIN_DIR_NAME));
   console.log("  端口     : " + port + "   CDP: " + CDP_PORT);
   console.log("  临时家   : " + tempHome);
   console.log("  bundles  : " + bundles.join(", "));
@@ -277,7 +282,9 @@ async function main() {
 
   await new Promise((r) => setTimeout(r, 2500));
 
-  const panelOk = await cdpEval(ws, `!!document.querySelector('[data-dsham="dsh-archive-manager-body"]')`);
+  // ★ 这个属性的**值**来自插件的 PANEL_ID（= 包名），所以改名后必须跟着改。
+  //   （属性**名** data-dsham 是固定选择器，不动。）
+  const panelOk = await cdpEval(ws, `!!document.querySelector('[data-dsham="dsh-int-archive-manager-body"]')`);
   ok("③ 点完之后主面板真的渲染出来了", panelOk === true, String(panelOk));
 
   const hasSearch = await cdpEval(ws, `!!document.querySelector('[data-dsham="search"]')`);

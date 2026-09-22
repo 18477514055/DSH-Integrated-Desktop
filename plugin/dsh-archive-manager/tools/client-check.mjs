@@ -114,7 +114,7 @@ try {
 ok("client.js 执行不抛错", loadErr === null, loadErr ? String(loadErr.message) : "");
 const spec = globalThis.__captured;
 ok("调用了模块加载器", !!spec, "没捕获到");
-ok("id = dsh-archive-manager", spec && spec.id === "dsh-archive-manager", spec && String(spec.id));
+ok("id = dsh-int-archive-manager", spec && spec.id === "dsh-int-archive-manager", spec && String(spec.id));
 ok("factory 是函数", spec && typeof spec.factory === "function");
 
 console.log("");
@@ -122,7 +122,7 @@ console.log("=== 2. 执行 factory ===");
 let mod = null, fErr = null;
 try { mod = spec.factory(globalThis.__require); } catch (e) { fErr = e; }
 ok("factory 不抛错", fErr === null, fErr ? String(fErr.message).slice(0, 200) : "");
-ok("导出 name", mod && mod.name === "dsh-archive-manager", mod && String(mod.name));
+ok("导出 name", mod && mod.name === "dsh-int-archive-manager", mod && String(mod.name));
 ok("inject 只含 slots", mod && Array.isArray(mod.inject) && mod.inject.length === 1 && mod.inject[0] === "slots",
   mod ? JSON.stringify(mod.inject) : "");
 ok("导出 apply", mod && typeof mod.apply === "function");
@@ -152,14 +152,14 @@ ok("apply 不抛错", aErr === null, aErr ? String(aErr.message).slice(0, 250) :
 ok("注册到 sidebar.panellist（侧边栏分组行）", injections.includes("sidebar.panellist"), JSON.stringify(injections));
 ok("注册到 main（主面板）", injections.includes("main"), JSON.stringify(injections));
 
-const panelReg = registrations.find((r) => r.options && r.options.id === "dsh-archive-manager");
-ok("panellist 的 id = dsh-archive-manager", !!panelReg, JSON.stringify(registrations.map((r) => r.options)));
+const panelReg = registrations.find((r) => r.options && r.options.id === "dsh-int-archive-manager");
+ok("panellist 的 id = dsh-int-archive-manager", !!panelReg, JSON.stringify(registrations.map((r) => r.options)));
 ok("panellist 带 label 已归档", panelReg && panelReg.options.label === "已归档", panelReg && String(panelReg.options.label));
 ok("panellist 带 order", panelReg && typeof panelReg.options.order === "number");
 ok("panellist name 字段 = 槽位名", panelReg && panelReg.options.name === "sidebar.panellist", panelReg && String(panelReg.options.name));
 
-const mainReg = registrations.find((r) => r.options && r.options.key === "dsh-archive-manager");
-ok("main 的 key = dsh-archive-manager", !!mainReg, JSON.stringify(registrations.map((r) => r.options)));
+const mainReg = registrations.find((r) => r.options && r.options.key === "dsh-int-archive-manager");
+ok("main 的 key = dsh-int-archive-manager", !!mainReg, JSON.stringify(registrations.map((r) => r.options)));
 ok("main name 字段 = 槽位名", mainReg && mainReg.options.name === "main", mainReg && String(mainReg.options.name));
 
 // ★ 这是最关键的一条：两个 id 必须一致，否则点侧边栏那行会抛
@@ -185,7 +185,7 @@ ok("渲染出转储夹设置输入框", /"data-dsham":"trashdir"/.test(all));
 ok("渲染出归档列表 tab", /"data-dsham":"tab-archived"/.test(all));
 ok("渲染出转储文件夹 tab", /"data-dsham":"tab-trash"/.test(all));
 ok("渲染出刷新按钮", /"data-dsham":"refresh"/.test(all));
-ok("面板根节点有标记", /"data-dsham":"dsh-archive-manager-body"/.test(all));
+ok("面板根节点有标记", /"data-dsham":"dsh-int-archive-manager-body"/.test(all));
 
 console.log("");
 console.log("=== 5. 渲染侧边栏图标 ===");
@@ -196,7 +196,7 @@ try { iconNode = panelReg.component({ size: 16, active: false }); } catch (e) { 
 ok("图标渲染不抛错", iErr === null, iErr ? String(iErr.message).slice(0, 200) : "");
 expand(iconNode, 0);
 const iconJson = JSON.stringify(created);
-ok("图标有标记", iconJson.includes("dsh-archive-manager-icon"), iconJson.slice(0, 160));
+ok("图标有标记", iconJson.includes("dsh-int-archive-manager-icon"), iconJson.slice(0, 160));
 ok("图标内含 svg", iconJson.includes("svg"), iconJson.slice(0, 160));
 
 console.log("");

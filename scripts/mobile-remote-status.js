@@ -38,7 +38,7 @@ const NEW_METHODS = ["workspace.list", "modelCatalog", "session.titles", "sessio
   // ── ① 插件在同源路由上活着吗 ──
   let st;
   try {
-    const r = await fetch(`${OFFICIAL}/dsh-mobile-remote/state`);
+    const r = await fetch(`${OFFICIAL}/dsh-int-mobile-remote/state`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     st = (await r.json()).data;
   } catch (e) {
@@ -108,7 +108,7 @@ const NEW_METHODS = ["workspace.list", "modelCatalog", "session.titles", "sessio
 
   // ── ③ 磁盘 vs 运行中：是不是"改了但没重启" ──
   const plug = path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"),
-    "DSH Integrated", "dsh-home", "profiles", "web", "node_modules", "dsh-mobile-remote");
+    "DSH Integrated", "dsh-home", "profiles", "web", "node_modules", "dsh-int-mobile-remote");
   let diskMtime = null;
   try {
     // ★ 2026-09-21 插件包内分层（desktop/ 电脑侧 / phone/ 手机侧）后，

@@ -1,5 +1,5 @@
 /**
- * dsh-archive-manager —— 宿主半边（Host half，node 侧）。
+ * dsh-int-archive-manager —— 宿主半边（Host half，node 侧）。
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * 这一半为什么必须存在
@@ -86,7 +86,7 @@ setPluginDir(PLUGIN_DIR);
  *   我第一版把 `homePaths` 写进了 `inject`，以为它是个 cordis 服务。
  *   实际启动报错（原文）：
  *       dsh: plugin tree failed to load: dsh: 1 entry did not activate
- *       dsh-archive-manager: pending (waiting for service: homePaths)
+ *       dsh-int-archive-manager: pending (waiting for service: homePaths)
  *   ⇒ **`@deepseek-ai/dsh-home-paths` 是一个纯函数模块，不是 cordis 服务**，
  *     它导出的全是 `resolveDshHome()` / `dshHomePath()` 这类**函数**，
  *     根本没有往 ctx 上挂 `homePaths`。
@@ -115,7 +115,7 @@ function resolveHome() {
   if (process.env.DSH_HOME && process.env.DSH_HOME.trim()) candidates.push(process.env.DSH_HOME.trim());
 
   // ② 插件自己的目录往上找（**这一条是 2026-09-21 补的，专治"认错家"**）：
-  //   本插件住在 `<家>\profiles\web\node_modules\dsh-archive-manager\`（联接过去也成立），
+  //   本插件住在 `<家>\profiles\web\node_modules\dsh-int-archive-manager\`（联接过去也成立），
   //   所以从 PLUGIN_DIR 往上数 3 层就是 `profiles\web`，再往上 2 层就是家。
   //   ⇒ **家在哪，由"插件被装在哪个家"决定**，而不是由全局探测猜。
   //   实测问题：真跑 plugin-check 时临时家里跑着，却解析到了**真实的 B 家**
@@ -180,7 +180,7 @@ function parseUrl(req) {
   return new URL(req.url || "/", "http://localhost");
 }
 
-const name = "dsh-archive-manager";
+const name = "dsh-int-archive-manager";
 /**
  * 声明依赖：**只写确定存在的服务**。
  *

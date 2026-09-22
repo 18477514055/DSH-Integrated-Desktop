@@ -1,5 +1,5 @@
 /**
- * dsh-mobile-remote —— 宿主半边（Host half）。
+ * dsh-int-mobile-remote —— 宿主半边（Host half）。
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * 它做什么
@@ -57,8 +57,10 @@ import { fileURLToPath } from 'node:url';
 
 import qrcode from './qr.cjs';
 
-/** 插件名（Cordis bundle tree 中的 id）。 */
-export const name = 'dsh-mobile-remote';
+/** 插件名（Cordis bundle tree 中的 id）。
+ *  ★ 必须与 package.json 的 name 一致 —— loader 拿它当模块标识符 import。
+ *  2026-09-22 由 dsh-int-mobile-remote 改名而来：那个名字在 npm 上已被占用。 */
+export const name = 'dsh-int-mobile-remote';
 
 /**
  * 运行参数。
@@ -88,7 +90,10 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
  * 所以它必须随宿主一起被装到用户机器上 ⇒ 归在包内、由 `files` 白名单一起分发。
  * 改名时这里要跟着改（两处引用：serveStatic 与 MIME 映射的取值都在本文件）。 */
 const PHONE_DIR = path.join(HERE, '..', 'phone');
-const ROUTE_PREFIX = '/dsh-mobile-remote';
+/** 局域网服务的路由前缀。跟着包名一起改（2026-09-22）。
+ *  ★ 手机页面**不碰**这个前缀（phone/app.js 走的是 /api/rpc、/api/events、
+ *    /api/pair/submit），所以改它**不需要重新编译 APK**。 */
+const ROUTE_PREFIX = '/dsh-int-mobile-remote';
 
 /* ══════════════════════════════════════════════════════════════════
  * 小工具
@@ -670,14 +675,14 @@ function startLanServer(ctx) {
     server.on('error', (e) => {
       state.diagnostics.errors.push('listen: ' + (e?.message || e));
       // 端口被占不该让整个插件（乃至 profile）挂掉 —— 记下来，让界面能看见
-      ctx.logger?.warn?.(`[dsh-mobile-remote] 局域网服务启动失败：${e?.message || e}`);
+      ctx.logger?.warn?.(`[dsh-int-mobile-remote] 局域网服务启动失败：${e?.message || e}`);
       resolve({ server: null, port: null });
     });
     server.listen(Config.port, '0.0.0.0', () => {
       const addrs = lanAddresses();
       state.diagnostics.listens.push({ port: Config.port, at: Date.now() });
       ctx.logger?.info?.(
-        `[dsh-mobile-remote] 局域网服务已监听 http://0.0.0.0:${Config.port}` +
+        `[dsh-int-mobile-remote] 局域网服务已监听 http://0.0.0.0:${Config.port}` +
         (addrs.length ? `（手机请访问 http://${addrs[0].address}:${Config.port}）` : '（未找到局域网地址）'),
       );
       resolve({ server, port: Config.port });
@@ -791,7 +796,7 @@ function installApprovalBridge(ctx) {
       return outcome;
     });
     return () => { try { dispose?.(); } catch { } };
-  }, 'dsh-mobile-remote: approval bridge');
+  }, 'dsh-int-mobile-remote: approval bridge');
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -824,7 +829,7 @@ export function apply(ctx, config) {
       state.streams.clear();
       state.watchers.clear();
     };
-  }, 'dsh-mobile-remote: lan server');
+  }, 'dsh-int-mobile-remote: lan server');
 
   // ② 审批桥接：把"要不要允许这个工具调用"推到手机，手机点同意/拒绝
   installApprovalBridge(ctx);
@@ -865,6 +870,6 @@ export function apply(ctx, config) {
       },
     }));
 
-    ctx.effect(() => () => { for (const d of disposers) { try { d?.(); } catch { } } }, 'dsh-mobile-remote: routes');
+    ctx.effect(() => () => { for (const d of disposers) { try { d?.(); } catch { } } }, 'dsh-int-mobile-remote: routes');
   });
 }

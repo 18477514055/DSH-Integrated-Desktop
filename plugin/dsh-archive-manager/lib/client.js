@@ -1,5 +1,5 @@
 /**
- * dsh-archive-manager —— 浏览器半边（客户端插件）。
+ * dsh-int-archive-manager —— 浏览器半边（客户端插件）。
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * 这个插件做一件什么事
@@ -62,7 +62,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: "dsh-archive-manager",
+  id: "dsh-int-archive-manager",
   factory: (require) => {
     "use strict";
 
@@ -75,14 +75,14 @@ window.__ModuleLoader__.load({
     // ─────────────────────────────────────────────────────────────────────
     // 常量
     // ─────────────────────────────────────────────────────────────────────
-    const PLUGIN_ID = "dsh-archive-manager";
+    const PLUGIN_ID = "dsh-int-archive-manager";
     const CSS_ID = PLUGIN_ID + "/archive-manager.css";
 
     /**
      * 面板 id —— 必须同时用作 `sidebar.panellist` 的 id 与 `main` 的 key。
      * ★ 字符串里不能有特殊字符：它会出现在槽位键里，也会进 aria 标签。
      */
-    const PANEL_ID = "dsh-archive-manager";
+    const PANEL_ID = "dsh-int-archive-manager";
     const PANELIST_SLOT = "sidebar.panellist";
     const MAIN_SLOT = "main";
     const PANEL_LABEL = "已归档";

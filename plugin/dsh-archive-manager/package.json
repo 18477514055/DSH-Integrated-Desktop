@@ -1,6 +1,6 @@
 {
-  "name": "dsh-archive-manager",
-  "version": "0.1.0",
+  "name": "dsh-int-archive-manager",
+  "version": "0.2.0",
   "private": true,
   "description": "侧边栏新增「已归档」分组：列出已归档对话，可搜索（标题/目录）、按天筛选，并可永久删除（送回收站，需二次确认）以腾出空间。",
   "type": "module",

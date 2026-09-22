@@ -99,7 +99,7 @@ function cdpEval(wsUrl, expression, timeoutMs = 30000) {
   // ── 取一个配对码 ──
   let code;
   try {
-    const st = await (await fetch(`${OFFICIAL}/dsh-mobile-remote/state`)).json();
+    const st = await (await fetch(`${OFFICIAL}/dsh-int-mobile-remote/state`)).json();
     code = st.data.code;
     console.log(`  拿到配对码 : ${code}`);
   } catch (e) {
