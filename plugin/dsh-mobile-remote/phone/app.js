@@ -38,8 +38,10 @@
   var sessionList = $('sessionList'), listMsg = $('listMsg'), searchInput = $('searchInput');
   var messages = $('messages'), promptForm = $('promptForm'), promptInput = $('promptInput');
   var detailTitle = $('detailTitle'), detailSub = $('detailSub'), sendBtn = $('sendBtn');
+  var detailModel = $('detailModel');
   var approvalBar = $('approvalBar'), approvalTool = $('approvalTool'), approvalReason = $('approvalReason');
   var attachBar = $('attachBar'), fileInput = $('fileInput');
+  var uploadInput = $('uploadInput');
   var sheet = $('sheet'), sheetTitle = $('sheetTitle'), sheetBody = $('sheetBody');
   var hostBanner = $('hostBanner'), hostBannerText = $('hostBannerText');
 
@@ -85,6 +87,13 @@
     if (h < 48) return '昨天';
     var dt = new Date(ts);
     return (dt.getMonth() + 1) + '-' + dt.getDate();
+  }
+  function fmtBytes(n) {
+    if (typeof n !== 'number' || !isFinite(n) || n < 0) return '';
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+    return (n / 1073741824).toFixed(2) + ' GB';
   }
   function scrollDown() { messages.scrollTop = messages.scrollHeight; }
 
@@ -231,6 +240,33 @@
     }).catch(function (e) { setMsg(pairMsg, e.message, 'bad'); });
   }
 
+  /* ── 401 自动静默重配对（2026-09-22 用户需求："连接过之后不要再断掉"）──
+   *
+   * 场景：电脑端插件升级 / 设备台账被清（换机器、点了"断开全部手机"）后，
+   * 手机 localStorage 里的旧 token 在服务端已不存在 ⇒ 所有请求 401 ⇒
+   * 旧版直接 logout() 回到配对页，用户只能拿手机去重新扫码 —— 烦。
+   *
+   * 修法分两层（都不需要用户动手）：
+   * ① **地址里有现成配对码时**（/pair?c=XXXX 链接、App 二维码带的 u 参数）：
+   *    拿那个码静默重新配对一次（一次性码本来就是给这一刻用的）。
+   *    App 场景尤其顺：App 记住的 URL 含 ?c=，重进 App 即自动恢复。
+   * ② **没有现成码时**：回配对页但**保留提示**"在电脑上点换一张码后输入 8 位码"
+   *    —— 手输 8 位码比拿相机扫码快得多（不用离开手机）。
+   *
+   * 安全边界：自动重配对用的也是**一次性码**，且只在 401（服务端明确拒绝）
+   * 时尝试一次，不存在"拿旧 token 续命"的通道。 */
+  var pairCodeFromUrl = new URLSearchParams(location.search).get('c');
+
+  function autoRepair() {
+    if (pairCodeFromUrl) {
+      var c = pairCodeFromUrl;
+      pairCodeFromUrl = null;         // 只试一次：码是一次性的，失败别死循环
+      pair(c);
+      return true;
+    }
+    return false;
+  }
+
   /* ── 事件流（SSE） ──────────────────────────────────── */
 
   function openStream() {
@@ -279,7 +315,7 @@
       renderList();          // ★ 标题就在 sessions 里，直接渲染，不再额外请求
     }).catch(function (e) {
       setMsg(listMsg, e.message, 'bad');
-      if (e.unauthorized) logout();
+      if (e.unauthorized) { if (!autoRepair()) logout(); }   // ★ 有现成码先静默重配对
     });
   }
 
@@ -291,38 +327,108 @@
     return null;
   }
 
+  /* ── 会话列表：按工作区分组 + 折叠 + 过滤子代理 ──────────────
+   * 2026-09-22 用户三条要求（都在这一段）：
+   *   ①「所有的对话按照工作区分成几类，现在这样子看着太乱了，并且可以折叠。」
+   *   ②「子代理引起的那些对话，基本没有必要展示出来，只展示主模型对话。」
+   *
+   * ★ 怎么判断"是不是子代理"：`session.list` 的条目里**本来就有** `origin` 字段
+   *   （旧代码第 344 行已经在用 `s.origin === 'subagent'` 打标签了），
+   *   所以这里直接按它过滤 —— 不猜、不额外请求。
+   *
+   * ★ 折叠状态存 localStorage：按工作区标题记，刷新/重进保持用户的展开习惯。
+   *   默认**全部收起**（列表一眼看清有几个工作区、各自多少会话），
+   *   但"正在运行"的工作区默认展开 —— 那是最可能需要点进去的。 */
+  var COLLAPSE_KEY = 'dsh-mmr-collapsed';
+  var collapsedWs = {};
+  try { collapsedWs = JSON.parse(localStorage.getItem(COLLAPSE_KEY) || '{}') || {}; } catch (e) { collapsedWs = {}; }
+  function saveCollapsed() {
+    try { localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsedWs)); } catch (e) { }
+  }
+
+  /** 子代理会话是否显示（默认隐藏）。存 localStorage。 */
+  var SHOW_SUB_KEY = 'dsh-mmr-show-sub';
+  var showSubagents = false;
+  try { showSubagents = localStorage.getItem(SHOW_SUB_KEY) === '1'; } catch (e) { }
+
   function renderList() {
     var q = (searchInput.value || '').trim().toLowerCase();
     sessionList.innerHTML = '';
-    var shown = 0;
+    var shown = 0, hiddenSub = 0;
+
+    // 先分组：key = 工作区标题（没有工作区的按 cwd 末段，再没有就归"未绑定工作区"）
+    var groups = [], byKey = {};
     sessions.forEach(function (s) {
       var title = titleOf(s);
       var ws = workspaceOf(s.sessionId);
       var wsName = ws ? ws.title : (s.cwd ? baseName(s.cwd) : '');
+      var isSub = s.origin === 'subagent';
       var hay = (title + ' ' + wsName + ' ' + (s.cwd || '')).toLowerCase();
       if (q && hay.indexOf(q) < 0) return;
-      shown++;
-
-      var row = el('button', 'row' + (s.running ? ' running' : '') + (s.blank && !title ? ' blank' : ''));
-      row.appendChild(el('span', 'row-dot'));
-      var main = el('div', 'row-main');
-
-      // 有标题用标题；没有才退回路径名 / 会话号（并说明是空会话）
-      var displayTitle = title || (s.blank ? '（空会话）' : (wsName || s.sessionId.slice(0, 12)));
-      main.appendChild(el('div', 'row-title', displayTitle));
-
-      var meta = el('div', 'row-meta');
-      if (wsName && wsName !== displayTitle) meta.appendChild(el('span', 'chip ws', '📁 ' + wsName));
-      if (s.running) meta.appendChild(el('span', 'chip run', '● 运行中'));
-      if (s.origin === 'subagent') meta.appendChild(el('span', 'chip', '子代理'));
-      meta.appendChild(el('span', 'chip time', relTime(s.updatedAt)));
-      main.appendChild(meta);
-
-      row.appendChild(main);
-      row.onclick = function () { openSession(s.sessionId, title); };
-      sessionList.appendChild(row);
+      if (isSub && !showSubagents && !q) { hiddenSub++; return; }   // ★ 搜索时不过滤，否则"搜不到"很费解
+      var key = wsName || '（未绑定工作区）';
+      if (!byKey[key]) { byKey[key] = { name: key, items: [], running: 0 }; groups.push(byKey[key]); }
+      byKey[key].items.push({ s: s, title: title, wsName: wsName });
+      if (s.running) byKey[key].running++;
     });
-    if (!shown) setMsg(listMsg, sessions.length ? '没有匹配的会话' : '还没有会话，点右上角 ＋ 新建');
+
+    // 组内按更新时间倒序（最近的在上面）
+    groups.forEach(function (g) {
+      g.items.sort(function (a, b) { return (b.s.updatedAt || 0) - (a.s.updatedAt || 0); });
+    });
+    // 组间：有运行中的排前面，然后按该组最新更新时间
+    groups.sort(function (a, b) {
+      if ((b.running > 0) !== (a.running > 0)) return (b.running > 0 ? 1 : -1);
+      var ta = a.items[0] ? (a.items[0].s.updatedAt || 0) : 0;
+      var tb = b.items[0] ? (b.items[0].s.updatedAt || 0) : 0;
+      return tb - ta;
+    });
+
+    groups.forEach(function (g) {
+      // 折叠状态：显式记过就用记的，否则默认收起（运行中的默认展开）
+      var isCollapsed = (g.name in collapsedWs) ? collapsedWs[g.name] : !(g.running > 0);
+
+      var head = el('button', 'wsgroup-head');
+      head.appendChild(el('span', 'wsgroup-caret', isCollapsed ? '▸' : '▾'));
+      head.appendChild(el('span', 'wsgroup-name', g.name));
+      head.appendChild(el('span', 'wsgroup-count', String(g.items.length)));
+      if (g.running) head.appendChild(el('span', 'chip run', '● ' + g.running));
+      head.onclick = function () {
+        collapsedWs[g.name] = !isCollapsed;
+        saveCollapsed();
+        renderList();
+      };
+      sessionList.appendChild(head);
+
+      if (isCollapsed) return;
+      g.items.forEach(function (it) {
+        shown++;
+        var s = it.s;
+        var row = el('button', 'row' + (s.running ? ' running' : '') + (s.blank && !it.title ? ' blank' : ''));
+        row.appendChild(el('span', 'row-dot'));
+        var main = el('div', 'row-main');
+        var displayTitle = it.title || (s.blank ? '（空会话）' : (it.wsName || s.sessionId.slice(0, 12)));
+        main.appendChild(el('div', 'row-title', displayTitle));
+
+        var meta = el('div', 'row-meta');
+        if (s.running) meta.appendChild(el('span', 'chip run', '● 运行中'));
+        if (s.origin === 'subagent') meta.appendChild(el('span', 'chip sub', '子代理'));
+        meta.appendChild(el('span', 'chip time', relTime(s.updatedAt)));
+        main.appendChild(meta);
+
+        row.appendChild(main);
+        row.onclick = function () { openSession(s.sessionId, it.title); };
+        sessionList.appendChild(row);
+      });
+    });
+
+    if (!shown) {
+      if (q) setMsg(listMsg, '没有匹配的会话');
+      else if (hiddenSub) setMsg(listMsg, '只有子代理会话（默认隐藏，可在「更多」里打开）');
+      else setMsg(listMsg, '还没有会话，点右上角 ＋ 新建');
+    } else {
+      setMsg(listMsg, hiddenSub ? ('已隐藏 ' + hiddenSub + ' 个子代理会话') : '');
+    }
   }
 
   /* ── 详情 ───────────────────────────────────────────── */
@@ -340,10 +446,40 @@
     detailTitle.textContent = currentTitle || sessionId.slice(0, 12);
     var s = sessions.filter(function (x) { return x.sessionId === sessionId; })[0];
     detailSub.textContent = (s && s.cwd) ? s.cwd : '';
+    detailModel.textContent = '';
+    loadModelLine();     // ★ 当前模型与推理强度（异步填，不挡开页面）
     show(detailView);
     api('session.watch', { sessionId: sessionId }).catch(function (e) { addNote('⚠ ' + e.message, true); });
     setTimeout(scrollDown, 60);
   }
+
+  /* ── 当前模型 / 推理强度（2026-09-22 用户需求）──────────────
+   * 显示规则（宿主已经把两个字段都给了，这里只做取舍）：
+   *   · 有 next（刚切过、还没生效）⇒ 显示 next，并标"下一条生效"
+   *   · 否则显示 lastUsed（真正在用）
+   *   · 都没有 ⇒ 显示"未选模型"（新会话可能还没发过消息）
+   * 点这一行 = 打开模型抽屉（比让用户找按钮快）。 */
+  function loadModelLine() {
+    if (!current) return;
+    api('session.model', { sessionId: current }).then(function (r) {
+      if (!r || !r.effective) {
+        detailModel.textContent = '未选模型';
+        detailModel.className = 'model-line dim';
+        return;
+      }
+      var m = r.effective;
+      var txt = (m.model || m.provider || '未知');
+      if (m.reasoningEffort) txt += ' · ' + m.reasoningEffort;
+      if (r.pending) txt += '（下一条生效）';
+      detailModel.textContent = txt;
+      detailModel.className = 'model-line' + (r.pending ? ' pending' : '');
+      detailModel.title = m.provider + ' / ' + m.model;
+    }).catch(function () {
+      detailModel.textContent = '';
+      detailModel.className = 'model-line dim';
+    });
+  }
+  detailModel.onclick = function () { openModelSheet(); };
 
   function addNote(text, bad) {
     var n = el('div', 'note' + (bad ? ' bad' : ''), text);
@@ -540,21 +676,77 @@
     scrollDown();
   }
 
+  /* ── Markdown → 纯文本（2026-09-22 用户需求）──────────────────
+   * 用户原话：「手机上同步到的对话全都是 Markdown 文档，我希望它变成纯文本形式。」
+   * 也就是说：**要的是内容，不是标记语法**。`**粗体**`、`## 标题`、`| 表格 |`、
+   * `[文字](链接)` 这些符号在窄屏上既占宽度又难读。
+   *
+   * ★ 为什么自己写而不是引 markdown 库：本插件零依赖（手机页就三个文件、
+   *   由宿主现读现发）。而这里**不需要解析器** —— 只需要"把标记去掉"，
+   *   正则足够，且不会因为语法边界把正文吃掉（下面每条的取舍都写清了）。
+   *
+   * ★ 哪些**故意保留**：
+   *   · 代码块（``` 围栏）仍然渲染成等宽块 —— 那是内容不是标记，
+   *     而且代码必须等宽才看得懂（见 renderAssistantText 的分段逻辑）。
+   *   · 列表符号转成 `•`（保留"这是一条列表"的信息，只去掉 markdown 的符号）。
+   *   · 表格转成 `a  ·  b  ·  c`（保留分列语义，去掉竖线噪音）。 */
+  function plainify(md) {
+    var t = String(md == null ? '' : md);
+    t = t.replace(/```[^\n]*\n?/g, '');                     // 残留围栏
+    t = t.replace(/`([^`]+)`/g, '$1');                       // 行内代码
+    t = t.replace(/!\[([^\]]*)\]\([^)]*\)/g, function (_, a) {  // 图片
+      return a ? '[图片：' + a + ']' : '[图片]';
+    });
+    t = t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (_, txt, url) {  // 链接
+      return txt === url ? url : txt + '（' + url + '）';
+    });
+    t = t.replace(/\*\*\*([^*]+)\*\*\*/g, '$1');
+    t = t.replace(/\*\*([^*]+)\*\*/g, '$1');
+    t = t.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1$2');
+    t = t.replace(/__([^_]+)__/g, '$1');
+    t = t.replace(/(^|[^_\w])_([^_\n]+)_(?!_)/g, '$1$2');
+    t = t.replace(/~~([^~]+)~~/g, '$1');
+    t = t.replace(/^\s{0,3}#{1,6}\s+/gm, '');                // 标题
+    t = t.replace(/^\s{0,3}>\s?/gm, '');                     // 引用
+    t = t.replace(/^\s{0,3}(?:[-*_]\s*){3,}$/gm, '————');    // 分隔线
+    t = t.replace(/^(\s*)[-*+]\s+/gm, '$1• ');               // 无序列表
+    t = t.replace(/^\s*\|?[\s:|-]{3,}\|[\s:|-]*$/gm, '');    // 表格分隔行
+    t = t.replace(/^\s*\|(.+)\|\s*$/gm, function (_, row) {  // 表格行 → · 分隔
+      /* ★ 必须自己补一个换行：这条正则匹配的是"整行"，替换结果不带 \n，
+       *   而 `.` 不跨行 ⇒ 相邻两行的替换结果会**首尾粘在一起**
+       *   （实测："| 名称 | 值 |\n| a | 1 |" 变成 "名称 · 值a · 1"）。
+       *   探针脚本 runtime/plainify-probe.cjs 抓到的就是这个。 */
+      return row.split('|').map(function (c) { return c.trim(); })
+        .filter(Boolean).join('  ·  ') + '\n';
+    });
+    t = t.replace(/<\/?[a-zA-Z][^>]*>/g, '');                // 残留 HTML
+    t = t.replace(/\n{3,}/g, '\n\n');
+    return t.replace(/^\n+|\n+$/g, '');
+  }
+
+  /** 显示开关：纯文本（默认）/ 原始 Markdown。存 localStorage，刷新后保持。 */
+  var PLAIN_KEY = 'dsh-mmr-plain';
+  var plainMode = true;
+  try { plainMode = localStorage.getItem(PLAIN_KEY) !== '0'; } catch (e) { }
+
   function renderAssistantText(text) {
     var parts = String(text).split(/```/);
     for (var i = 0; i < parts.length; i++) {
       var seg = parts[i];
       if (!seg) continue;
       if (i % 2 === 1) {
+        // 代码块：保留等宽渲染（内容不是标记），但去掉语言标签那行
         var nl = seg.indexOf('\n');
         var lang = '', code = seg;
         if (nl >= 0) { lang = seg.slice(0, nl).trim(); code = seg.slice(nl + 1); }
         var pre = el('pre', 'code');
-        if (lang && lang.length < 20) pre.setAttribute('data-lang', lang);
+        if (!plainMode && lang && lang.length < 20) pre.setAttribute('data-lang', lang);
         pre.textContent = code.replace(/\s+$/, '');
         messages.appendChild(pre);
       } else {
         var t = seg.replace(/^\n+|\n+$/g, '');
+        if (!t) continue;
+        if (plainMode) t = plainify(t);
         if (t) addBubble('assistant', t);
       }
     }
@@ -786,6 +978,7 @@
       closeSheet();
       var sel = (r && r.selected) || {};
       addNote('已切换模型：' + (sel.model || model) + (sel.reasoningEffort ? ' · ' + sel.reasoningEffort : ''));
+      loadModelLine();     // ★ 顶栏那行"当前模型"跟着更新（否则要退出重进才变）
     }).catch(function (e) {
       closeSheet();
       addNote('⚠ 切换失败：' + e.message, true);
@@ -835,13 +1028,38 @@
   /* 「＋」动作列表：输入区的所有附加功能集中在这一个抽屉里。
    * 用户原话：「以后所有的功能全部集中在一个列表中，而不是分成什么图片啊、
    *   历史输入啊，两个按键……输入框的位置也宽一点。」
-   * 以后加新能力 = 往下面 ACTIONS 里加一条，**不再动输入区布局**。 */
+   * 以后加新能力 = 往下面 ACTIONS 里加一条，**不再动输入区布局**。
+   *
+   * 2026-09-22 新增四类（用户要求）：
+   *   · 权限选择   —— 走官方 permissionPresets（沙箱模式+审批策略的预设）
+   *   · 文件选择   —— 走官方 fileReferences（电脑上的文件/目录）
+   *   · 指令选择   —— 走官方 commands（斜杠命令目录）
+   *   · 上下文容量 —— 走官方 contextPressure 投影
+   * 每一条都是**先探测再显示**：宿主不支持就不显示（而不是点了报错）。 */
   function openPlusSheet() {
     openSheet('添加', function (body) {
       var ACTIONS = [
         { icon: '🖼', label: '发图片', hint: '最多 6 张', run: function () { fileInput.click(); } },
         { icon: '🕘', label: '历史输入', hint: '最近 30 条', run: openHistorySheet },
+        { icon: '📄', label: '选电脑文件', hint: '引用 / 下载电脑上的文件', run: openFileSheet },
+        { icon: '⬆', label: '传到电脑', hint: '把手机文件存进工作区', run: openUploadSheet },
+        { icon: '⌘', label: '指令', hint: '斜杠命令', run: openCommandSheet },
+        { icon: '🛡', label: '权限', hint: '沙箱 / 审批档位', run: openPermissionSheet },
+        { icon: '📊', label: '上下文容量', hint: '当前占用与窗口', run: openContextSheet },
+        { icon: '🔑', label: '添加 API', hint: '给电脑加一个模型通道', run: openAddApiSheet },
       ];
+      /* 「重启 App」：只在跑在手机 App（WebView 壳）里时显示。
+       * 原理：壳里注册了 JS 桥 window.dshNative.forceRestart()（MainActivity），
+       * 浏览器里没有这个对象 ⇒ 探测不到就不显示（浏览器刷新页面即可，用不上重启）。
+       * 用途：电脑端插件升级后，点一下 App 原地重启，不用去系统设置砍后台。 */
+      var isNativeShell = false;
+      try { isNativeShell = !!(window.dshNative && window.dshNative.forceRestart); } catch (e) { }
+      if (isNativeShell) {
+        ACTIONS.push({
+          icon: '↻', label: '重启 App', hint: '电脑端升级后用',
+          run: function () { try { window.dshNative.forceRestart(); } catch (e) { location.reload(); } },
+        });
+      }
       ACTIONS.forEach(function (a) {
         var b = el('button', 'btn block plus-item');
         b.appendChild(el('span', 'plus-ico', a.icon));
@@ -851,6 +1069,686 @@
         b.onclick = function () { closeSheet(); a.run(); };
         body.appendChild(b);
       });
+    });
+  }
+
+  /* ── 上下文容量（抽屉）─────────────────────────────────
+   * 显示与电脑端**同源**的数字：usedTokens / contextWindow，百分比照抄官方
+   * 前端算法（`dsh-client-ui-conversation/lib/client.js:15330-15334`）。 */
+  function openContextSheet() {
+    if (!current) { addNote('⚠ 先打开一个会话'); return; }
+    openSheet('上下文容量', function (body) {
+      body.appendChild(el('div', 'empty', '读取中…'));
+      api('context.usage', { sessionId: current }).then(function (u) {
+        body.innerHTML = '';
+        if (u.usedTokens == null || !u.contextWindow) {
+          body.appendChild(el('div', 'empty', '还没有请求过 —— 发一条消息后就有数据了'));
+        } else {
+          var pct = u.percent == null ? 0 : u.percent;
+          var wrap = el('div', 'ctx-wrap');
+          wrap.appendChild(el('div', 'ctx-num',
+            fmtTokens(u.usedTokens) + ' / ' + fmtTokens(u.contextWindow)));
+          var bar = el('div', 'ctx-bar');
+          var fill = el('div', 'ctx-fill' + (pct >= 80 ? ' hot' : (pct >= 60 ? ' warm' : '')));
+          fill.style.width = Math.max(2, pct) + '%';
+          bar.appendChild(fill);
+          wrap.appendChild(bar);
+          wrap.appendChild(el('div', 'ctx-pct', pct + '%'));
+          body.appendChild(wrap);
+          if (u.projectedTokens != null) {
+            body.appendChild(el('div', 'sec', '下一轮预计'));
+            body.appendChild(el('div', 'empty',
+              fmtTokens(u.projectedTokens) + '（含本轮新增内容）'));
+          }
+          if (pct >= 80) {
+            body.appendChild(el('div', 'warnbox',
+              '已接近压缩线：这个客户端到窗口的 80% 会自动压缩，压缩后早期对话会被摘要替换。'));
+          }
+        }
+        if (u.totals) {
+          body.appendChild(el('div', 'sec', '本会话累计计费'));
+          body.appendChild(el('div', 'empty',
+            '输入 ' + fmtTokens(u.totals.uncachedInputTokens || 0)
+            + '　输出 ' + fmtTokens(u.totals.outputTokens || 0)
+            + '　缓存读 ' + fmtTokens(u.totals.cacheReadTokens || 0)));
+        }
+        var r = el('button', 'btn block', '刷新');
+        r.onclick = openContextSheet;
+        body.appendChild(r);
+      }).catch(function (e) {
+        body.innerHTML = '';
+        if (e.unknownMethod) unsupportedBox(body, '上下文容量');
+        else body.appendChild(el('div', 'empty', '读取失败：' + e.message));
+      });
+    });
+  }
+
+  /** 大数字缩写（与电脑端观感一致）。 */
+  function fmtTokens(n) {
+    n = Number(n) || 0;
+    if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+    if (n >= 1000) return Math.round(n / 1000) + 'K';
+    return String(n);
+  }
+
+  /* ── 权限选择（抽屉）───────────────────────────────────
+   * 走官方 permissionPresets：沙箱模式 + 审批策略的成对预设。
+   * danger 那一档标红并在点选时二次确认 —— 那是"完全放行"的意思。 */
+  function openPermissionSheet() {
+    if (!current) { addNote('⚠ 先打开一个会话'); return; }
+    openSheet('权限', function (body) {
+      body.appendChild(el('div', 'empty', '读取中…'));
+      api('permission.list', { sessionId: current }).then(function (r) {
+        body.innerHTML = '';
+        body.appendChild(el('div', 'sec', '当前：' + (r.current || '未知')));
+        (r.options || []).forEach(function (o) {
+          var danger = o.value === 'danger-full-access';
+          var b = el('button', 'btn block' + (o.value === r.current ? ' on' : '') + (danger ? ' danger' : ''));
+          b.appendChild(el('div', 'perm-name', o.name || o.value));
+          if (o.description) b.appendChild(el('div', 'perm-desc', o.description));
+          b.onclick = function () {
+            if (danger && !window.confirm('切到「' + (o.name || o.value) + '」= 完全放行文件访问、且不再询问审批。确定吗？')) return;
+            api('permission.set', { sessionId: current, preset: o.value }).then(function (res) {
+              closeSheet();
+              addNote('已切换权限：' + (res.current || o.value));
+            }).catch(function (e) { addNote('⚠ 切换失败：' + e.message, true); });
+          };
+          body.appendChild(b);
+        });
+        body.appendChild(el('div', 'empty',
+          '权限是**按会话**的；这里改的只影响当前会话，电脑端其它会话不受影响。'));
+      }).catch(function (e) {
+        body.innerHTML = '';
+        if (e.unknownMethod) unsupportedBox(body, '权限选择');
+        else body.appendChild(el('div', 'empty', '读取失败：' + e.message));
+      });
+    });
+  }
+
+  /* ── 指令选择（抽屉）───────────────────────────────────
+   * 列出官方斜杠命令；点一条就把 `/name ` 填进输入框（不直接执行 ——
+   * 需要参数的命令得让人先填参数，而且"填进输入框"是可反悔的）。 */
+  function openCommandSheet() {
+    if (!current) { addNote('⚠ 先打开一个会话'); return; }
+    openSheet('指令', function (body) {
+      body.appendChild(el('div', 'empty', '读取中…'));
+      api('command.list', { sessionId: current }).then(function (r) {
+        body.innerHTML = '';
+        var items = (r && r.items) || [];
+        if (!items.length) { body.appendChild(el('div', 'empty', '这个会话没有可用命令')); return; }
+        items.forEach(function (c) {
+          var b = el('button', 'btn block');
+          b.appendChild(el('div', 'cmd-name', '/' + c.name));
+          if (c.description) b.appendChild(el('div', 'cmd-desc', c.description));
+          if (c.takesInput && c.hint) b.appendChild(el('div', 'cmd-hint', '参数：' + c.hint));
+          b.onclick = function () {
+            var t = '/' + c.name + (c.takesInput ? ' ' : '');
+            promptInput.value = t;
+            promptInput.focus();
+            autoGrow();
+            closeSheet();
+            if (c.takesInput) addNote('已填入 /' + c.name + '，补上参数再发送');
+          };
+          body.appendChild(b);
+        });
+        body.appendChild(el('div', 'empty',
+          '命令由电脑端内核执行（与电脑上打 / 完全一样）。'));
+      }).catch(function (e) {
+        body.innerHTML = '';
+        if (e.unknownMethod) unsupportedBox(body, '指令列表');
+        else body.appendChild(el('div', 'empty', '读取失败：' + e.message));
+      });
+    });
+  }
+
+  /* ── 添加 API 通道（抽屉）────────────────────────────────
+   * 两步式，与电脑端设置页的"新增提供方"同一条路：
+   *   ① 填 ID / 地址 / 协议 / key → 「探测模型」（**只读，不写任何东西**）
+   *   ② 在结果里勾选要加的模型 → 「添加」→ 才真正写进电脑
+   * 为什么不一步到位：端点填错、协议选错时，一步式会**先把错配置写进电脑**。
+   * 先探测能把"这个地址到底能不能用"在落盘之前问清楚。 */
+  function openAddApiSheet() {
+    openSheet('添加 API', function (body) {
+      var wrap = el('div', 'api-form');
+
+      function field(label, hint, value) {
+        var f = el('div', 'api-field');
+        f.appendChild(el('label', 'api-label', label));
+        var i = document.createElement('input');
+        i.className = 'search';
+        i.type = 'text';
+        i.autocomplete = 'off';
+        i.spellcheck = false;
+        if (hint) i.placeholder = hint;
+        if (value) i.value = value;
+        f.appendChild(i);
+        wrap.appendChild(f);
+        return i;
+      }
+
+      var idIn = field('通道 ID', '小写字母/数字/连字符，例 acme-gateway');
+      var urlIn = field('接口地址', 'https://api.example.com/v1');
+      var nameIn = field('显示名（可选）', 'Acme');
+
+      var pf = el('div', 'api-field');
+      pf.appendChild(el('label', 'api-label', '协议'));
+      var proto = document.createElement('select');
+      proto.className = 'search';
+      ['openai-completions', 'openai-responses', 'anthropic-messages'].forEach(function (p) {
+        var o = document.createElement('option');
+        o.value = p; o.textContent = p;
+        proto.appendChild(o);
+      });
+      pf.appendChild(proto);
+      wrap.appendChild(pf);
+
+      var keyIn = field('API Key', 'sk-…（只存在电脑上，不回显）');
+      keyIn.type = 'password';
+
+      body.appendChild(wrap);
+      body.appendChild(el('div', 'empty',
+        'Key 会写进电脑的凭据文件（.credentials.yaml 的 refs 段），手机不留副本。'));
+
+      var found = [];          // 探测结果
+      var picked = {};         // id -> true
+      var listBox = el('div', 'api-list');
+      body.appendChild(listBox);
+
+      var probeBtn = el('button', 'btn block primary', '① 探测模型（只读，不写电脑）');
+      probeBtn.onclick = function () {
+        var providerId = idIn.value.trim();
+        var baseURL = urlIn.value.trim();
+        var api = proto.value;
+        if (!providerId || !baseURL) { listBox.innerHTML = ''; listBox.appendChild(el('div', 'empty', '先填通道 ID 和接口地址')); return; }
+        probeBtn.disabled = true;
+        listBox.innerHTML = '';
+        listBox.appendChild(el('div', 'empty', '正在问端点有哪些模型…'));
+        api('llm.discover', { provider: providerId, baseURL: baseURL, api: api, apiKey: keyIn.value })
+          .then(function (r) {
+            found = (r && r.models) || [];
+            picked = {};
+            listBox.innerHTML = '';
+            if (!found.length) {
+              listBox.appendChild(el('div', 'empty', '端点没报出任何模型（地址/协议/key 对不上？）'));
+              return;
+            }
+            listBox.appendChild(el('div', 'sec', '探测到 ' + found.length + ' 个模型（勾选要加的）'));
+            found.forEach(function (m) {
+              picked[m.id] = true;      // 默认全选：官方设置页也是"添加所选"
+              var row = el('button', 'btn block api-model on');
+              row.appendChild(el('span', 'api-check', '✓'));
+              row.appendChild(el('span', 'api-mid', m.name ? (m.name + '  (' + m.id + ')') : m.id));
+              if (m.contextWindow) row.appendChild(el('span', 'api-ctx', fmtTokens(m.contextWindow)));
+              row.onclick = function () {
+                picked[m.id] = !picked[m.id];
+                row.className = 'btn block api-model' + (picked[m.id] ? ' on' : '');
+                row.firstChild.textContent = picked[m.id] ? '✓' : '○';
+              };
+              listBox.appendChild(row);
+            });
+          })
+          .catch(function (e) {
+            listBox.innerHTML = '';
+            listBox.appendChild(el('div', 'empty', '探测失败：' + e.message));
+          })
+          .then(function () { probeBtn.disabled = false; });
+      };
+      body.appendChild(probeBtn);
+
+      var addBtn = el('button', 'btn block primary', '② 添加到电脑');
+      addBtn.onclick = function () {
+        var providerId = idIn.value.trim();
+        var baseURL = urlIn.value.trim();
+        var api = proto.value;
+        var chosen = found.filter(function (m) { return picked[m.id]; });
+        if (!chosen.length) { addNote('⚠ 先探测并勾选模型'); return; }
+        if (!window.confirm('把这 ' + chosen.length + ' 个模型加到电脑的通道「' + providerId + '」？\n'
+          + '（会写入电脑的 settings.yaml 与 .credentials.yaml，立刻生效、不用重启）')) return;
+        addBtn.disabled = true;
+        api('llm.add', {
+          providerId: providerId,
+          baseURL: baseURL,
+          api: api,
+          displayName: nameIn.value.trim(),
+          apiKey: keyIn.value,
+          models: chosen.map(function (m) {
+            return { id: m.id, name: m.name, contextWindow: m.contextWindow, maxTokens: m.maxTokens };
+          }),
+        }).then(function (r) {
+          closeSheet();
+          addNote('✅ 已添加通道 ' + (r.displayName || providerId) + '（' + r.models + ' 个模型）'
+            + (r.keyStored ? '，key 已保存' : '') + '。' + (r.note || ''));
+        }).catch(function (e) {
+          addNote('⚠ 添加失败：' + e.message, true);
+        }).then(function () { addBtn.disabled = false; });
+      };
+      body.appendChild(addBtn);
+
+      // 已有通道（避免重复添加 / 看清单）
+      var existBox = el('div', 'api-exist');
+      body.appendChild(existBox);
+      api('llm.providers').then(function (r) {
+        var ps = (r && r.providers) || [];
+        if (!ps.length) return;
+        existBox.appendChild(el('div', 'sec', '电脑上已有的通道'));
+        ps.forEach(function (p) {
+          existBox.appendChild(el('div', 'empty',
+            (p.displayName || p.id) + '　' + p.models.length + ' 个模型　' + (p.baseURL || '')));
+        });
+      }).catch(function () { /* 读不到就不显示 */ });
+    });
+  }
+
+  /* ── 电脑文件选择（抽屉）───────────────────────────────
+   * 用官方文件引用服务逐层浏览电脑目录；选中后把官方 @ 提及语法填进输入框
+   * （内核自己会把它解析成文件引用 —— 与电脑端 @ 完全同一条路）。
+   *
+   * ★ 2026-09-22 扩展：**可以切换工作区**（用户原话：「我们的整个工作其实已经
+   *   迁移到第2个工作区了，有没有办法让手机可以下载三个工作区的文件？
+   *   以及向三个工作区发送文件。」）
+   *   工作区列表来自官方 `workspace.list`（与"新建会话"同一个来源，早就在用了）。
+   *   `root` 一路透传给宿主；宿主**只认已注册工作区**（见 desktop/index.js 的
+   *   `resolveTargetRoot`），手机端传别的路径一律被拒。 */
+  function openFileSheet(startPath, root) {
+    if (!current) { addNote('⚠ 先打开一个会话'); return; }
+    var path = startPath || '';
+    var curRoot = root || '';          // '' = 本会话自己的工作区
+    function render(body) {
+      body.innerHTML = '';
+      body.appendChild(el('div', 'empty', '读取中…'));
+      var params = { sessionId: current, path: path };
+      if (curRoot) params.root = curRoot;
+      api('file.list', params).then(function (r) {
+        body.innerHTML = '';
+
+        /* ── 工作区切换条 ────────────────────────────────
+         * 只在**真的有多个工作区**时显示（一个的时候是噪音）。
+         * 每台设备显示成一颗胶囊，当前所在的那颗高亮。 */
+        if (workspaces.length > 1) {
+          var wsbar = el('div', 'wsbar');
+          // 本会话自己的工作区（用返回的 root 判断，比猜 cwd 可靠）
+          var ownRoot = r && r.isOther === false ? (r.root || '') : '';
+          var pills = [{ title: '本会话', root: '', active: !curRoot }];
+          workspaces.forEach(function (w) {
+            pills.push({
+              title: w.title || w.path,
+              root: w.path,
+              active: !!curRoot && curRoot === w.path,
+            });
+          });
+          pills.forEach(function (p) {
+            var c = el('button', 'wspill' + (p.active ? ' on' : ''), p.title);
+            c.title = p.root || '（当前会话的工作区）';
+            c.onclick = function () {
+              if (p.active) return;
+              openFileSheet('', p.root);       // 换工作区 ⇒ 回到那个工作区的根
+            };
+            wsbar.appendChild(c);
+          });
+          body.appendChild(wsbar);
+        }
+
+        // 面包屑：支持逐层返回
+        var crumb = el('div', 'crumb');
+        var up = el('button', 'crumb-up', path ? '↑ 上一级' : (r && r.rootName ? r.rootName : '工作区根目录'));
+        up.onclick = function () { openFileSheet(r.parent || '', curRoot); };
+        crumb.appendChild(up);
+        if (path) crumb.appendChild(el('span', 'crumb-path', path));
+        body.appendChild(crumb);
+
+        /* 跨工作区时明确提示一句 —— 否则用户会以为"我明明在本会话里，
+         * 怎么看到的是别的工作区的文件"。 */
+        if (r && r.isOther) {
+          body.appendChild(el('div', 'xfer-note', '正在浏览别的工作区：' + (r.root || '')));
+        }
+
+        var items = (r && r.items) || [];
+        if (!items.length) body.appendChild(el('div', 'empty', '这个目录是空的'));
+        items.forEach(function (it) {
+          var isDir = it.kind === 'directory';
+          var b = el('button', 'btn block file-item');
+          b.appendChild(el('span', 'file-ico', isDir ? '📁' : '📄'));
+          b.appendChild(el('span', 'file-name', it.name || it.path));
+          // 文件大小（跨工作区那条路会带 size；本会话那条不带）
+          if (!isDir && typeof it.size === 'number') {
+            b.appendChild(el('span', 'file-size', fmtBytes(it.size)));
+          }
+          b.onclick = function () {
+            if (isDir) { openFileSheet(it.path, curRoot); return; }
+            /* 文件有三种用法，让用户选（图片尤其需要 —— 直接引用图片路径
+             * 模型只能看到路径，而"读成图片发出去"它才真的看得见图）：
+             *   · 引用路径：把官方 @提及 文本填进输入框（纯文本，内核靠系统
+             *     提示词让模型用 read 工具读 —— 官方就是这么设计的）
+             *   · 读成图片：走 workspaceFiles.readAll 拿 base64，塞进待发图片
+             *     列表（与手机相册发的图走**完全相同**的发送路径）
+             *   · 下载到手机：交给系统下载器（2026-09-22 新增）
+             * 2026-09-22 改：**所有文件**都进这个抽屉，不再只给图片。
+             * 旧写法对非图片直接 insertMention，于是"下载"这个动作
+             * 在非图片上根本没有入口 —— 而用户要下载的恰恰是 zip / 源码。 */
+            openFileActions(it, curRoot);
+          };
+          body.appendChild(b);
+        });
+      }).catch(function (e) {
+        body.innerHTML = '';
+        if (e.unknownMethod) unsupportedBox(body, '选文件');
+        else body.appendChild(el('div', 'empty', '读取失败：' + e.message));
+      });
+    }
+    openSheet('选电脑文件', render);
+  }
+
+  /** 把 @提及 填进输入框（官方语法：目录补 /，含空白用 @"…"）。 */
+  function insertMention(it, root) {
+    promptInput.value = (promptInput.value ? promptInput.value.replace(/\s*$/, ' ') : '') + it.mention + ' ';
+    promptInput.focus();
+    autoGrow();
+    closeSheet();
+    /* 跨工作区的提及是**绝对路径**（宿主那边拼的，见 desktop/index.js 的
+     * `tr.isOther` 分支）—— 因为 `@相对路径` 的语义是"相对**本会话**工作区根"，
+     * 拿别的工作区的相对路径在当前会话里根本解析不到。这里如实告诉用户。 */
+    addNote('已引用：' + (root ? it.mention : it.path));
+  }
+
+  /** 文件：问"引用路径 / 读成图片 / 下载到手机"。 */
+  function openFileActions(it, root) {
+    var isImg = /\.(png|jpe?g|webp|gif|bmp|avif)$/i.test(it.path);
+    openSheet(isImg ? '这张图怎么用' : '这个文件怎么用', function (body) {
+      body.appendChild(el('div', 'empty', root ? it.mention : it.path));
+      var a = el('button', 'btn block');
+      a.appendChild(el('div', 'cmd-name', '引用路径'));
+      a.appendChild(el('div', 'cmd-desc', root
+        ? '填绝对路径进输入框（别的工作区只能用绝对路径）'
+        : '把 @路径 填进输入框，模型自己用工具去读'));
+      a.onclick = function () { insertMention(it, root); };
+      body.appendChild(a);
+
+      if (isImg) {
+        var b = el('button', 'btn block');
+        b.appendChild(el('div', 'cmd-name', '读成图片发出去'));
+        b.appendChild(el('div', 'cmd-desc', '直接把文件内容读过来，像相册图片一样发给模型看'));
+        b.onclick = function () {
+          b.disabled = true;
+          var rp = { sessionId: current, path: it.path };
+          if (root) rp.root = root;
+          api('file.read', rp).then(function (r) {
+            if (!r || !r.data) throw new Error('文件是空的');
+            var ext = (it.path.split('.').pop() || 'png').toLowerCase();
+            var mt = ext === 'jpg' ? 'jpeg' : ext;
+            pendingImages.push({
+              mediaType: 'image/' + mt,
+              data: r.data,
+              name: it.name || 'file',
+              url: 'data:image/' + mt + ';base64,' + r.data,
+            });
+            renderAttach();
+            closeSheet();
+            addNote('已加入待发图片：' + (it.name || it.path)
+              + (r.bytes ? '（' + Math.round(r.bytes / 1024) + ' KB）' : ''));
+          }).catch(function (e) {
+            addNote('⚠ 读取失败：' + e.message, true);
+          }).then(function () { b.disabled = false; });
+        };
+        body.appendChild(b);
+      }
+
+      /* ★ 下载到手机（2026-09-22 新增，用户需求"随时下载电脑那边的文件"）。
+       *   放在这里而不是「＋」里：下载的对象**永远是"某个具体的文件"**，
+       *   而用户在文件列表里点到它的时候，正好就是"我想要这个"的那一刻。
+       *   从「＋」进的话还要重新逐层找到它一遍。 */
+      var d = el('button', 'btn block');
+      d.appendChild(el('div', 'cmd-name', '下载到手机'));
+      d.appendChild(el('div', 'cmd-desc', '用系统下载器下载（有进度、可断点续传）'));
+      d.onclick = function () { startDownload(it, root); };
+      body.appendChild(d);
+    });
+  }
+
+  /* ── 文件互传（2026-09-22 用户需求）───────────────────────
+   * 用户原话：「允许连接之后的手机和电脑DSH互传文件。这方便了一些跨端项目中，
+   *   我可以随时下载电脑那边的文件。」
+   *
+   * ══════════════════════════════════════════════════════════════
+   * 下载为什么**不用 fetch**（这是本功能唯一的设计要点）
+   * ══════════════════════════════════════════════════════════════
+   * 若用 fetch 把字节拉进 JS 再转 blob：
+   *   · 整个文件**进 WebView 内存**（手机上传 200 MB 必被系统杀掉）；
+   *   · 没有任何进度（用户只看到"没反应"）；
+   *   · 拿不到系统下载器的断点续传与通知栏。
+   * 所以这里只做两件事：
+   *   ① 向宿主要一张**一次性票据**（`file.download`，只回 JSON）；
+   *   ② 把票据 URL 交给**系统下载管理器**（Android 壳里走 JS 桥
+   *      `dshNative.download`；浏览器里退化成 `location.href`，
+   *      由浏览器自己的下载器接管）。
+   * 字节全程不经过 JS。 */
+  function isNative() {
+    try { return !!(window.dshNative && window.dshNative.download); } catch (e) { return false; }
+  }
+
+  /** 把宿主给的相对 URL 补成绝对 URL（票据 URL 是 `/api/file/dl?t=…`）。 */
+  function absUrl(u) {
+    if (/^https?:\/\//i.test(u)) return u;
+    return location.origin + u;
+  }
+
+  function startDownload(it, root) {
+    if (!current) { addNote('⚠ 先打开一个会话'); return; }
+    var b = el('div', 'empty', '正在准备下载…');
+    openSheet('下载到手机', function (body) { body.appendChild(b); });
+    var params = { sessionId: current, path: it.path, name: it.name };
+    if (root) params.root = root;      // ★ 跨工作区：指定要下载的那个工作区
+    api('file.download', params)
+      .then(function (r) {
+        var url = absUrl(r.url);
+        /* ★ 票据 URL 必须带 token：系统下载器**加不了 Authorization 头**，
+         *   所以 token 只能走查询参数（宿主那边 `url.searchParams.get('token')`
+         *   就是为这条路留的，SSE 同理）。 */
+        url += (url.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(token);
+        if (isNative()) {
+          try { window.dshNative.download(url, r.name || 'file'); } catch (e) { }
+          closeSheet();
+          addNote('已交给系统下载：' + (r.name || '') + '（' + fmtBytes(r.bytes) + '）');
+          return;
+        }
+        // 浏览器：交给浏览器自己的下载器（同样带原生进度）
+        var a = document.createElement('a');
+        a.href = url; a.download = r.name || 'file';
+        a.rel = 'noopener';
+        document.body.appendChild(a); a.click();
+        setTimeout(function () { document.body.removeChild(a); }, 0);
+        closeSheet();
+        addNote('已开始下载：' + (r.name || '') + '（' + fmtBytes(r.bytes) + '）');
+      })
+      .catch(function (e) {
+        closeSheet();
+        if (e.unknownMethod) { addNote('⚠ 电脑端插件是旧版本，下载不可用（需重启客户端）', true); return; }
+        addNote('⚠ 下载失败：' + e.message, true);
+      });
+  }
+
+  /* ── 上传：手机 → 电脑 ────────────────────────────────────
+   * 走 `POST /api/file/ul?…`（**裸字节流**，不是 JSON），用 XHR 而不是 fetch ——
+   * 因为只有 XHR 有 `upload.onprogress`（fetch 的流式上传进度在 Android
+   * WebView 131 上仍不可靠）。进度要显示给用户：几百 MB 的传输没有进度
+   * 等于"卡死了"。
+   *
+   * ★ 落点是**某个工作区的目录**（默认本会话的），且由宿主强制校验
+   *   （越界、以及"不是已注册工作区"一律拒绝）。
+   *   这里先把落点问出来给用户看（`file.uploadTarget`），用户确认后才传。
+   *
+   * ★ 2026-09-22：加了**工作区切换**（用户："向三个工作区发送文件"）。 */
+  function openUploadSheet(root) {
+    if (!current) { addNote('⚠ 先打开一个会话'); return; }
+    var sub = '';                       // 当前选择的子目录（相对工作区根）
+    var curRoot = root || '';           // '' = 本会话自己的工作区
+    function render(body) {
+      body.innerHTML = '';
+      body.appendChild(el('div', 'empty', '正在读取落点…'));
+      var tp = { sessionId: current, dir: sub };
+      if (curRoot) tp.root = curRoot;
+      api('file.uploadTarget', tp).then(function (t) {
+        body.innerHTML = '';
+
+        // 工作区切换条（只有一个工作区时不显示，免得是噪音）
+        if (workspaces.length > 1) {
+          var wsbar = el('div', 'wsbar');
+          var pills = [{ title: '本会话', root: '', active: !curRoot }];
+          workspaces.forEach(function (w) {
+            pills.push({ title: w.title || w.path, root: w.path, active: !!curRoot && curRoot === w.path });
+          });
+          pills.forEach(function (p) {
+            var c = el('button', 'wspill' + (p.active ? ' on' : ''), p.title);
+            c.title = p.root || '（当前会话的工作区）';
+            c.onclick = function () {
+              if (p.active) return;
+              sub = '';                      // 换工作区 ⇒ 子目录重来（两个工作区的子目录无关）
+              openUploadSheet(p.root);
+            };
+            wsbar.appendChild(c);
+          });
+          body.appendChild(wsbar);
+        }
+
+        var info = el('div', 'xfer-info');
+        info.appendChild(el('div', 'xfer-row',
+          '电脑上的落点' + (t.isOther ? '（别的工作区）' : '')));
+        info.appendChild(el('div', 'xfer-path', t.absolutePath));
+        info.appendChild(el('div', 'xfer-note',
+          '上限 ' + fmtBytes(t.maxBytes) + '；重名不会覆盖，会自动加 -1、-2'));
+        body.appendChild(info);
+
+        // 子目录输入（相对工作区根；宿主会拒绝越出工作区）
+        var row = el('div', 'xfer-sub');
+        var inp = document.createElement('input');
+        inp.type = 'text'; inp.className = 'xfer-input';
+        inp.placeholder = '子目录（可留空 = 工作区根）';
+        inp.value = sub;
+        var go = el('button', 'btn small', '进入');
+        go.onclick = function () { sub = inp.value.trim(); render(body); };
+        row.appendChild(inp); row.appendChild(go);
+        body.appendChild(row);
+
+        var pick = el('button', 'btn block primary');
+        pick.appendChild(el('div', 'cmd-name', '选择手机上的文件'));
+        pick.appendChild(el('div', 'cmd-desc', '可以多选；传完可直接引用路径让模型读'));
+        pick.onclick = function () { uploadPick = { dir: sub, root: curRoot }; uploadInput.click(); };
+        body.appendChild(pick);
+      }).catch(function (e) {
+        body.innerHTML = '';
+        if (e.unknownMethod) unsupportedBox(body, '文件上传');
+        else body.appendChild(el('div', 'empty', '读取失败：' + e.message));
+      });
+    }
+    openSheet('传到电脑', render);
+  }
+
+  /** 当前待上传的目标（由 openUploadSheet 设置；选择器回调要用）。 */
+  var uploadPick = null;
+
+  uploadInput.onchange = function () {
+    var files = Array.prototype.slice.call(uploadInput.files || []);
+    uploadInput.value = '';
+    if (!files.length) return;
+    var target = uploadPick || { dir: '', root: '' };
+    uploadPick = null;
+    closeSheet();
+    uploadQueue(files, target.dir, target.root || '', 0, []);
+  };
+
+  /**
+   * 逐个上传（**串行**，不并行）。
+   * 为什么串行：并行会让"总进度"变成一笔糊涂账，而手机热点带宽本来就窄，
+   * 并行只会让每个都变慢。串行还能让用户看清"现在传到第几个"。
+   */
+  function uploadQueue(files, dir, root, idx, done) {
+    if (idx >= files.length) {
+      var ok = done.filter(function (d) { return d.ok; });
+      addNote('✅ 传到电脑：' + ok.length + '/' + files.length + ' 个'
+        + (ok.length ? '（' + ok[0].name + (ok.length > 1 ? ' 等' : '') + '）' : ''));
+      if (ok.length) {
+        // 把落点相对路径记下来，方便用户立刻引用
+        lastUploads = ok;
+        showUploadResult(ok);
+      }
+      return;
+    }
+    var f = files[idx];
+    var box = el('div', 'xfer-item');
+    box.appendChild(el('div', 'xfer-name', (idx + 1) + '/' + files.length + '  ' + f.name));
+    var bar = el('div', 'ctx-bar');
+    var fill = el('div', 'ctx-fill');
+    fill.style.width = '0%';
+    bar.appendChild(fill);
+    box.appendChild(bar);
+    var pct = el('div', 'xfer-pct', '0%');
+    box.appendChild(pct);
+    openSheet('正在传到电脑', function (body) { body.appendChild(box); });
+
+    var url = '/api/file/ul?sessionId=' + encodeURIComponent(current)
+      + '&path=' + encodeURIComponent(dir || '')
+      + '&name=' + encodeURIComponent(f.name)
+      + (root ? '&root=' + encodeURIComponent(root) : '');   // ★ 跨工作区上传
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', url, true);
+    xhr.setRequestHeader('authorization', 'Bearer ' + token);
+    xhr.setRequestHeader('content-type', 'application/octet-stream');
+    xhr.upload.onprogress = function (e) {
+      if (!e.lengthComputable) return;
+      var p = Math.round(e.loaded * 100 / e.total);
+      fill.style.width = Math.max(2, p) + '%';
+      pct.textContent = p + '%  ·  ' + fmtBytes(e.loaded) + ' / ' + fmtBytes(e.total);
+    };
+    xhr.onload = function () {
+      var j = null;
+      try { j = JSON.parse(xhr.responseText); } catch (e) { }
+      if (xhr.status === 200 && j && j.ok) {
+        done.push({
+          ok: true, name: j.name, rel: j.relativePath, mention: j.mention,
+          renamed: j.renamed, isOther: !!j.isOther,
+        });
+      } else {
+        done.push({ ok: false, name: f.name });
+        addNote('⚠ ' + f.name + ' 上传失败：' + ((j && j.message) || ('HTTP ' + xhr.status)), true);
+      }
+      uploadQueue(files, dir, root, idx + 1, done);
+    };
+    xhr.onerror = function () {
+      done.push({ ok: false, name: f.name });
+      addNote('⚠ ' + f.name + ' 上传中断（网络断了？）', true);
+      uploadQueue(files, dir, root, idx + 1, done);
+    };
+    xhr.send(f);
+  }
+
+  /** 上传成功后的收尾抽屉：把相对路径摆出来，一键引用 / 复制。 */
+  var lastUploads = [];
+  function showUploadResult(items) {
+    openSheet('已传到电脑', function (body) {
+      var other = items.some(function (i) { return i.isOther; });
+      body.appendChild(el('div', 'empty', other
+        ? '传进了**别的工作区**，引用时用的是绝对路径：'
+        : '落点在当前会话的工作区里，可以直接引用：'));
+      items.forEach(function (it) {
+        var b = el('button', 'btn block file-item');
+        b.appendChild(el('span', 'file-ico', '📄'));
+        b.appendChild(el('span', 'file-name',
+          (it.isOther ? it.mention : it.rel) + (it.renamed ? '（重名已改名）' : '')));
+        b.onclick = function () {
+          promptInput.value = (promptInput.value ? promptInput.value.replace(/\s*$/, ' ') : '') + it.mention + ' ';
+          promptInput.focus(); autoGrow(); closeSheet();
+          addNote('已引用：' + (it.isOther ? it.mention : it.rel));
+        };
+        body.appendChild(b);
+      });
+      var c = el('button', 'btn block', '复制路径');
+      c.onclick = function () {
+        var txt = items.map(function (i) { return i.mention; }).join(' ');
+        try {
+          navigator.clipboard.writeText(txt);
+          addNote('已复制到剪贴板');
+        } catch (e) { addNote('复制失败，请长按选择', true); }
+      };
+      body.appendChild(c);
     });
   }
 
@@ -880,9 +1778,43 @@
       var a = el('button', 'btn block', '刷新会话列表');
       a.onclick = function () { closeSheet(); loadAll(); };
       body.appendChild(a);
+
+      // ── 显示开关（2026-09-22）──
+      body.appendChild(el('div', 'sec', '显示'));
+
+      var p = el('button', 'btn block plus-item');
+      p.appendChild(el('span', 'plus-ico', plainMode ? '☑' : '☐'));
+      p.appendChild(el('span', 'plus-label', '纯文本显示对话'));
+      p.appendChild(el('span', 'plus-hint', plainMode ? '已开' : '原始 Markdown'));
+      p.onclick = function () {
+        plainMode = !plainMode;
+        try { localStorage.setItem(PLAIN_KEY, plainMode ? '1' : '0'); } catch (e) { }
+        closeSheet();
+        addNote(plainMode ? '已切到纯文本显示（重新打开会话生效）' : '已切回原始 Markdown（重新打开会话生效）');
+      };
+      body.appendChild(p);
+
+      var su = el('button', 'btn block plus-item');
+      su.appendChild(el('span', 'plus-ico', showSubagents ? '☑' : '☐'));
+      su.appendChild(el('span', 'plus-label', '显示子代理会话'));
+      su.appendChild(el('span', 'plus-hint', showSubagents ? '已开' : '默认隐藏'));
+      su.onclick = function () {
+        showSubagents = !showSubagents;
+        try { localStorage.setItem(SHOW_SUB_KEY, showSubagents ? '1' : '0'); } catch (e) { }
+        closeSheet();
+        renderList();
+      };
+      body.appendChild(su);
+
+      var rl = el('button', 'btn block', '展开全部工作区');
+      rl.onclick = function () { collapsedWs = {}; saveCollapsed(); closeSheet(); renderList(); };
+      body.appendChild(rl);
+
+      body.appendChild(el('div', 'sec', '连接'));
       var b = el('button', 'btn block', '断开并重新配对');
       b.onclick = function () { closeSheet(); logout(); };
       body.appendChild(b);
+
       body.appendChild(el('div', 'sec', '诊断'));
       body.appendChild(el('div', 'empty',
         '选模型：' + (caps.catalog === null ? '未探测' : (caps.catalog ? '可用' : '不可用（宿主过旧）'))
@@ -991,6 +1923,22 @@
     pair(code);
   };
 
+  /* 「打开扫码器」按钮（配对页）：只在 App 壳里显示。
+   * 浏览器 getUserMedia 在 http 明文页上不可用 ⇒ 网页自己扫不了，
+   * 必须走 App 的原生扫码（dshNative.startScan → ScanActivity → onActivityResult
+   * → MainActivity 直接 loadUrl 并带 #scan 回来）。 */
+  var isNativeShell = false;
+  try { isNativeShell = !!(window.dshNative && window.dshNative.startScan); } catch (e) { }
+  if (isNativeShell) {
+    var scanBtn = el('button', 'btn primary', '打开扫码器');
+    scanBtn.type = 'button';
+    scanBtn.style.marginTop = '10px';
+    scanBtn.onclick = function () {
+      try { window.dshNative.startScan(); } catch (e) { setMsg(pairMsg, '扫码不可用', 'bad'); }
+    };
+    pairForm.parentNode.insertBefore(scanBtn, pairForm.nextSibling);
+  }
+
   $('refreshBtn').onclick = function () { loadAll(); };
   $('newSessionBtn').onclick = openNewSessionSheet;
   $('menuBtn').onclick = openMenuSheet;
@@ -1028,6 +1976,7 @@
   var fromUrl = new URLSearchParams(location.search).get('c');
   if (fromUrl) {
     codeInput.value = fromUrl.trim().toUpperCase();
+    pairCodeFromUrl = fromUrl.trim().toUpperCase();   // ★ 留给 autoRepair：以后 401 可用它静默恢复
     pair(codeInput.value);
   } else {
     try { token = localStorage.getItem(TOKEN_KEY); } catch (e) { }

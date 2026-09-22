@@ -60,6 +60,20 @@
 **/smoke-result.json
 **/window-state.json
 
+# ── 手机遥控插件的设备台账（★ 2026-09-23 加，**这是一条安全闸门，别删**）──────
+# `plugin/dsh-mobile-remote/.devices/devices.json` 是**本机运行时数据**，里面存的是
+# **活的配对 token**（256 bit，43 字符 base64url）。拿到它 = 拿到这台电脑上
+# DSH Agent 的完整操作权（能发提示词、能批准工具调用、能往工作区写文件）。
+#
+# ★ 为什么这条必须存在（2026-09-23 实测核实，不是假想）：
+#   · 这个仓库的 origin 是 **公开** 仓库（`api.github.com/repos/...` 返回 **200**）；
+#   · 而 `.devices/` 之前**不在**任何忽略规则里（`git check-ignore` 无输出）；
+#   · 插件本体是**目录联接**进 `plugin/` 的 ⇒ git 会跟随 ⇒ 一次 `git add plugin/`
+#     就会把这 5 个活 token 提交进公开仓库（**git 历史删不干净，只能改写历史+作废密钥**）。
+# 它不在插件 `package.json` 的 `files` 白名单里（发布包已排除），所以只差 git 这一道。
+**/.devices/
+**/devices.json
+
 # ── 兜底的**唯一例外**：客户端插件必须自带它的 cordis.patch.yml ──────────
 # 上面 `**/cordis.patch.yml` 那条兜底是为了不把 DSH home / profile 里的配置提交进来；
 # 但插件包里的那一份是**bundle 声明的一部分** —— 没有它内核组合 profile 时直接失败：

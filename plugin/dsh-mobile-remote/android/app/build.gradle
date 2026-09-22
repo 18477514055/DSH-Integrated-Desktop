@@ -33,4 +33,12 @@ android {
     }
 }
 
-// ★ 没有 dependencies 块 —— 本工程**零第三方依赖**，见根 build.gradle 的说明。
+// ★ 唯一的第三方依赖（2026-09-22 打破"零依赖"纪录，原因记录在案）：
+//   手机 App 要内嵌扫码（用户需求：不用切出去开系统相机）。
+//   解码器用 ZXing core（Apache 2.0，纯 Java、无传递依赖）——
+//   jar 直接取自本机 Android Studio 安装目录（plugins/android/lib/core-3.5.0.jar）
+//   vendor 进 libs/，**不经过任何网络下载**（当晚外网全断，Maven 不可达）。
+//   相机预览仍用系统 camera2 手写，不引 androidx/CameraX。
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+}

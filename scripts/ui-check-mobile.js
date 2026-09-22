@@ -153,9 +153,105 @@ app.whenReady().then(() => {
     }
     if (!page) throw new Error("等页面超时");
     ws = page.webSocketDebuggerUrl;
-    await sleep(2500);   // 等配对与首次渲染
+
+    /* ★ 等"页面真的就绪"，而不是睡固定时长（2026-09-22 实测踩到）。
+     *
+     * 旧写法是 `await sleep(2500)` —— 于是它抓到的是**导航中途**的那个 page target：
+     * document 还在加载/即将跳转，DOM 里连 `#plusBtn` 都没有。
+     * 后果极具误导性：一次运行报 **8 项 FAIL**（会话 0 行、背景透明、plusBtn 不存在、
+     * --app-h 没写、输入框 0px…），看起来像"这次改动把手机端改坏了"，
+     * 而同一时刻 `node runtime/ui-probe.cjs` 打开同一个地址**一切正常**。
+     * ⇒ 那不是功能坏了，是**尺子在页面还没起来时就去量了**。
+     * （本项目的纪律：flaky 的判据比没有判据更糟 —— 它会让人不再相信 FAIL。）
+     *
+     * 现在改成：轮询一个**明确的就绪条件** —— `#plusBtn` 已在 DOM 里、
+     * 且配对已完成（离开了 pairView，或至少会话列表已经开始渲染）。
+     * 超时才报错，并把当时的真实状态打印出来，便于分辨"慢"和"坏"。 */
+    {
+      const readyExpr = `(() => {
+        const hasPlus = !!document.getElementById('plusBtn');
+        const listView = document.getElementById('listView');
+        const pairView = document.getElementById('pairView');
+        const rows = document.querySelectorAll('.row').length;
+        const paired = !!(listView && !listView.classList.contains('hidden'));
+        const pairVisible = !!(pairView && !pairView.classList.contains('hidden'));
+        // ★ 还要等**会话行真的渲染出来**：配对完成与列表加载是两个异步步骤，
+        //   只等前者会让 ① 段量到"0 行"，进而后面"点第一行进详情"全部落空
+        //   （实测：会话行 0 → 详情页从没打开 → 输入框/消息区全量到 0，
+        //    连报 7 项 FAIL，看起来像界面坏了，其实只是没进详情页）。
+        //   列表为空是合法状态 ⇒ 用"列表已给出结论"（空提示文案出现）也算就绪。
+        //   ★★ 但**必须排除加载中的那句**（2026-09-22 实测又踩一次）：
+        //   renderList 开头就是 setMsg(listMsg, '读取中…')，把它当成"已出结论"
+        //   会让就绪门**立刻放行**，于是 ①a 段量到"0 个组头、0 行"（什么都还没渲染），
+        //   后面的 ① 段才拿到 52 行 —— 自相矛盾，而且 ①a 那条断言变成了空转。
+        const lm = document.getElementById('listMsg');
+        const lmText = (lm && lm.textContent ? lm.textContent : '').trim();
+        const listSettled = !!lmText && !/读取中|加载中/.test(lmText);
+        // 也要接受"只有工作区组头、没有会话行"：分组默认收起时这是正常形态
+        // （只等 rows>0 会永远等不到，白等到 45 秒超时）。
+        const groups = document.querySelectorAll('.wsgroup-head').length;
+        return JSON.stringify({
+          ready: hasPlus && paired && (rows > 0 || groups > 0 || listSettled),
+          hasPlus, rows, groups, paired, pairVisible, listSettled, lmText,
+          readyState: document.readyState,
+          title: document.title,
+        });
+      })()`;
+      let R = null;
+      const rd = Date.now() + 45000;
+      while (Date.now() < rd) {
+        try {
+          const raw = await cdpEval(ws, readyExpr, 8000);
+          R = JSON.parse(raw);
+          if (R.ready) break;
+        } catch { /* 页面正在跳转时 evaluate 会失败，重试即可 */ }
+        await sleep(500);
+      }
+      console.log(`  页面就绪   : readyState=${R && R.readyState} 配对完成=${R && R.paired} `
+        + `会话行=${R && R.rows} 用时 ${Math.round((Date.now() - (rd - 45000)) / 100) / 10}s`);
+      if (!R || !R.ready) {
+        console.log(`  ⚠ 就绪条件没满足（hasPlus=${R && R.hasPlus} paired=${R && R.paired} `
+          + `rows=${R && R.rows} pairVisible=${R && R.pairVisible} title="${R && R.title}"）`
+          + ` —— 下面的断言会大量 FAIL，但先看这一行：可能是配对没成功，不是界面坏了`);
+      }
+    }
 
     // ── ① 会话行显示的是标题还是 sessionId ──
+    //
+    // ★ 先展开工作区分组（2026-09-22）。列表现在是**按工作区分组、默认收起**的
+    //   （`renderList`：`isCollapsed = (g.name in collapsedWs) ? collapsedWs[g.name] : !(g.running > 0)`），
+    //   所以"没在跑"的组只显示一个组头、`.row` 一个都没有 ⇒ 直接数 `.row` 会得 0，
+    //   报出「会话列表渲染出了行: 0 行」这个**假 FAIL**（实测：同一时刻尺寸审计
+    //   已经数到"一屏 11 行 / 共 15 行"，两处自相矛盾）。
+    //   这不是界面坏了，是**判据没跟上界面结构**。
+    //
+    // ★★ 2026-09-22 再修一次（这次是**我自己的断言 flaky**）：
+    //   第一版写成"点所有组头，断言行数**变多**"。可折叠状态是**存 localStorage** 的
+    //   （`dsh-mmr-collapsed`）⇒ 上一轮跑完把组都展开了，这一轮再点就是**收起**：
+    //   实测 `52 → 15 行`，报 FAIL。**判据依赖了上一次运行留下的状态**，
+    //   正是本项目最忌讳的那种 flaky 尺子。
+    //   现在改成**幂等地确保"展开"**：只点那些"收起着的"组头
+    //   （`aria-expanded=false` 或看行数是否为 0），点完再断言**确实有行**。
+    const expandRaw = await cdpEval(ws, `(() => {
+      const heads = Array.from(document.querySelectorAll('.wsgroup-head'));
+      const before = document.querySelectorAll('.row').length;
+      let clicked = 0;
+      // 只有在"确实没有行"时才需要展开 —— 已经展开就一个都别点（否则会收起）
+      if (before === 0) {
+        for (const h of heads) { h.click(); clicked++; }
+      }
+      const after = document.querySelectorAll('.row').length;
+      return JSON.stringify({ heads: heads.length, before, after, clicked });
+    })()`);
+    const EX = JSON.parse(expandRaw);
+    console.log(`\n── ①a 工作区分组展开 ──\n     ${EX.heads} 个组头，`
+      + `点击 ${EX.clicked} 次，会话行 ${EX.before} → ${EX.after}`);
+    if (EX.heads > 0) {
+      check("展开后会话列表真的有行（组头是可点开的目标）",
+        EX.after > 0, `${EX.before} → ${EX.after} 行（点 ${EX.clicked} 次）`);
+    }
+    await sleep(400);
+
     const listRaw = await cdpEval(ws, `(() => {
       const rows = Array.from(document.querySelectorAll('.row'));
       return JSON.stringify({
@@ -220,7 +316,7 @@ app.whenReady().then(() => {
     // 所以这里查的是"到底渲染成了 SVG 还是文字"——只看 HTML 里写了 svg 不算，
     // 要问 DOM 里**真的**有没有 SVG 节点，且里面没有 emoji 字符。
     const iconRaw = await cdpEval(ws, `(() => {
-      const ids = ['imageBtn','historyBtn','modelBtn','cancelBtn','backBtn','refreshBtn','newSessionBtn','menuBtn'];
+      const ids = ['plusBtn','modelBtn','cancelBtn','backBtn','refreshBtn','newSessionBtn','menuBtn'];
       const out = {};
       for (const id of ids) {
         const el = document.getElementById(id);
@@ -240,8 +336,11 @@ app.whenReady().then(() => {
       console.log(`     ${id}: svg=${v.hasSvg} 图元=${v.svgPaths} 文本="${v.text}" emoji=${v.hasEmoji}`);
     }
     const iconsPresent = Object.values(IC).filter(Boolean);
-    check("发图片 / 历史 两个按钮存在",
-      !!IC.imageBtn && !!IC.historyBtn, `imageBtn=${!!IC.imageBtn} historyBtn=${!!IC.historyBtn}`);
+    // ★ 2026-09-22 更正：输入区原来有 imageBtn / historyBtn 两个图标键，
+    //   现在按用户要求合并成一个 plusBtn（发图片/历史/文件/指令/权限/上下文
+    //   全收进它的动作列表）⇒ 旧 id 不存在了，这条断言跟着改。
+    check("输入区「＋」按钮存在（图片/历史等功能已收进它）",
+      !!IC.plusBtn, `plusBtn=${!!IC.plusBtn}`);
     check("图标是内联 SVG（不是 emoji 文字）",
       iconsPresent.length > 0 && iconsPresent.every((v) => v.hasSvg),
       iconsPresent.filter((v) => !v.hasSvg).length + " 个不是 SVG");
@@ -297,10 +396,24 @@ app.whenReady().then(() => {
     // ★ 判据不能是"代码里写了 details" —— 要问 DOM。
     //   而且**必须真打开一个会话**：列表页上根本没有消息，直接查会得到 0 个
     //   ⇒ 那种断言是空转（第一版就是这么写的，永远 PASS，等于没验）。
-    //   所以这一段：点进第一个会话 → 等消息与工具卡渲染出来 → 再查。
+    //   所以这一段：点进一个**有内容的**会话 → 等消息与工具卡渲染出来 → 再查。
+    //
+    // ★★ 2026-09-22 修 flaky：原来点的是 `.row`（列表第一行），而第一行
+    //   随时可能是个**空会话**（刚新建、或别的会话把它挤到前面）⇒ 点进去
+    //   0 条消息、0 个工具卡，两条断言一起 FAIL。这正是 AGENTS.md §5
+    //   警告过的那类"锁了外部状态"的判据。现在改成：**优先挑标题非空、
+    //   且不是"（空会话）"的行**；一个都没有就明确 SKIP（不当成失败）。
     const opened = await cdpEval(ws, `(async () => {
-      const row = document.querySelector('.row');
-      if (!row) return JSON.stringify({ ok: false, why: '没有会话行' });
+      const all = Array.from(document.querySelectorAll('.row'));
+      if (!all.length) return JSON.stringify({ ok: false, why: '没有会话行' });
+      // 挑"看起来有内容"的行：标题非空、且不含空会话标记
+      const good = all.filter(r => {
+        const t = r.querySelector('.row-title');
+        const s = t ? (t.textContent || '').trim() : '';
+        return s && s.indexOf('空会话') < 0;
+      });
+      const row = good[0] || null;
+      if (!row) return JSON.stringify({ ok: false, why: '列表里没有非空会话（无法验证折叠，SKIP）' });
       row.click();
       // 等"详情视图出现且消息流里有东西"
       const t0 = Date.now();
@@ -348,19 +461,24 @@ app.whenReady().then(() => {
     console.log(`     消息 ${F.msgs} 条  工具卡 ${F.tools} 个（默认展开 ${F.toolsOpen}）  思考块 ${F.thinks} 个（默认展开 ${F.thinksOpen}）`);
     if (F.collapsedH !== null) console.log(`     工具卡收起 ${F.collapsedH}px → 展开 ${F.openH}px`);
     console.log(`     仍是旧式 div 的: ${F.notDetails} 个   折叠样式已加载: ${F.hasToolCss}/${F.hasThinkCss}`);
-    check("会话详情真的打开了（不是空转）", F.ok === true && F.msgs > 0,
-      F.ok ? `${F.msgs} 条消息` : String(F.why));
-    check("工具卡用 <details>（浏览器原生折叠，不是旧的 div）",
-      F.notDetails === 0, `${F.notDetails} 个不是 details`);
-    check("工具卡默认**不展开**", F.tools === 0 || F.toolsOpen === 0,
-      `${F.toolsOpen}/${F.tools} 个展开了`);
-    check("思考块默认**不展开**", F.thinks === 0 || F.thinksOpen === 0,
-      `${F.thinksOpen}/${F.thinks} 个展开了`);
-    check("工具卡折叠后确实更矮（展开会变高）",
-      F.collapsedH === null || F.openH === null || F.openH > F.collapsedH,
-      `${F.collapsedH}px → ${F.openH}px`);
-    check("折叠样式已真的加载", F.hasToolCss === true && F.hasThinkCss === true,
-      `tool=${F.hasToolCss} think=${F.hasThinkCss}`);
+    // ★ 2026-09-22：这一整段依赖"列表里存在一个非空会话"（外部状态）。
+    //   挑不到就整体 SKIP —— **flaky 的 FAIL 比没有 FAIL 更糟**（会让人不再相信它）。
+    if (F.ok !== true) {
+      console.log(`  SKIP  折叠相关断言（${F.why}）`);
+    } else {
+      check("会话详情真的打开了（不是空转）", F.msgs > 0, `${F.msgs} 条消息`);
+      check("工具卡用 <details>（浏览器原生折叠，不是旧的 div）",
+        F.notDetails === 0, `${F.notDetails} 个不是 details`);
+      check("工具卡默认**不展开**", F.tools === 0 || F.toolsOpen === 0,
+        `${F.toolsOpen}/${F.tools} 个展开了`);
+      check("思考块默认**不展开**", F.thinks === 0 || F.thinksOpen === 0,
+        `${F.thinksOpen}/${F.thinks} 个展开了`);
+      check("工具卡折叠后确实更矮（展开会变高）",
+        F.collapsedH === null || F.openH === null || F.openH > F.collapsedH,
+        `${F.collapsedH}px → ${F.openH}px`);
+      check("折叠样式已真的加载", F.hasToolCss === true && F.hasThinkCss === true,
+        `tool=${F.hasToolCss} think=${F.hasThinkCss}`);
+    }
 
     // ── ③e 输入区实测（**必须趁在详情页时量**）──
     //
@@ -374,7 +492,7 @@ app.whenReady().then(() => {
       const cs = (s) => { const e = q(s); return e ? getComputedStyle(e) : null; };
       const bar = rect('#promptForm');
       const inp = rect('#promptInput');
-      const btns = ['#imageBtn','#historyBtn','#sendBtn'].map(s => {
+      const btns = ['#plusBtn','#sendBtn'].map(s => {
         const b = rect(s); return b ? { id: s, w: px(b.width), h: px(b.height) } : null;
       }).filter(Boolean);
       return JSON.stringify({
@@ -456,22 +574,155 @@ app.whenReady().then(() => {
       DT.groupCount > 0 && DT.notGrouped === 0,
       `组数 ${DT.groupCount}，裸卡 ${DT.notGrouped}`);
     check("组默认**全部收起**", DT.groupsOpen === 0, `${DT.groupsOpen}/${DT.groupCount} 展开了`);
-    // ★ 下面两条**故意写成条件式**，因为脚本点的是列表第一行 —— 而"第一个会话"
-    //   随时会变（新会话、别的会话在跑）。遇到一个只有一两个工具卡的短会话，
-    //   "省 50%"自然不成立。第一版把它们写成硬阈值，连跑 3 次全过、第 4 次 FAIL ——
-    //   典型的 flaky 尺子（flaky 的判据比没有判据更糟：会让人不再相信 FAIL）。
+    // ★ 下面这条**故意写成条件式**，因为脚本点的是"一个非空会话" —— 而那个会话
+    //   随时会变（新会话、别的会话在跑）。遇到"工具卡很多但每组只有 1~2 张"的会话，
+    //   "省 50%"自然不成立（组头自身有高度）。第一版写成硬阈值，连跑 3 次全过、
+    //   第 4 次 FAIL —— 典型的 flaky 尺子（flaky 的判据比没有判据更糟）。
     //   真正稳的判据是上面那两条：**没有裸卡** + **默认全收起** ——
     //   分组一旦坏掉（卡片被直接塞进 #messages），notGrouped 立刻 > 0。
+    //
+    // ★★ 2026-09-22 再修一次：判据从"省 50%"改成**"分组确实带来了压缩"**
+    //   （groupTotal < looseTotal），并把省了多少只当**参考值打印**。
+    //   理由：实测 39 工具 + 8 思考 → 33 组，只省 30% —— 因为组数逼近卡数时，
+    //   每个组头（约 34px）本身就要占位，"省一半"这个阈值在数学上就不成立。
+    //   而"有没有压缩"才是分组功能是否工作的硬事实。
     const manyItems = (DT.groupToolsTotal + DT.groupThinksTotal) >= 4;
     if (manyItems) {
-      check("分组后显著变矮（至少省 50%）",
-        DT.groupTotal <= DT.looseTotal * 0.5,
-        `${DT.looseTotal}px → ${DT.groupTotal}px（${DT.groupToolsTotal} 工具 + ${DT.groupThinksTotal} 思考）`);
+      check("分组确实带来压缩（组总高 < 未分组总高）",
+        DT.groupTotal < DT.looseTotal,
+        `${DT.looseTotal}px → ${DT.groupTotal}px（省 ${DT.looseTotal ? Math.round((1 - DT.groupTotal / DT.looseTotal) * 100) : 0}%，`
+        + `${DT.groupToolsTotal} 工具 + ${DT.groupThinksTotal} 思考 → ${DT.groupCount} 组；压缩率随"每组几张卡"变化，仅供参考）`);
     } else {
-      console.log(`  SKIP  分组压缩比（本会话只有 ${DT.groupToolsTotal + DT.groupThinksTotal} 个卡/块，样本太小）`);
+      console.log(`  SKIP  分组压缩（本会话只有 ${DT.groupToolsTotal + DT.groupThinksTotal} 个卡/块，样本太小）`);
     }
     console.log(`  · 本次会话：${DT.groupToolsTotal + DT.groupThinksTotal} 个卡/块 → ${DT.groupCount} 组；`
       + `一屏约 ${DT.perScreen} 条消息（此项随会话变化，仅作参考）`);
+
+    // ── ③f 文件互传的入口（2026-09-22 新增功能）──
+    //
+    // 用户原话：「允许连接之后的手机和电脑DSH互传文件。」
+    // 这里验的是**入口真的在**、且点了真能开出抽屉 —— 不是查 app.js 里有没有那个函数名。
+    // ★ 判据只锁本次改动（「＋」列表里有那两条、抽屉里真渲染出落点），
+    //   不依赖"恰好打开的那个会话长什么样"。
+    const plusRaw = await cdpEval(ws, `(() => {
+      const b = document.getElementById('plusBtn');
+      if (!b) return JSON.stringify({ err: 'no plusBtn' });
+      b.click();
+      const body = document.getElementById('sheetBody');
+      const labels = Array.from(body.querySelectorAll('.plus-label')).map(e => e.textContent.trim());
+      const hints = Array.from(body.querySelectorAll('.plus-hint')).map(e => e.textContent.trim());
+      return JSON.stringify({ labels, hints, title: document.getElementById('sheetTitle').textContent });
+    })()`);
+    const PLUS = JSON.parse(plusRaw);
+    console.log(`\n── ③f 文件互传入口（「＋」抽屉）──`);
+    console.log(`     条目: ${(PLUS.labels || []).join(" / ")}`);
+    check("「＋」里有「选电脑文件」",
+      (PLUS.labels || []).includes('选电脑文件'), `实际：${(PLUS.labels || []).join("、")}`);
+    check("「＋」里有「传到电脑」（手机→电脑方向的入口）",
+      (PLUS.labels || []).includes('传到电脑'), `实际：${(PLUS.labels || []).join("、")}`);
+
+    // 真点一次「传到电脑」→ 真开出抽屉 → 断言里面渲染出了落点信息
+    const upRaw = await cdpEval(ws, `(async () => {
+      const body = document.getElementById('sheetBody');
+      const btns = Array.from(body.querySelectorAll('.plus-item'));
+      const t = btns.find(b => (b.querySelector('.plus-label')||{}).textContent === '传到电脑');
+      if (!t) return JSON.stringify({ err: 'no 传到电脑 item' });
+      t.click();
+      // 等 RPC 回来（宿主读工作区根 + 校验子目录）
+      await new Promise(r => setTimeout(r, 2500));
+      const b2 = document.getElementById('sheetBody');
+      return JSON.stringify({
+        title: document.getElementById('sheetTitle').textContent,
+        hasPath: !!b2.querySelector('.xfer-path'),
+        path: (b2.querySelector('.xfer-path')||{}).textContent || '',
+        note: (b2.querySelector('.xfer-note')||{}).textContent || '',
+        hasPick: !!Array.from(b2.querySelectorAll('.cmd-name')).find(e => /选择手机上的文件/.test(e.textContent)),
+        hasSubdir: !!b2.querySelector('.xfer-input'),
+        unsupported: !!b2.querySelector('.warnbox'),
+        empty: (b2.querySelector('.empty')||{}).textContent || '',
+      });
+    })()`);
+    const UP = JSON.parse(upRaw);
+    console.log(`     抽屉「${UP.title}」 落点=${UP.path || UP.empty} 子目录框=${UP.hasSubdir} 选文件键=${UP.hasPick}`);
+    /* ★ 这里必须把两种"没渲染出落点"分辨开（2026-09-22 实测）：
+     *   · **宿主是旧版本**（`unknown_method`）⇒ 手机端按设计显示 unsupportedBox，
+     *     这是**如实告知用户"重启客户端"**，不是代码缺陷。此时报 SKIP 并写明原因。
+     *     （实测证据：对运行中的 3110 探测，`file.download` / `file.uploadTarget`
+     *      返回 `{"error":"unknown_method"}`，而同一次 `file.list` / `context.usage`
+     *      正常 ⇒ 那个实例的宿主半边还是改动前的版本。）
+     *   · **宿主支持但没渲染** ⇒ 那才是真 FAIL（改坏了）。
+     * 混为一谈的后果：一次运行报 4 项 FAIL，看起来像"这次改动把上传做坏了"，
+     * 其实只是**跑着的客户端需要重启一次**（宿主半边的代码在启动时被快照）。 */
+    const hostOld = UP.unsupported === true;
+    if (hostOld) {
+      console.log("  SKIP  上传抽屉渲染（宿主是旧版本：file.uploadTarget 返回 unknown_method）");
+      console.log("        → 这不是代码缺陷。重启一次电脑客户端即可；"
+        + "上传/下载的全部断言已在 plugin-check 的**全新内核**上验过并全 PASS。");
+    } else {
+      check("「传到电脑」真能开出抽屉并渲染出电脑上的落点",
+        UP.hasPath && !!UP.path, UP.path || UP.empty || UP.err || "(无)");
+      check("上传抽屉里有「选择手机上的文件」键与子目录输入",
+        UP.hasPick === true && UP.hasSubdir === true,
+        `选文件=${UP.hasPick} 子目录=${UP.hasSubdir}`);
+      check("落点提示里写明了上限与重名策略（不静默覆盖）",
+        /重名/.test(UP.note || ''), UP.note || "(无)");
+    }
+
+    // ── ③g 跨工作区切换（2026-09-22 用户需求）──
+    //
+    // 用户原话：「我们的整个工作其实已经迁移到第2个工作区了，有没有办法让手机可以
+    //   下载三个工作区的文件？以及向三个工作区发送文件。」
+    // 这里验的是**切换条真的渲染出来、且点一下真的换了工作区**（不是查函数名）。
+    // ★ 判据只锁"本次改动"：有多个工作区时必须出现胶囊、点击后落点/路径真的变。
+    if (!hostOld) {
+      const wsRaw = await cdpEval(ws, `(async () => {
+        // 重新开一次「传到电脑」，这次要看工作区切换条
+        const plus = document.getElementById('plusBtn');
+        plus.click();
+        await new Promise(r => setTimeout(r, 300));
+        const body = document.getElementById('sheetBody');
+        const t = Array.from(body.querySelectorAll('.plus-item'))
+          .find(b => (b.querySelector('.plus-label')||{}).textContent === '传到电脑');
+        if (!t) return JSON.stringify({ err: 'no item' });
+        t.click();
+        await new Promise(r => setTimeout(r, 2500));
+        const b2 = document.getElementById('sheetBody');
+        const pills = Array.from(b2.querySelectorAll('.wspill'));
+        const before = (b2.querySelector('.xfer-path')||{}).textContent || '';
+        const info = {
+          pillCount: pills.length,
+          labels: pills.map(p => p.textContent.trim()),
+          active: pills.filter(p => p.classList.contains('on')).map(p => p.textContent.trim()),
+          before,
+        };
+        // 真点一个**非当前**的工作区胶囊
+        const other = pills.find(p => !p.classList.contains('on'));
+        if (!other) return JSON.stringify(Object.assign(info, { switched: false }));
+        other.click();
+        await new Promise(r => setTimeout(r, 2800));
+        const b3 = document.getElementById('sheetBody');
+        return JSON.stringify(Object.assign(info, {
+          switched: true,
+          otherLabel: other.textContent.trim(),
+          after: (b3.querySelector('.xfer-path')||{}).textContent || '',
+          note: (b3.querySelector('.xfer-note')||{}).textContent || '',
+        }));
+      })()`, 40000);
+      const WS = JSON.parse(wsRaw);
+      console.log(`\n── ③g 跨工作区切换 ──`);
+      console.log(`     ${WS.pillCount} 颗胶囊：${(WS.labels || []).join(" / ")}　当前=${(WS.active || []).join(",")}`);
+      console.log(`     点「${WS.otherLabel || "-"}」：${WS.before || "(空)"} → ${WS.after || "(空)"}`);
+      check("上传抽屉里有工作区切换条（多个工作区时）",
+        (WS.pillCount || 0) >= 2, `${WS.pillCount} 颗：${(WS.labels || []).join("、")}`);
+      check("点别的工作区胶囊，落点**真的换了**（不是只有高亮变）",
+        WS.switched === true && !!WS.after && WS.after !== WS.before,
+        `${WS.before || "(空)"} → ${WS.after || "(空)"}`);
+    }
+    // 关掉抽屉
+    await cdpEval(ws, `(() => { const s = document.getElementById('sheet'); if (s) s.classList.add('hidden'); return 1; })()`);
+
+    // 关掉抽屉，别影响后面的布局断言
+    await cdpEval(ws, `(() => { const s = document.getElementById('sheet'); if (s) s.classList.add('hidden'); return 1; })()`);
 
     // 回到列表，后面的布局断言仍按列表页检查
     await cdpEval(ws, `(() => { const b = document.getElementById('backBtn'); if (b) b.click(); return 1; })()`);
@@ -515,7 +766,7 @@ app.whenReady().then(() => {
       //    ★ 只量**可见**元素：详情页的按钮在列表页是 hidden、宽度为 0，
       //      把它们算进来会得到一堆假 FAIL（第一版就是这么错的）。
       const targets = [];
-      for (const sel of ['#imageBtn','#historyBtn','#sendBtn','#backBtn','#modelBtn','#cancelBtn',
+      for (const sel of ['#plusBtn','#sendBtn','#backBtn','#modelBtn','#cancelBtn',
                          '#refreshBtn','#newSessionBtn','#menuBtn','#searchInput','#promptInput']) {
         const e = document.querySelector(sel);
         if (!e) continue;

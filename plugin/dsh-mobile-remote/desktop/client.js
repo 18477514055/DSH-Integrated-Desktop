@@ -86,8 +86,12 @@ window.__ModuleLoader__.load({
 .mmr-body{padding:16px;display:flex;flex-direction:column;gap:13px;align-items:center}
 .mmr-qr{width:236px;height:236px;background:#fff;border-radius:10px;padding:8px;box-sizing:border-box;
   display:flex;align-items:center;justify-content:center}
-.mmr-qr.small{width:168px;height:168px}
 .mmr-qr svg{width:100%;height:100%;display:block}
+/* 标签页：两个码拆开显示，相机一次只可能看到一个（用户："整天同时扫到两个"） */
+.mmr-tabs{display:flex;gap:6px;padding:12px 16px 0}
+.mmr-tab{flex:1;padding:8px 10px;border-radius:9px;cursor:pointer;font-size:13px;font-weight:600;
+  border:1px solid var(--dsw-alias-border-l2,#3a3f4b);background:transparent;color:inherit}
+.mmr-tab.on{background:var(--dsw-alias-state-success-primary,#3b82f6);border-color:transparent;color:#fff}
 .mmr-qr-label{font-size:12.5px;opacity:.8;text-align:center;margin-bottom:-4px}
 .mmr-code{font:600 22px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:4px;
   padding:9px 14px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,rgba(255,255,255,.05));
@@ -174,29 +178,51 @@ window.__ModuleLoader__.load({
         } catch (e) { setErr(e.message); }
       }
 
+      /* ── 二维码拆成两个标签页（2026-09-22 用户要求）────────────
+       * 用户原话："照相机整天同时扫到两个二维码"。
+       * 真因：旧版一屏同时摆两个码（① 浏览器用 http 码 + ② App 用 dshmr 码），
+       * 相机取景框稍微一偏就两个都进画面，系统相机不知道该认哪个。
+       * 现在改成 tab：一屏只有一个码，绝不歧义；默认页是"用 App 扫"
+       * （装了 App 的人是主力用户，浏览器场景是兜底）。 */
+      const [tab, setTab] = useState('app');
+
       return h('div', { className: 'mmr-mask', onClick: onClose },
         h('div', { className: 'mmr-panel', onClick: (e) => e.stopPropagation() },
           h('div', { className: 'mmr-head' },
             h('h3', null, '📱 手机遥控'),
             h('button', { className: 'mmr-x', onClick: onClose, title: '关闭' }, '✕'),
           ),
+          h('div', { className: 'mmr-tabs' },
+            h('button', {
+              className: 'mmr-tab' + (tab === 'app' ? ' on' : ''),
+              onClick: () => setTab('app'),
+            }, '用 App 扫'),
+            h('button', {
+              className: 'mmr-tab' + (tab === 'web' ? ' on' : ''),
+              onClick: () => setTab('web'),
+            }, '用浏览器扫'),
+          ),
           h('div', { className: 'mmr-body' },
             err ? h('div', { className: 'mmr-err' }, '读取失败：' + err) : null,
 
-            // ── ① 通用二维码：任何手机相机都能扫，开浏览器（没装 App 也能用）──
-            h('div', { className: 'mmr-qr-label' }, '① 用相机扫（打开浏览器，无需装 App）'),
-            state && state.qrSvg
-              ? h('div', { className: 'mmr-qr', dangerouslySetInnerHTML: { __html: state.qrSvg } })
-              : h('div', { className: 'mmr-qr' }, h('span', { style: { color: '#888', fontSize: '12px' } },
-                  state ? '未找到局域网地址' : '生成中…')),
-
-            // ── ② App 专用二维码：装了「手机遥控」App 就扫这个，直接进 App ──
-            state && state.qrSvgApp
-              ? h('div', { className: 'mmr-qr-label' }, '② 装了「手机遥控」App 的扫这个（直接进 App）')
-              : null,
-            state && state.qrSvgApp
-              ? h('div', { className: 'mmr-qr small', dangerouslySetInnerHTML: { __html: state.qrSvgApp } })
-              : null,
+            // ── 标签页内容：一屏只有一个码（tab 状态在上方 useState）──
+            tab === 'app'
+              ? h('div', { className: 'mmr-tabpane' },
+                  state && state.qrSvgApp
+                    ? h('div', { className: 'mmr-qr', dangerouslySetInnerHTML: { __html: state.qrSvgApp } })
+                    : h('div', { className: 'mmr-qr' }, h('span', { style: { color: '#888', fontSize: '12px' } },
+                        state ? '未找到局域网地址' : '生成中…')),
+                  h('div', { className: 'mmr-qr-label' },
+                    '已装「手机遥控」App：用系统相机扫这个，直接进 App'),
+                )
+              : h('div', { className: 'mmr-tabpane' },
+                  state && state.qrSvg
+                    ? h('div', { className: 'mmr-qr', dangerouslySetInnerHTML: { __html: state.qrSvg } })
+                    : h('div', { className: 'mmr-qr' }, h('span', { style: { color: '#888', fontSize: '12px' } },
+                        state ? '未找到局域网地址' : '生成中…')),
+                  h('div', { className: 'mmr-qr-label' },
+                    '没装 App 也能用：系统相机扫一下，用浏览器打开手机页'),
+                ),
 
             state && state.code ? h('div', { className: 'mmr-code' }, state.code) : null,
 

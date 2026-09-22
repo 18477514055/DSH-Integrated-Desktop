@@ -15,6 +15,11 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 内嵌扫码（2026-09-22）：App 里直接扫电脑上的二维码，不用切出去开系统相机。
+         camera 声明为非必需（uses-feature required=false）：没摄像头的设备仍可安装，
+         只是扫码按钮不起作用（手输地址仍然可用）。 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
         android:allowBackup="false"
@@ -41,7 +46,6 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-
             <!--
               ★ 扫码直接唤起本 App 的通道：自定义 scheme `dshmr://`。
                 电脑端弹窗里会**同时**给两个二维码：
@@ -58,5 +62,11 @@
                 <data android:scheme="dshmr" />
             </intent-filter>
         </activity>
+
+        <!-- 内嵌扫码（2026-09-22）：不出 App 即可扫电脑上的二维码 -->
+        <activity
+            android:name=".ScanActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
     </application>
 </manifest>

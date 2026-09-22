@@ -45,7 +45,7 @@
         <button type="submit" class="btn primary">连接</button>
       </form>
       <p id="pairMsg" class="msg"></p>
-      <p class="hint">配对码 60 秒内有效、用过即废。<br />连不上时先确认手机与电脑在同一个 Wi-Fi。</p>
+      <p class="hint">配对码 60 秒内有效、用过即废。<br />连不上时先确认手机与电脑在同一个 Wi-Fi。<br />已配对过但被断开？在电脑上点「换一张码」后<b>手输 8 位码</b>即可，不必扫码。</p>
     </div>
   </div>
 </section>
@@ -86,6 +86,9 @@
     <div class="titlebox">
       <h1 id="detailTitle">会话</h1>
       <span id="detailSub" class="sub2"></span>
+      <!-- 当前模型与推理强度（2026-09-22 用户要求"手机上可以看到当前对话使用的模型和推理强度"）
+           放在标题下面一行，与工作区路径同一栏；点它可以打开模型切换抽屉。 -->
+      <span id="detailModel" class="model-line"></span>
     </div>
     <button id="modelBtn" class="icon" title="模型与工作区" aria-label="模型与工作区">
       <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
@@ -144,6 +147,11 @@
     </button>
   </form>
   <input id="fileInput" type="file" accept="image/*" multiple hidden />
+  <!-- 文件互传（2026-09-22）：上传用的选择器**不限定类型** —— 用户要传的是
+       "电脑那边的项目文件"，zip / 源码 / 视频都可能，不能只收图片。
+       与上面 fileInput 分开是刻意的：accept 属性一旦写死就改不了，
+       而"发图片给模型看"与"把文件存到电脑"是两件事，混在一个入口会互相干扰。 -->
+  <input id="uploadInput" type="file" multiple hidden />
 </section>
 
 <!-- ══════════ 抽屉：模型 / 工作区 / 历史 / 菜单 ══════════ -->
