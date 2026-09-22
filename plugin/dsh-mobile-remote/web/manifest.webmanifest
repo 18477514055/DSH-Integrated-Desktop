@@ -1,9 +1,0 @@
-{
-  "name": "dsh手机遥控",
-  "short_name": "dsh手机遥控",
-  "start_url": "/",
-  "display": "standalone",
-  "background_color": "#ffffff",
-  "theme_color": "#ffffff",
-  "icons": []
-}

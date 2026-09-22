@@ -561,6 +561,31 @@
     scrollDown();
   }
 
+  /* ── 发出去的消息"显示两条一模一样的"——去重 ─────────────
+   *
+   * 真因（用户 2026-09-22 报告，怀疑得对）：
+   *   手机上发送时，本地**立即** addBubble('user', ...)（乐观回显，保证"点了就有反应"）；
+   *   同一条消息随后经 SSE 的 user/message 事件（或重连时的 snapshot 快照）再次到达，
+   *   又画一条 ⇒ 两条一模一样。电脑端发的消息只走事件流，所以**只有手机自己发的**会双份。
+   *
+   * 修法：发送时把文本与时间戳记进 lastSent；事件流再推同文时，若落在时间窗内则跳过。
+   *   · 窗口 15 秒：覆盖正常回显（毫秒级）与断线重连后的 snapshot 补发（秒级）；
+   *   · 只匹配**完全相同**的文本 ⇒ 电脑端发同样内容（同文不同源）在窗口内也会被
+     ·   正确合并，这在"手机发了、电脑再发一句一样的"这种罕见场景下是可接受的取舍；
+   *   · 窗口过后同文不再拦（防错杀：用户故意重发同样的内容应正常显示）。 */
+  var lastSent = { text: '', at: 0 };
+  var SENT_WINDOW_MS = 15000;
+
+  function markSent(text) {
+    lastSent.text = text;
+    lastSent.at = Date.now();
+  }
+  /** 事件流推来的用户消息是否是"刚从本机发出去的那条"（是则跳过不画）。 */
+  function isEchoOfSent(text) {
+    var fresh = (Date.now() - lastSent.at) < SENT_WINDOW_MS;
+    return fresh && lastSent.text && text && text === lastSent.text;
+  }
+
   function renderEvent(event) {
     if (!event || !event.type) return;
     var d = event.data || {};
@@ -568,7 +593,7 @@
     if (event.type === 'user/message') {
       if (d.source && d.source.kind === 'user') {
         var t = textOfContent(d.content);
-        if (t.trim()) addBubble('user', t);
+        if (t.trim() && !isEchoOfSent(t.trim())) addBubble('user', t);
       }
       return;
     }
@@ -643,7 +668,14 @@
   }
   function closeSheet() { sheet.classList.add('hidden'); }
   sheet.addEventListener('click', function (e) {
-    if (e.target && e.target.getAttribute && e.target.getAttribute('data-close')) closeSheet();
+    /* ★ 用 closest 而不是 e.target：✕ 按钮里是 <svg><path>，手指点下去
+     *   e.target 是 path（它没有 data-close）⇒ 旧写法点叉叉毫无反应、
+     *   只有蒙层能关（蒙层没有子元素，target 就是它自己）。
+     *   closest 沿祖先链找最近一个带 data-close 的元素，按钮整体热区生效。
+     *   这是与 §3 AGENTS.md「事件拦截挂根节点+冒泡」同源的坑：
+     *   委托判据必须落在"语义元素"上，不能落在"物理命中节点"上。 */
+    var hit = e.target && e.target.closest ? e.target.closest('[data-close]') : null;
+    if (hit) closeSheet();
   });
 
   /** 宿主不支持某功能时的统一提示（**不静默**）。 */
@@ -661,18 +693,69 @@
         body.innerHTML = '';
         var groups = (cat && cat.groups) || [];
         if (!groups.length) { body.appendChild(el('div', 'empty', '没有可用模型')); return; }
-        groups.forEach(function (g) {
-          body.appendChild(el('div', 'sec', g.name || g.id));
-          (g.models || []).forEach(function (m) {
-            var b = el('button', 'btn block', m.name || m.id);
-            b.onclick = function () {
-              var efforts = (m.reasoning && m.reasoning.efforts) || [];
-              if (efforts.length) openEffortSheet(g, m, efforts);
-              else doSelectModel(g.id, m.id, null);
-            };
-            body.appendChild(b);
+
+        /* ★ 搜索 + 平台筛选（对齐电脑端，2026-09-22 用户要求）：
+         *   「在选择模型那里加一个搜索框，然后一个按标签（各大平台）筛选。」
+         *   groups 里每组的 name/id 就是平台名（DeepSeek / 智谱 / OpenRouter…），
+         *   正好当标签用；选中哪个平台就只显示哪一组的模型，「全部」恢复。 */
+        var activeTag = '';            // '' = 全部
+        var q = '';
+
+        var bar = el('div', 'model-filter');
+        var si = el('input', 'search model-search');
+        si.type = 'search'; si.placeholder = '搜模型名…';
+        si.autocomplete = 'off';
+        bar.appendChild(si);
+        var tags = el('div', 'model-tags');
+        bar.appendChild(tags);
+        body.appendChild(bar);
+
+        var listBox = el('div', 'model-list');
+        body.appendChild(listBox);
+
+        function tagLabel(g) { return g.name || g.id; }
+        function match(m) {
+          if (!q) return true;
+          return ((m.name || '') + ' ' + (m.id || '')).toLowerCase().indexOf(q) >= 0;
+        }
+
+        function renderTags() {
+          tags.innerHTML = '';
+          var all = el('button', 'tag' + (activeTag === '' ? ' on' : ''), '全部');
+          all.onclick = function () { activeTag = ''; renderTags(); renderModels(); };
+          tags.appendChild(all);
+          groups.forEach(function (g) {
+            var t = el('button', 'tag' + (activeTag === tagLabel(g) ? ' on' : ''), tagLabel(g));
+            t.onclick = function () { activeTag = (activeTag === tagLabel(g)) ? '' : tagLabel(g); renderTags(); renderModels(); };
+            tags.appendChild(t);
           });
-        });
+        }
+
+        function renderModels() {
+          listBox.innerHTML = '';
+          var shown = 0;
+          groups.forEach(function (g) {
+            if (activeTag && tagLabel(g) !== activeTag) return;
+            var models = (g.models || []).filter(match);
+            if (!models.length) return;
+            shown += models.length;
+            listBox.appendChild(el('div', 'sec', tagLabel(g)));
+            models.forEach(function (m) {
+              var b = el('button', 'btn block', m.name || m.id);
+              b.onclick = function () {
+                var efforts = (m.reasoning && m.reasoning.efforts) || [];
+                if (efforts.length) openEffortSheet(g, m, efforts);
+                else doSelectModel(g.id, m.id, null);
+              };
+              listBox.appendChild(b);
+            });
+          });
+          if (!shown) listBox.appendChild(el('div', 'empty', q ? '没有匹配的模型' : '这个平台下没有模型'));
+        }
+
+        si.addEventListener('input', function () { q = (si.value || '').trim().toLowerCase(); renderModels(); });
+        renderTags();
+        renderModels();
       }).catch(function (e) {
         body.innerHTML = '';
         if (e.unknownMethod) { caps.catalog = false; unsupportedBox(body, '选模型'); }
@@ -749,18 +832,44 @@
       localStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, 30)));
     } catch (e) { }
   }
+  /* 「＋」动作列表：输入区的所有附加功能集中在这一个抽屉里。
+   * 用户原话：「以后所有的功能全部集中在一个列表中，而不是分成什么图片啊、
+   *   历史输入啊，两个按键……输入框的位置也宽一点。」
+   * 以后加新能力 = 往下面 ACTIONS 里加一条，**不再动输入区布局**。 */
+  function openPlusSheet() {
+    openSheet('添加', function (body) {
+      var ACTIONS = [
+        { icon: '🖼', label: '发图片', hint: '最多 6 张', run: function () { fileInput.click(); } },
+        { icon: '🕘', label: '历史输入', hint: '最近 30 条', run: openHistorySheet },
+      ];
+      ACTIONS.forEach(function (a) {
+        var b = el('button', 'btn block plus-item');
+        b.appendChild(el('span', 'plus-ico', a.icon));
+        var t = el('span', 'plus-label', a.label);
+        b.appendChild(t);
+        b.appendChild(el('span', 'plus-hint', a.hint));
+        b.onclick = function () { closeSheet(); a.run(); };
+        body.appendChild(b);
+      });
+    });
+  }
+
   function openHistorySheet() {
     openSheet('历史输入', function (body) {
       var h = getHistory();
       if (!h.length) { body.appendChild(el('div', 'empty', '还没有历史输入')); return; }
       h.forEach(function (t) {
-        var b = el('button', 'btn block', t.length > 70 ? t.slice(0, 70) + '…' : t);
+        /* ★ 不再 slice(0,70) 截断：整段放进 .hist-text，CSS 负责**换行**展示
+         *   （旧写法撞上 .btn 基类的 white-space:nowrap，长句直接溢出抽屉 ——
+         *   用户报的「很多句话超出去了，已经超出页面了」。） */
+        var b = el('button', 'btn block hist-item');
+        b.appendChild(el('div', 'hist-text', t));
         b.onclick = function () {
           promptInput.value = t; promptInput.focus(); autoGrow(); closeSheet();
         };
         body.appendChild(b);
       });
-      var c = el('button', 'btn block', '🗑 清空历史');
+      var c = el('button', 'btn block hist-clear', '清空历史');
       c.onclick = function () { try { localStorage.removeItem(HISTORY_KEY); } catch (e) { } closeSheet(); };
       body.appendChild(c);
     });
@@ -768,10 +877,10 @@
 
   function openMenuSheet() {
     openSheet('更多', function (body) {
-      var a = el('button', 'btn block', '⟳ 刷新会话列表');
+      var a = el('button', 'btn block', '刷新会话列表');
       a.onclick = function () { closeSheet(); loadAll(); };
       body.appendChild(a);
-      var b = el('button', 'btn block', '🔓 断开并重新配对');
+      var b = el('button', 'btn block', '断开并重新配对');
       b.onclick = function () { closeSheet(); logout(); };
       body.appendChild(b);
       body.appendChild(el('div', 'sec', '诊断'));
@@ -849,7 +958,7 @@
 
     sendBtn.disabled = true;
     addBubble('user', text.trim() || ('（' + pendingImages.length + ' 张图片）'));
-    if (text.trim()) pushHistory(text.trim());
+    if (text.trim()) { pushHistory(text.trim()); markSent(text.trim()); }   // ★ 记下"刚发的"，事件流回显时去重
 
     var payload = { sessionId: current, text: text };
     if (pendingImages.length) {
@@ -886,8 +995,7 @@
   $('newSessionBtn').onclick = openNewSessionSheet;
   $('menuBtn').onclick = openMenuSheet;
   $('modelBtn').onclick = openModelSheet;
-  $('historyBtn').onclick = openHistorySheet;
-  $('imageBtn').onclick = function () { fileInput.click(); };
+  $('plusBtn').onclick = openPlusSheet;
   $('approveBtn').onclick = function () { answerApproval(true); };
   $('rejectBtn').onclick = function () { answerApproval(false); };
   searchInput.addEventListener('input', renderList);

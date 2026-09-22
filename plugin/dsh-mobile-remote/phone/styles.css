@@ -508,3 +508,38 @@ pre.code[data-lang]::before {
   background: var(--warn-soft); color: var(--warn); border: 1px solid #f0d9b5;
   border-radius: 10px; padding: 10px 12px; font-size: 12.5px; line-height: 1.6; margin-bottom: 10px;
 }
+
+/* ── 历史输入条目（2026-09-22 修"超出页面"）──────────────
+ * 真因：.btn 基类的 white-space:nowrap（为顶栏小按钮设的）被 .btn.block 继承，
+ * 历史里那串长句不换行 ⇒ 直接横向溢出抽屉（用户："很多句话超出去了"）。
+ * 修法：hist-item 显式恢复 normal + 任意断行，整段完整展示，不再截 70 字。 */
+.btn.hist-item { white-space: normal; padding: 10px 12px; }
+.hist-text {
+  font-size: 13.5px; line-height: 1.5; color: var(--text);
+  word-break: break-word; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.btn.hist-clear { text-align: center; color: var(--danger); background: var(--surface); border: 1px solid var(--border); }
+
+/* ── 「＋」动作列表（输入区功能全收进来）────────────────── */
+.btn.plus-item { display: flex; align-items: center; gap: 10px; }
+.plus-ico { flex: none; font-size: 17px; }
+.plus-label { flex: 1; font-weight: 600; }
+.plus-hint { flex: none; font-size: 11.5px; color: var(--text-3); font-weight: 400; }
+
+/* ── 模型抽屉：搜索 + 平台标签筛选 ────────────────────────
+ * 对齐电脑端（用户："在选择模型那里加一个搜索框，然后一个按标签（各大平台）筛选"）。 */
+.model-filter { margin-bottom: 4px; }
+.model-search { margin-bottom: 8px; }
+.model-tags {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
+}
+.model-tags .tag {
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text-2);
+  border-radius: 999px; padding: 5px 12px; font-size: 12.5px; font-weight: 500; cursor: pointer;
+}
+.model-tags .tag.on {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600;
+}
+.model-list .sec { margin-top: 10px; }

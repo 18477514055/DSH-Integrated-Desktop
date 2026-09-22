@@ -118,29 +118,18 @@
 
   <form id="promptForm" class="composer">
     <!--
-      输入区三个按钮的取舍（2026-09-21 按真机 375 宽实测重排）：
-        改之前：🖼 38 + 🕘 38 + 输入框 197 + 「发送」64 + 间距 ⇒ 输入框连半屏都不到。
-        改之后：44 + 44 + 输入框 207 + ● 44 ⇒ 输入框占比从 53% 升到 55%，
-                且三个按钮都达到了 44×44 的可点下限。
-      ★ 为什么不干脆去掉两个图标按钮换回 250px 输入框：
-        「发图片」是**不可替代**的功能（没有它手机上就发不了图）；
-        「历史输入」虽然可用性弱，但它是手机上找回上一句话的唯一入口
-        （手机没有 Ctrl+↑ 那种键）。两个都留着，代价是输入框窄一点 ——
-        这是**有意识的取舍**，不是没注意。
-      每个按钮都有 title + aria-label，长按/读屏都知道是干什么的。
+      输入区按钮（2026-09-22 按用户要求重构）：
+      「以后所有的功能全部集中在一个列表中，而不是分成什么图片啊、历史输入啊两个按键，
+        这样输入框的位置也宽一点。」
+        改之前：[图片][历史] 两个 44px 图标键 + 输入框 ≈245px + 发送 44px；
+        改之后：[＋] 一个键 + 输入框 ≈289px + 发送 44px —— 输入框再宽约 18%。
+      发图片 / 历史输入收进「＋」弹出的动作列表（app.js 的 openPlusSheet）；
+      以后的新能力（文件、模板、语音…）只往那个列表加条目，不再动输入区的布局。
+      （历史账：最早的 64px 文字键「发送」曾把输入框挤到只剩 197px ——
+        那一轮把发送收成 44px 圆形图标键，这一轮把两个功能键收成一个「＋」。）
     -->
-    <button type="button" id="imageBtn" class="icon" title="发图片" aria-label="发图片">
-      <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
-        <rect x="3" y="4.8" width="18" height="14.4" rx="2.6"/>
-        <circle cx="8.6" cy="10" r="1.55"/>
-        <path d="M4.2 16.6l4.4-4.2 3.4 3.3 2.8-2.3 4.6 3.9"/>
-      </svg>
-    </button>
-    <button type="button" id="historyBtn" class="icon" title="历史输入" aria-label="历史输入">
-      <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M3.6 12a8.4 8.4 0 1 0 2.6-6.1"/><path d="M3.2 3.6v5.2h5.2"/>
-        <path d="M12 8.2V12.6l3.1 1.9"/>
-      </svg>
+    <button type="button" id="plusBtn" class="icon" title="添加" aria-label="添加：发图片 / 历史输入等">
+      <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5.5v13M5.5 12h13"/></svg>
     </button>
     <textarea id="promptInput" rows="1" placeholder="发消息…（回车换行）"></textarea>
     <!-- 发送键：44px 圆形图标（纸飞机）。原来是 64px 的文字键「发送」，
@@ -153,7 +142,6 @@
         <path d="M11.2 13.4l8.2-8.8"/>
       </svg>
     </button>
-  </form>
   </form>
   <input id="fileInput" type="file" accept="image/*" multiple hidden />
 </section>

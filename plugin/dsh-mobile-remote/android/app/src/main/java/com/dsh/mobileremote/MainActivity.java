@@ -82,18 +82,31 @@ public class MainActivity extends Activity {
     private void installKeyboardInsetHandler() {
         root.setOnApplyWindowInsetsListener((v, insets) -> {
             int bottom;
+            int top = 0;
             if (android.os.Build.VERSION.SDK_INT >= 30) {
                 // ① 键盘（IME）高度：真正要躲开的那一块
                 android.graphics.Insets ime = insets.getInsets(android.view.WindowInsets.Type.ime());
                 // ② 系统手势条 / 导航栏：键盘没弹出时也要避让
                 android.graphics.Insets sys = insets.getInsets(android.view.WindowInsets.Type.systemBars());
                 bottom = Math.max(ime.bottom, sys.bottom);
+                // ③ 状态栏（含前置摄像头/刘海挖孔区）：
+                //    用户 2026-09-22 报告"上面是前置摄像头挡住的" —— targetSdk 37 强制
+                //    edge-to-edge 后，页面顶端顶进了摄像头区域，标题/按钮会被挖孔压住。
+                //    top 取 systemBars.top（状态栏高度，挖孔机型的状态栏本来就把挖孔包进去），
+                //    与 displayCutout.top 兜底取大 —— 两种实现哪个大听哪个。
+                int cutout = 0;
+                if (android.os.Build.VERSION.SDK_INT >= 30) {
+                    cutout = insets.getInsets(android.view.WindowInsets.Type.displayCutout()).top;
+                }
+                top = Math.max(sys.top, cutout);
             } else {
                 bottom = insets.getSystemWindowInsetBottom();
+                top = insets.getSystemWindowInsetTop();
             }
-            // 把底部让出来 ⇒ WebView 的可用高度随之变小，输入框被顶到键盘之上
-            if (v.getPaddingBottom() != bottom) {
-                v.setPadding(v.getPaddingLeft(), v.getPaddingTop(), v.getPaddingRight(), bottom);
+            // 把底部让出来 ⇒ WebView 的可用高度随之变小，输入框被顶到键盘之上；
+            // 把顶部也让出来 ⇒ 页面整体从摄像头/刘海下方开始（用户："把整个页面稍拉短一点"）
+            if (v.getPaddingBottom() != bottom || v.getPaddingTop() != top) {
+                v.setPadding(v.getPaddingLeft(), top, v.getPaddingRight(), bottom);
             }
             return insets;
         });
