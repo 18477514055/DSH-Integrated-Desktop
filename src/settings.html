@@ -297,6 +297,29 @@
           <span class="note">一屏勾选、一次装完（安装包不带插件，插件都从仓库拉）</span>
         </div>
       </div>
+
+      <!-- ── 本地插件包：断网也能装（0.2.8） ──
+           用它的场景：别人把插件包从网盘下下来、解压在本机，而这台机器连不上
+           GitHub。此时上面那条「检查插件更新」必然失败，但插件照样能装上。 -->
+      <div class="row">
+        <div class="k">本地插件包</div>
+        <div class="v" style="flex-direction:column;align-items:stretch;gap:6px">
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <button class="btn" id="btn-pl-pack">扫描本机插件包</button>
+            <button class="btn" id="btn-pl-pack-dir">选择插件包目录…</button>
+            <span class="note" id="pl-pack-status">还没扫描</span>
+          </div>
+          <span class="note" id="pl-pack-dir" style="word-break:break-all"></span>
+          <span class="note">
+            断网也能装：把插件包解压到<b>下载夹 / 桌面 / 应用数据目录</b>任一处的
+            <span class="mono">plugin-pack</span> 文件夹里，或者用左边「选择插件包目录…」指给它。
+            包里的每个 .tgz 照样要过 sha256 与插件目录校验，不比从网上装松。
+          </span>
+        </div>
+      </div>
+      <div id="pl-pack-notice"></div>
+      <div id="pl-pack-list" class="pl-list"></div>
+
       <div class="row" id="pl-row-prog" style="display:none">
         <div class="k">进度</div>
         <div class="v" style="flex-direction:column;align-items:stretch;gap:6px">

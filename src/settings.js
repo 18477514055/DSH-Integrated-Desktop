@@ -443,6 +443,128 @@
     if (ok) await loadPlugins(false);   // 同上：解锁之后再刷新
   }
 
+  /**
+   * 渲染「本地插件包」区块（断网也能装的那条路）。
+   *
+   * ★ 这里刻意**不复用** cardHtml：那张卡的动作是"下载 + 安装"，
+   *   而这一张的动作是"从本机文件安装"，措辞必须能一眼分清，
+   *   否则用户在断网时点了一个写着"安装"的按钮却不知道文件是从哪来的。
+   */
+  function renderPack(pack) {
+    const list = $("pl-pack-list");
+    const notice = $("pl-pack-notice");
+    const st = $("pl-pack-status");
+    const dirEl = $("pl-pack-dir");
+    if (!list) return;
+
+    if (!pack) { st.textContent = "还没扫描"; list.innerHTML = ""; notice.innerHTML = ""; dirEl.textContent = ""; return; }
+
+    if (!pack.found) {
+      st.textContent = "本机没找到插件包";
+      dirEl.textContent = "";
+      list.innerHTML = "";
+      // 找过哪些地方也说出来 —— 用户才知道该往哪放
+      const tried = (pack.tried || []).slice(0, 4);
+      notice.innerHTML = tried.length
+        ? `<div class="pl-warn">找过这些位置都没有 plugin-index.json：<br>${tried.map(ShellUI.esc).join("<br>")}</div>`
+        : "";
+      return;
+    }
+
+    const items = pack.items || [];
+    st.textContent = `找到了：${items.length} 个包${pack.updatedAt ? "（" + fmtTime(pack.updatedAt) + "）" : ""}`;
+    dirEl.textContent = pack.dir || "";
+
+    const warn = [];
+    for (const w of (pack.warnings || []).slice(0, 3)) warn.push(w);
+    if (pack.missing && pack.missing.length) warn.push(`这些条目的文件不在包里：${pack.missing.join("、")}`);
+    if (pack.error) warn.push(pack.error);
+    notice.innerHTML = warn.length
+      ? `<div class="pl-warn">${warn.map(ShellUI.esc).join("<br>")}</div>`
+      : "";
+
+    list.innerHTML = items.length ? items.map((it) => {
+      const e = ShellUI.esc;
+      const desc = it.description ? e(it.description) : '<i style="color:var(--fg-faint)">（发布者未填说明）</i>';
+      const meta = [`v${it.version}`];
+      if (it.bytes) meta.push(fmtBytes(it.bytes));
+      meta.push("来自本机插件包");
+      return `<div class="pl-card">
+        <div class="hd"><span class="nm">${e(it.name)}</span><span class="tag dev">本机插件包</span></div>
+        <p class="ds">${desc}</p>
+        <div class="meta">${meta.map(e).join(" · ")}</div>
+        <div class="ops"><button class="btn" data-pack-act="install" data-pack-name="${e(it.name)}">从插件包装</button></div>
+      </div>`;
+    }).join("") : '<div class="pl-empty">插件包是空的（里面没有可装的条目）。</div>';
+  }
+
+  async function loadPack() {
+    $("btn-pl-pack").disabled = true;
+    $("pl-pack-status").textContent = "正在扫描…";
+    try {
+      const p = await S.packScan();
+      // 扫描结果里没有 rows（那是 pluginState 才算的）—— 这里够了，本区块只列出包内条目
+      renderPack(p);
+    } catch (e) {
+      $("pl-pack-status").textContent = `扫描出错：${(e && e.message) || e}`;
+    } finally {
+      $("btn-pl-pack").disabled = false;
+    }
+  }
+
+  async function doInstallFromPack(name, btn) {
+    if (pluginBusy) return;
+    pluginBusy = true;
+    btn.disabled = true;
+    $("pl-row-prog").style.display = "";
+    $("pl-fill").style.width = "0%";
+    plProg(`正在从本机插件包安装 ${name}…`);
+    let ok = false;
+    try {
+      const r = await S.installLocal([name]);
+      ok = !!(r && r.installed && r.installed.length);
+      plProg(ok
+        ? `已从插件包装上 ${name} —— 重启一次客户端才生效`
+        : `失败：${((r && r.results && r.results[0] && r.results[0].errors) || (r && r.errors) || ["未知原因"]).join("；")}`);
+    } catch (e) {
+      plProg(`出错：${(e && e.message) || e}`);
+    } finally {
+      pluginBusy = false;
+      btn.disabled = false;
+    }
+    if (ok) await loadPlugins(false);
+  }
+
+  function wirePack() {
+    const scan = $("btn-pl-pack");
+    const pick = $("btn-pl-pack-dir");
+    if (scan) scan.addEventListener("click", () => loadPack());
+    if (pick) {
+      pick.addEventListener("click", async () => {
+        pick.disabled = true;
+        try {
+          const r = await S.pickPackDir();
+          if (r && r.ok) {
+            plStatus(`插件包目录已设为 ${r.path}${r.hasIndex ? "" : "（但这个目录里没找到 plugin-index.json）"}`);
+            await loadPack();
+          }
+        } catch (e) {
+          plStatus(`选择目录出错：${(e && e.message) || e}`);
+        } finally {
+          pick.disabled = false;
+        }
+      });
+    }
+    const list = $("pl-pack-list");
+    if (list) {
+      list.addEventListener("click", (ev) => {
+        const btn = ev.target && ev.target.closest ? ev.target.closest("button[data-pack-act]") : null;
+        if (!btn) return;
+        if (btn.dataset.packAct === "install") doInstallFromPack(btn.dataset.packName, btn);
+      });
+    }
+  }
+
   function wirePlugins() {
     $("btn-pl-check").addEventListener("click", () => loadPlugins(true));
     $("btn-pl-hub").addEventListener("click", () => S.openPluginHub().catch(() => { }));
@@ -512,6 +634,9 @@
   function frInstallable(r) {
     if (!r || !r.compatible) return false;
     if (!r.latest || !r.latest.version) return false;
+    // ★ 本地插件包的条目 state 一定是 "local"（本机装着它自己那份源码联接）——
+    //   那是**正常**的，不是"已经装好了"，所以也要能勾（否则离线路径永远勾不上）。
+    if (r.localPack) return true;
     return ["not-installed", "broken"].includes(r.state);
   }
 
@@ -519,6 +644,7 @@
   function frWhyNot(r) {
     if (!r.compatible) return "不适用于本外壳";
     if (!r.latest || !r.latest.version) return "清单里没有可装的版本";
+    if (r.localPack) return "";
     switch (r.state) {
       case "installed": return "已经装好了";
       case "update": return "已经装好了（有新版，去「集成版插件」里更新）";
@@ -542,11 +668,15 @@
     if (r.devOnly) tags.push('<span class="tag dev">开发者工具</span>');
     if (!r.compatible) tags.push('<span class="tag bad">不适用于本外壳</span>');
     else if (!can) tags.push('<span class="tag on">已装</span>');
+    // ★ 这一条来自本机插件包（网盘那份），不是仓库 —— 说出来，别让人以为是线上版本
+    if (r.localPack) tags.push('<span class="tag dev">本机插件包</span>');
 
-    const meta = [`线上 v${latest.version}`];
-    if (r.local) meta.push(`本机 v${r.local.version}`);
-    if (latest.repo) meta.push(`来自 ${latest.repo}`);
+    // 措辞跟着来源走：来自插件包的**不能**写"线上 v…"，那会误导
+    const meta = [r.localPack ? `本机插件包 v${latest.version}` : `线上 v${latest.version}`];
+    if (r.local && !r.localPack) meta.push(`本机 v${r.local.version}`);
+    if (latest.repo && !r.localPack) meta.push(`来自 ${latest.repo}`);
     if (latest.bytes) meta.push(fmtBytes(latest.bytes));
+    if (r.alsoLocalPack) meta.push("本机插件包里也有这一份");
     if (!can) meta.push(frWhyNot(r));
 
     // ★ 整张卡片就是一个 <label> ⇒ 点卡片任何地方都能勾/取消（不必瞄准那个小方块）。
@@ -572,35 +702,79 @@
     $("fr-sel").textContent = sel.length ? "" : "（上面一条都没勾）";
   }
 
+  /**
+   * 把"本地插件包"并进向导的候选里。
+   *
+   * 为什么要有：用户从网盘下的插件包解压出来，**断网也该能勾着装**。
+   * 网络清单与本地包可能重叠（同一个包两处都有）——那时以网络那条为准
+   * （网络能反映下架与新版本），但给本地那条打上标记，让人知道本机也有一份。
+   *
+   * ★ 本地条目与网络条目**同形**（plugin-pack.js 刻意复用同一套 groupByName /
+   *   mergeInstalled），所以这里只是并集 + 去重，界面代码一行都不用改。
+   */
+  function frMergePack(st) {
+    const net = (st && st.rows) || [];
+    const pack = (st && st.pack) || null;
+    const packRows = (pack && pack.rows) || [];
+    if (!packRows.length) return { rows: net, pack: pack || null, source: "net" };
+
+    const have = new Set(net.map((r) => r.name));
+    const extra = packRows.filter((r) => !have.has(r.name));
+    const merged = net.map((r) => {
+      const hit = packRows.find((p) => p.name === r.name);
+      return hit ? { ...r, alsoLocalPack: true } : r;
+    }).concat(extra);
+    // 全部来自本地包（网络那条彻底拿不到）时才算"离线模式"
+    return { rows: merged, pack, source: net.length ? "both" : "pack" };
+  }
+
   function renderWizard(st) {
     const list = $("fr-list");
-    if (!st || !st.ok) {
+    const m = frMergePack(st);
+    const rows = m.rows;
+    const pack = m.pack;
+
+    // ★ 这一栏的措辞分三种情形，别混：
+    //   ① 网络拿到了           → 照旧
+    //   ② 网络没拿到，但有本地包 → **明确说"离线可用"**，这是 0.2.8 的重点
+    //   ③ 两个都没有           → 才说"先跳过"
+    if (!st || (!st.ok && !rows.length)) {
       $("fr-repo").textContent = "—";
       frStatus(`取清单失败：${(st && st.error) || "未知原因"}`);
-      list.innerHTML = '<div class="pl-empty">连不上插件仓库，本机也没有缓存 —— '
-        + '先点「先跳过」把客户端用起来，以后在「集成版插件」里随时能装。</div>';
+      list.innerHTML = '<div class="pl-empty">连不上插件仓库，本机也没有缓存、没找到插件包 —— '
+        + '先点「先跳过」把客户端用起来。装了插件包之后，在「集成版插件」里点'
+        + '「扫描本机插件包」就能离线装。</div>';
       $("fr-actions").style.display = "";
       frSyncActions();
       return;
     }
 
-    const rows = st.rows || [];
-    $("fr-repo").textContent = st.repo || "—";
-    frStatus(st.stale
-      ? `这次没连上插件仓库，显示的是缓存（${fmtTime(st.fetchedAt)}）`
-      : `清单更新于 ${fmtTime(st.fetchedAt)}`);
+    $("fr-repo").textContent = (m.source === "pack")
+      ? "本机插件包"
+      : (st.repo || "—");
+    frStatus(m.source === "pack"
+      ? `连不上插件仓库，改用**本机插件包**（${pack.dir || ""}${pack.updatedAt ? "，" + fmtTime(pack.updatedAt) : ""}）`
+      : (st.stale
+        ? `这次没连上插件仓库，显示的是缓存（${fmtTime(st.fetchedAt)}）`
+        : `清单更新于 ${fmtTime(st.fetchedAt)}`));
 
     // 读不懂的东西**明说**，不假装没发生（与「集成版插件」栏同一套措辞）
     const warn = [];
     if (!st.knownSchema) warn.push(`清单格式是 ${st.schema}，本外壳认识的是更早的一版 —— 可能读不全。`);
     for (const w of (st.warnings || []).slice(0, 3)) warn.push(w);
+    if (m.source !== "net" && pack && pack.found) {
+      warn.push(`本机插件包：${pack.dir}（${pack.entries ? pack.entries.length : 0} 个包${pack.updatedAt ? "，" + fmtTime(pack.updatedAt) : ""}）`);
+    }
+    if (pack && pack.missing && pack.missing.length) {
+      warn.push(`插件包里这些条目的文件不在：${pack.missing.slice(0, 4).join("、")}${pack.missing.length > 4 ? " …" : ""}`);
+    }
     $("fr-notice").innerHTML = warn.length
       ? `<div class="pl-warn">${warn.map(ShellUI.esc).join("<br>")}</div>`
       : "";
 
     list.innerHTML = rows.length
       ? rows.map(frItemHtml).join("")
-      : '<div class="pl-empty">仓库里现在还没有插件。</div>';
+      : '<div class="pl-empty">仓库里现在还没有插件，本机插件包里也没有。</div>';
     $("fr-actions").style.display = "";
     frSyncActions();
   }
@@ -646,7 +820,17 @@
     $("fr-fill").style.width = "0%";
     frProg(`正在准备 ${names.length} 个插件…`);
     try {
-      const r = await S.installPlugins(names);
+      // ★ 断网兜底：网络那条拿不到清单，但本机插件包里有 ⇒ 走**本地文件**装。
+      //   两条路走的是同一个咽喉（installFromArchive：sha256 + validatePluginDir），
+      //   区别只有"文件从哪来"。渲染进程在这条路上同样只递包名。
+      //
+      //   先定来源、再报进度：反过来的话，安装一开始推送进度就会把这个提示覆盖掉，
+      //   用户永远看不到"这次走的是本地包"（第一版就是这么写错的）。
+      const st = await S.plugins();
+      const usePack = !!(st && !st.ok && st.pack && st.pack.found && st.pack.count);
+      if (usePack) frProg(`连不上插件仓库 —— 改用本机插件包（${names.length} 个）…`);
+
+      const r = usePack ? await S.installLocal(names) : await S.installPlugins(names);
       const okList = (r && r.installed) || [];
       const bad = ((r && r.results) || []).filter((x) => !x.ok);
 
@@ -789,7 +973,11 @@
     wireUpdate();
     wirePlugins();
     wireWizard();
+    wirePack();
     loadPlugins(false);
+    // 本地插件包是"兜底"，开机顺手扫一次（纯磁盘读，不联网、不花钱）。
+    // 扫到了就在那一栏显示出来 —— 用户从网盘解压完，不必再点一次才知道能装。
+    loadPack();
 
     await ShellUI.mountActions($("actions"), { output, verdictEl: $("verdict") });
   }

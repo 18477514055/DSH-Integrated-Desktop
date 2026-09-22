@@ -47,6 +47,7 @@ const SITES = require("./sites");
 const U = require("./update");
 const PC = require("./plugin-catalog");
 const PI = require("./plugin-install");
+const PP = require("./plugin-pack");
 const FR = require("./first-run");
 const WHALE = require("./whale-path.json");
 
@@ -1384,6 +1385,13 @@ async function pluginState({ force = false } = {}) {
   const cat = await PC.fetchIndex({ force });
   const rows = cat.ok ? PC.mergeInstalled(cat.groups, inst.plugins) : [];
 
+  // ── 本地插件包（断网也能装的那条路，见 src/plugin-pack.js）──────────
+  // ★ 只有在**网络来源没给出清单**时才拿它兜底。
+  //   为什么不让它覆盖网络清单：网络那份是权威（能反映下架、新版本），
+  //   本地这份是**快照**，混在一起会让人分不清"这个版本到底还在不在仓库里"。
+  //   两者都有时，界面上本地那份单独显示成"本机插件包"，并标明路径。
+  const pack = packState();
+
   return {
     ok: cat.ok,
     error: cat.error || "",
@@ -1401,6 +1409,23 @@ async function pluginState({ force = false } = {}) {
     repo: PC.HUB_REPO,
     dshHome,
     profile,
+    // 本地插件包：有没有找到、在哪个目录、里面有几个包、能装哪几个
+    pack: {
+      found: pack.found,
+      dir: pack.dir || "",
+      updatedAt: pack.updatedAt || "",
+      count: pack.entries ? pack.entries.length : 0,
+      missing: pack.missing || [],
+      warnings: pack.warnings || [],
+      // ★ 只外发包名与版本（渲染进程**递不进路径**，只能拿名字回来）
+      items: (pack.entries || []).map((e) => ({
+        name: e.name, version: e.version, bytes: e.bytes, description: e.description,
+      })),
+      // 把本地的与已装的并一遍，让界面能显示"本机插件包里有但它还没装"
+      rows: pack.found && pack.entries && pack.entries.length
+        ? PC.mergeInstalled(PC.groupByName(pack.entries), inst.plugins).map((r) => ({ ...r, localPack: true }))
+        : [],
+    },
     counts: {
       total: rows.length,
       // ★ "已装"要把**本地装的**也算进去（dev 联接 / 本地 tgz / npm）——
@@ -1411,6 +1436,89 @@ async function pluginState({ force = false } = {}) {
       broken: rows.filter((r) => r.state === "broken").length,
     },
   };
+}
+
+/**
+ * 本地插件包现在的样子 —— **只读**，纯磁盘扫描，不联网。
+ *
+ * 候选目录由 `PP.candidateDirs` 算（用户显式指定的那个排第一），
+ * 这里只负责把 Electron 的路径概念喂给它。
+ */
+function packState() {
+  const explicit = (settings && settings.pluginPackDir) || "";
+  const dirs = PP.candidateDirs({
+    userData: app.getPath("userData"),
+    downloads: app.getPath("downloads"),
+    desktop: app.getPath("desktop"),
+    explicit,
+  });
+  try {
+    return PP.scan({ dirs, explicit });
+  } catch (e) {
+    // 扫描出错绝不能把整个插件栏带崩 —— 它是**兜底**，不是主路径
+    log(`扫描本地插件包出错：${(e && e.message) || e}`);
+    return { ok: false, found: false, dir: "", entries: [], missing: [], warnings: [], updatedAt: "", error: String((e && e.message) || e) };
+  }
+}
+
+/**
+ * 从本地插件包里装一个（或整批）。
+ *
+ * ★ 与从索引装**走同一个咽喉**（PI.installFromArchive：sha256 + validatePluginDir），
+ *   唯一区别是"文件从哪来"。这里还多做一件事：**安装前复算 sha256**，
+ *   关掉"扫完到装之间文件被换掉"的 TOCTOU 窗口。
+ */
+function installFromLocalPack(names, extra = {}) {
+  const pack = packState();
+  if (!pack.found || !pack.entries.length) {
+    return { ok: false, errors: ["本机没有可用的插件包"], results: [], installed: [], needsRestart: false };
+  }
+  const want = (Array.isArray(names) ? names : []).map((n) => String(n || "").trim()).filter(Boolean);
+  const results = [];
+
+  for (let i = 0; i < want.length; i += 1) {
+    const name = want[i];
+    const at = { itemIndex: i + 1, itemTotal: want.length, ...extra };
+    // 同一个包名在包里可能有多版 —— 取版本最高的那一版（与 groupByName 的排序口径一致）
+    const cands = pack.entries.filter((e) => e.name === name);
+    if (!cands.length) {
+      results.push({ name, ok: false, errors: [`本地插件包里没有 ${name}`] });
+      continue;
+    }
+    const entry = cands.sort((a, b) => require("./update.js").cmpVersion(b.version, a.version))[0];
+
+    pluginsEmit({ kind: "start", name, version: entry.version, ...at });
+    const v = PP.verifyLocalFile(entry);
+    if (!v.ok) {
+      pluginsEmit({ kind: "end", name, ok: false, ...at });
+      log(`本地安装 ${name}：校验失败 —— ${v.error}`);
+      results.push({ name, ok: false, version: entry.version, errors: [v.error] });
+      continue;
+    }
+
+    let r;
+    try {
+      r = PI.installFromArchive({
+        dshHome: getDshHome(),
+        profile: (settings && settings.profile) || "web",
+        tgz: entry.localFile,
+        expectedSha256: v.sha256 || entry.sha256 || undefined,
+        name: entry.name,           // ★ 名字必须对得上（validatePluginDir 会核）
+        log: (m) => log(`[本地插件] ${m}`),
+      });
+    } catch (e) {
+      r = { ok: false, errors: [`安装出错：${(e && e.message) || e}`], warnings: [], changed: [] };
+    }
+    pluginsEmit({ kind: "end", name, ok: !!r.ok, ...at });
+    log(`本地安装 ${entry.name}@${entry.version}：ok=${r.ok} ${(r.errors || []).join("；")}`);
+    results.push({
+      name, ok: !!r.ok, version: entry.version,
+      errors: r.errors || [], warnings: r.warnings || [],
+    });
+  }
+
+  const installed = results.filter((x) => x.ok).map((x) => x.name);
+  return { ok: installed.length > 0, results, installed, needsRestart: installed.length > 0 };
 }
 
 function communityExe() {
@@ -1699,6 +1807,58 @@ function registerIpc() {
   ipcMain.handle("dsh:plugins:open-page", (e) => {
     assertShellSender(e);
     return shell.openExternal(`https://github.com/${PC.HUB_REPO}`);
+  });
+
+  // ── 本地插件包（断网可用；见 src/plugin-pack.js）────────────────────
+  //
+  // ★ 这三条**都不接受渲染进程递来的路径**：
+  //   · 扫描：目录只有"主进程算出来的候选"和"用户在原生选择框里点的那一个"两种来路；
+  //   · 选目录：走 dialog.showOpenDialog，返回值由**主进程**写进 settings，
+  //     渲染进程只是触发者，连自己选了什么路径都不需要知道；
+  //   · 安装：渲染进程只能递**包名**，文件路径由主进程从本地索引里查出来。
+  //   这样"装本地插件"就不会变成一条"从任意路径装任意代码"的通道。
+  ipcMain.handle("dsh:plugins:pack-scan", (e) => {
+    assertShellSender(e);
+    const p = packState();
+    log(`本地插件包：found=${p.found} dir=${p.dir || "-"} 条目=${p.entries ? p.entries.length : 0} ${p.error || ""}`);
+    return {
+      ok: p.ok, found: !!p.found, dir: p.dir || "",
+      count: p.entries ? p.entries.length : 0,
+      updatedAt: p.updatedAt || "", error: p.error || "",
+      missing: p.missing || [], warnings: p.warnings || [],
+      items: (p.entries || []).map((x) => ({ name: x.name, version: x.version, bytes: x.bytes, description: x.description })),
+      tried: p.tried || [],
+    };
+  });
+
+  ipcMain.handle("dsh:plugins:pick-pack-dir", async (e) => {
+    assertShellSender(e);
+    const r = await dialog.showOpenDialog(
+      settingsWindow && !settingsWindow.isDestroyed() ? settingsWindow : mainWindow,
+      {
+        title: "选择插件包目录（里面有 plugin-index.json）",
+        defaultPath: (settings && settings.pluginPackDir) || app.getPath("downloads"),
+        properties: ["openDirectory"],
+      });
+    if (r.canceled || !r.filePaths || !r.filePaths.length) return { ok: false, message: "已取消" };
+    const picked = r.filePaths[0];
+    // 先验一下再存 —— 免得用户点了个不相干的目录，之后一直"找到了但没内容"
+    const probe = PP.inspectDir(picked);
+    settings.pluginPackDir = picked;
+    saveSettings();
+    log(`插件包目录已设为：${picked}（里面有索引 = ${probe.found}）`);
+    return { ok: true, path: picked, hasIndex: probe.found, dir: probe.dir || "" };
+  });
+
+  ipcMain.handle("dsh:plugins:install-local", async (e, names) => {
+    assertShellSender(e);
+    const want = (Array.isArray(names) ? names : []).map((n) => String(n || "").trim()).filter(Boolean);
+    if (!want.length) return { ok: false, errors: ["没给插件名"], results: [], installed: [], needsRestart: false };
+    if (want.length > 32) return { ok: false, errors: ["一次勾太多了（上限 32 个）"], results: [], installed: [], needsRestart: false };
+    log(`[本地插件包] 开始安装：${want.join(", ")}`);
+    const r = installFromLocalPack(want);
+    log(`[本地插件包] 装完：成功 ${r.installed.length}/${want.length} [${r.installed.join(", ")}]`);
+    return r;
   });
 
   // ── 首次安装向导（标记文件见 src/first-run.js）────────────────────

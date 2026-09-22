@@ -361,7 +361,17 @@ async function fetchIndex(opts = {}) {
 
   const fail = (error) => {
     const cached = readCache();
-    if (cached && !opts.force) {
+    // ★ 2026-09-22 修：「检查插件更新」（force=true）**也要**能退回缓存。
+    //
+    //   原来的 `cached && !opts.force` 有个很坑的后果：用户看着好好的清单，
+    //   点一下「检查插件更新」——本来只是想看看有没有新版本 ——
+    //   却因为断网而把列表整个变成「拿不到插件清单」，连"断网时还能看到上一份"
+    //   这条兜底都被自己的按钮关掉了。**主动检查不该比不检查结果更差。**
+    //
+    //   force 现在只表示"**别用过期的内存快照、去网上再要一次**"，
+    //   不再表示"不许 fallback"。退回缓存时如实标 stale=true，界面照旧会
+    //   写明「这次没连上插件仓库，显示的是缓存（时间）」—— 用户不会被误导。
+    if (cached) {
       const idx = normalizeIndex(cached.index);
       return {
         ok: true, index: idx, groups: groupByName(idx.entries),

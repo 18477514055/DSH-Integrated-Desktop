@@ -123,6 +123,21 @@ contextBridge.exposeInMainWorld("dshShell", {
   /** 插件下载/安装进度：{ kind:"start"|"progress"|"end", name, version?, got?, total?, percent?, ok? } */
   onPluginProgress: (cb) => subscribe("dsh:plugins:progress", cb),
 
+  // ── 本地插件包（断网可用；src/plugin-pack.js）──────────────────────
+  //
+  // ★ 这三个通道**都不接受渲染进程递来的路径**：
+  //   · packScan    —— 只读扫候选目录（用户设过的那一个优先）
+  //   · pickPackDir —— 弹**原生**目录选择框，路径由主进程存进 settings
+  //   · installLocal—— 只收**包名**，文件路径由主进程从本地索引里查
+  //   所以"装本地插件"不会变成"从任意路径装任意代码"的通道。
+  /** 扫一遍本机有没有插件包。返回 { ok, found, dir, count, items, missing, tried }。 */
+  packScan: () => ipcRenderer.invoke("dsh:plugins:pack-scan"),
+  /** 让用户挑一个插件包目录（原生对话框）。返回 { ok, path, hasIndex }。 */
+  pickPackDir: () => ipcRenderer.invoke("dsh:plugins:pick-pack-dir"),
+  /** 从**本地插件包**装（断网也走得通）。返回 { ok, results, installed, needsRestart }。 */
+  installLocal: (names) => ipcRenderer.invoke(
+    "dsh:plugins:install-local", Array.isArray(names) ? names.map(String) : []),
+
   // ── 首次安装向导（标记文件 src/first-run.js）────────────────────
   //
   // 0.2.6 起安装包**不带插件**（包干干净净），插件的入口变成"首启时勾选、从插件仓库拉"。
