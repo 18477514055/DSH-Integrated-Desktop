@@ -62,7 +62,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: "dsh-int-archive-manager",
+  id: "@zjh18477514055/dsh-int-archive-manager",
   factory: (require) => {
     "use strict";
 

@@ -55,7 +55,7 @@ const ROOT = path.join(__dirname, "..");
  *     联接都是**写死的绝对路径**，改目录名 = 当场弄坏这个插件（全局规矩）。
  *   合成一个常量就会出现"改包名把路径一起改掉、脚本再也找不到源码"这种静默故障。
  */
-const PLUGIN_NAME = "dsh-int-mobile-remote";
+const PLUGIN_NAME = "@zjh18477514055/dsh-int-mobile-remote";
 const PLUGIN_DIR_NAME = "dsh-mobile-remote";
 const PLUGIN_DIR = path.join(ROOT, "plugin", PLUGIN_DIR_NAME);
 const CDP_PORT = Number(process.env.DSH_MMR_CDP || 9346);

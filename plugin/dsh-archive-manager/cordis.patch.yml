@@ -20,5 +20,5 @@
 # ============================================================================
 
 - insert:
-    - id: dsh-int-archive-manager
-      name: 'dsh-int-archive-manager'
+    - id: '@zjh18477514055/dsh-int-archive-manager'
+      name: '@zjh18477514055/dsh-int-archive-manager'

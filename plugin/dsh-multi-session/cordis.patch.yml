@@ -10,5 +10,5 @@
 #
 # id 用包名（dsh-crosshub 也是这么写的）；qoder 用 llm-qoder 是因为它要占一个 provider id。
 - insert:
-    - id: dsh-multi-session
-      name: 'dsh-multi-session'
+    - id: '@zjh18477514055/dsh-multi-session'
+      name: '@zjh18477514055/dsh-multi-session'

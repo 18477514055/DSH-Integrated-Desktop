@@ -34,7 +34,7 @@ import { fileURLToPath } from "node:url";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const PLUGIN_NAME = "dsh-int-archive-manager";
+const PLUGIN_NAME = "@zjh18477514055/dsh-int-archive-manager";
 /** ★ 目录名**不动**（2026-09-22 改名）：仓库里 `plugin\<目录>` 是指向
  *  `D:\DSH工作区002\2.归档管理器` 的目录联接，而已装插件的 link: 与 node_modules
  *  联接都是**写死的绝对路径** ⇒ 改目录名就当场弄坏这个插件。

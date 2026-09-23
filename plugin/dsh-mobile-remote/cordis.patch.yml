@@ -21,5 +21,5 @@
 #   改名要同时动三处，漏一处内核直接起不来：
 #     ① 本文件下面的 id 与 name   ② package.json 的 name   ③ profile 的三处契约
 - insert:
-    - id: dsh-int-mobile-remote
-      name: 'dsh-int-mobile-remote'
+    - id: '@zjh18477514055/dsh-int-mobile-remote'
+      name: '@zjh18477514055/dsh-int-mobile-remote'

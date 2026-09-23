@@ -1,7 +1,7 @@
 {
-  "name": "dsh-int-mobile-remote",
+  "name": "@zjh18477514055/dsh-int-mobile-remote",
   "version": "0.8.0",
-  "private": true,
+  
   "description": "手机遥控：电脑端显示二维码，手机扫码后经局域网远程查看会话、看流式输出、发消息、中断。 · Scan a QR code on the desktop and drive this DSH from your phone over LAN.",
   "type": "module",
   "main": "desktop/index.js",

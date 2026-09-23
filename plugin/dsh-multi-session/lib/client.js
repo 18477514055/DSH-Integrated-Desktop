@@ -57,7 +57,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: "dsh-multi-session",
+  id: "@zjh18477514055/dsh-multi-session",
   factory: (require) => {
     "use strict";
 
