@@ -690,12 +690,23 @@ async function verifyReuse(tmpDir) {
     try { fs.unlinkSync(recFile); } catch { }
     const app1 = launch("own", tmpDir, port);
     const t1 = await waitForPage((t) => /status-page\.html/.test(t.url), 60000);
-    await sleep(4000);
-    const b = JSON.parse(await cdpEval(t1.webSocketDebuggerUrl, `JSON.stringify({
-      title: (document.getElementById("title")||{}).textContent || "",
-      stage: (document.getElementById("stagetext")||{}).textContent || "",
-      detail: ((document.getElementById("detail")||{}).textContent || "").slice(0, 400)
-    })`));
+    // ★ 判据改成**轮询**，不再是固定 `sleep(4000)`。
+    //   为什么：外壳要先加载内核页、再连续确认被 401 挡住
+    //   （verifyUiLoaded 里是 6 次 × 700ms），才会切到「打不开这个内核」页 ——
+    //   固定 4 秒只是**碰巧够用**。2026-09-23 实测：本机内核 7 秒就绪时，
+    //   4 秒窗口正好错过那次切换，于是下面三条断言一起**假 FAIL**
+    //   （已用 HEAD 版本 A/B 核对：同样假 FAIL ⇒ 不是代码回归，是判据太紧）。
+    //   项目 AGENTS.md §5：**flaky 的判据比没有判据更糟**。
+    let b = { title: "", stage: "", detail: "" };
+    for (let i = 0; i < 40; i++) {
+      b = JSON.parse(await cdpEval(t1.webSocketDebuggerUrl, `JSON.stringify({
+        title: (document.getElementById("title")||{}).textContent || "",
+        stage: (document.getElementById("stagetext")||{}).textContent || "",
+        detail: ((document.getElementById("detail")||{}).textContent || "").slice(0, 400)
+      })`));
+      if (b.title) break;
+      await sleep(600);
+    }
     check("B) 拿不到 token 时给出**人话**提示（而不是那行英文 401）",
       /打不开这个内核/.test(b.title), `标题="${b.title}" ／ 阶段="${b.stage}"`);
     check("B) 提示里说清了怎么办（关掉 / 用浏览器打开 / 换端口）",

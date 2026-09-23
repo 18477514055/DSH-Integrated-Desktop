@@ -120,6 +120,51 @@ let kernelLogFile = null;
  * 见 ensureServer 的 ①b 与 verifyUiLoaded。
  */
 let reuseUnverified = false;
+/**
+ * **认领来的内核 pid** —— 不是我 spawn 的，但已证实是本应用拉起来的（见 claimAdoptedKernel）。
+ *
+ * ★ 2026-09-23 用户报「我现在无法彻底退出 dsh，从托盘退出也不行」的根因就在这条链上：
+ *   复用（`serverOwned = false`）之后，退出时**只关 `kernelProc`** ⇒
+ *   复用的那个内核永远没人关、端口一直占着、下次启动又把它复用回来
+ *   —— 在用户看来就是"根本没退"。任务管理器里 `DSH Integrated.exe` 还在
+ *   （内核用的就是同一个 exe，见 kernel.js 的 spawnKernel）。
+ *
+ * 认领的原则：**能证明才认领**（kernel.ourKernelProcess）；
+ * 认不出的一律不认领 ⇒ 退出时一个字都不动它（用户自己 `dsh web` 起的那个内核
+ * 就属于这一类，命令行是 node.exe ⇒ 天然不匹配）。
+ */
+let adoptedKernelPid = null;
+
+/**
+ * 认领一个"已经在端口上跑、但不是我这次 spawn 的内核"。
+ *
+ * ★ 异步：判据要查一次 WMI（PowerShell 冷启动几百毫秒），
+ *   **不能挡住启动** —— 调用方一律 `void claimAdoptedKernel(...)` 发出去就走，
+ *   认领结果在几百毫秒后落到 `adoptedKernelPid`。退出时读的就是它。
+ *
+ * @param {number} pid 端口持有者
+ * @param {number} port
+ * @param {string} why 从哪条路发现的（只进日志）
+ * @returns {Promise<boolean>} 认领成功没有（调用方通常不 await）
+ */
+async function claimAdoptedKernel(pid, port, why) {
+  let chk;
+  try { chk = await K.ourKernelProcess(pid, port); }
+  catch (e) { log(`不认领内核 pid=${pid}（${why}）：判据抛异常 ${(e && e.message) || e}`); return false; }
+  if (!chk.ok) {
+    log(`不认领内核 pid=${pid}（${why}）：${chk.why} ⇒ 退出时不会关它`);
+    return false;
+  }
+  // 父进程还活着 ⇒ 它是**另一个外壳实例**正在用的内核，不是孤儿。
+  //   杀了它等于替别的实例关内核（那个实例还会自己再拉一个），所以不碰。
+  if (chk.info && chk.info.ppid && chk.info.ppid !== process.pid && isPidAlive(chk.info.ppid)) {
+    log(`不认领内核 pid=${pid}（${why}）：它的父进程 ${chk.info.ppid} 还活着（属于另一个外壳实例）`);
+    return false;
+  }
+  adoptedKernelPid = pid;
+  log(`已认领内核 pid=${pid}（${why}，父进程 ${chk.info ? chk.info.ppid : "?"} 已不在）⇒ 退出时会一并关掉它`);
+  return true;
+}
 
 /**
  * 加载页状态。`seq` 单调递增：页面先订阅事件、再拉快照，
@@ -825,7 +870,15 @@ async function ensureServer(opts = {}) {
     if (recorded && K.isProbeAlive(await K.probeDsh(recorded))) {
       serverUrl = recorded;
       serverOwned = false;
-      reuseUnverified = false;
+      // ★ 带上 token 的地址只可能来自**我们自己写的记录** ⇒ 这个内核是本应用拉起来的。
+      //   认领它：退出时才能把它一起关掉（否则就是用户报的"退不干净"）。
+      const rec = readKernelRecord();
+      // ★ 发出去就走：认领要查 WMI，不许挡住启动（见 claimAdoptedKernel 的注释）
+      if (rec && rec.pid) void claimAdoptedKernel(rec.pid, port, "记录里的带 token 地址");
+      // ★ 记录里可能是**裸 origin**（认领时补写的，见 ①b）—— 那种地址同样要过一遍
+      //   "能不能看见界面"的检查，不能因为"有记录"就跳过。
+      reuseUnverified = !/[?&]token=/.test(String(recorded));
+      if (reuseUnverified) log("记录里的地址不带 token ⇒ 加载后仍要确认一次鉴权");
       log(`复用已有内核（用记录里的带 token 地址）: ${recorded.replace(/token=[^&]+/, "token=***")}`);
       return true;
     }
@@ -839,6 +892,25 @@ async function ensureServer(opts = {}) {
       serverOwned = false;
       reuseUnverified = true;
       log(`复用已有内核（裸 origin，${probe}）: ${primary} —— 加载后需确认能否通过鉴权`);
+      // ★ 走到这里说明**记录丢了或过期了**。端口上那个内核是谁的？
+      //   能证明是我们自己拉起来的就认领（退出时关掉它），否则明确记一笔"不认领"。
+      //   认领要查 WMI ⇒ **发出去就走**，绝不挡住启动（见 claimAdoptedKernel）。
+      const owner = K.portOwner(port);
+      if (owner) {
+        void claimAdoptedKernel(owner, port, "裸 origin 复用").then((claimed) => {
+          if (!claimed) return;
+          // 补一份记录：下次启动就能带 token 复用，也能一眼看出它的归属与 pid
+          saveKernelRecord({
+            pid: owner, port, url: primary, dshHome: dshHomeForProbe, profile,
+            version: (kernelInfo && kernelInfo.version) || "未知",
+            startedAt: new Date().toISOString(),
+            adopted: true,
+          });
+          log(`已为认领的内核补写记录（pid=${owner}，地址是裸 origin）`);
+        }).catch((e) => log("认领流程异常:", (e && e.message) || e));
+      } else {
+        log("端口上探到了 dsh 服务，但读不出持有者 pid ⇒ 无法判断归属，退出时不会关它");
+      }
       return true;
     }
   }
@@ -861,8 +933,24 @@ async function ensureServer(opts = {}) {
 
   // ③ 端口被别的程序占了？
   if (K.isPortBusy(port)) {
+    // ★ 先问一句"上面坐着的到底是不是 dsh" —— 原来不管是不是都报
+    //   「上面探测到的不是 dsh 服务」，把"一个已经在跑的 dsh 内核"误报成
+    //   "别的程序占着端口"，还叫人去关别的程序。2026-09-23 实测：
+    //   诊断里的「重启内核」在复用状态下**永远失败**，报的就是这句错话。
+    const busyProbe = await K.probeDsh(primary);
+    const busyOwner = K.portOwner(port);
+    if (K.isProbeAlive(busyProbe)) {
+      throw new Error(
+        `端口 ${port} 上已经有一个 dsh 内核在跑（pid ${busyOwner || "读不到"}），` +
+        "而这一步要求**不复用**。\n" +
+        (busyOwner && busyOwner === adoptedKernelPid
+          ? "它就是本应用认领的那个内核（停止它之后端口会释放，请重试）。"
+          : `如果那是你自己在终端里起的内核，请到那个终端里关它；` +
+            "如果它其实是本客户端留下的，请点「诊断与修复」里的「重启内核」。"),
+      );
+    }
     throw new Error(
-      `端口 ${port} 已被占用，但上面探测到的不是 dsh 服务。\n` +
+      `端口 ${port} 已被别的程序占用（pid ${busyOwner || "读不到"}，探活确认上面不是 dsh 服务）。\n` +
       "请关掉占用该端口的程序，或在设置里换一个端口。",
     );
   }
@@ -883,6 +971,7 @@ async function ensureServer(opts = {}) {
   kernelProc = spawned.child;
   kernelLogFile = spawned.logFile;
   serverOwned = true;
+  adoptedKernelPid = null;   // ★ 自己起了一个 ⇒ 之前认领的那个不再是我要负责的对象
 
 
   spawned.child.on("exit", (code, sig) => {
@@ -926,17 +1015,105 @@ async function ensureServer(opts = {}) {
 }
 
 // ── 内核的停止 / 重启（诊断与修复用）──────────────────────────────
-/** 停掉**本应用自己拉起的**内核，并清空服务地址。 */
-function stopOwnedKernel() {
+/**
+ * 停掉**本应用自己拉起的**内核，并清空服务地址。
+ *
+ * @param {{adopted?:boolean}} [opts] `adopted: true` 时连**认领来的**那个也一起停。
+ *   「重启内核」必须传它 —— 否则端口被认领的内核占着，
+ *   `ensureServer({ reuse: false })` 起不了第二个，"重启"会**永远失败**
+ *   （2026-09-23 实测：诊断里连点三次「重启内核」，三次都报端口被占用）。
+ */
+function stopOwnedKernel(opts = {}) {
+  let killed = false;
   if (kernelProc) {
-    try { K.killTree(kernelProc); } catch (e) { log("杀内核失败:", (e && e.message) || e); }
+    try { K.killTree(kernelProc); killed = true; } catch (e) { log("杀内核失败:", (e && e.message) || e); }
     kernelProc = null;
+  }
+  if (opts.adopted && adoptedKernelPid) {
+    log(`停掉认领来的内核 pid=${adoptedKernelPid}`);
+    try { K.killTree({ pid: adoptedKernelPid }); killed = true; }
+    catch (e) { log("杀认领的内核失败:", (e && e.message) || e); }
+    adoptedKernelPid = null;
   }
   serverUrl = null;
   serverOwned = false;
   reuseUnverified = false;
-  clearKernelRecord();
+  // ★ 记录只在**真的动了那个 pid**、或它已经不在了的时候才清。
+  //   以前无条件清 ⇒ 在"复用"状态下点一次「重启内核」就把记录抹掉了，
+  //   之后永远退回裸 origin、永远认不出那个内核是自己人
+  //   （这正是用户现场 `kernel.json` 不见了的那条路）。
+  const rec = readKernelRecord();
+  if (killed || !rec || !isPidAlive(rec.pid)) clearKernelRecord();
+  else log(`保留内核记录（pid=${rec.pid} 还活着，本次没动它）`);
   if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
+}
+
+/**
+ * 退出时的内核收尾：**把本应用拉起来的（含认领来的）内核关掉**。
+ *
+ * ★ 这是用户 2026-09-23 报的那个 bug 的正解。判据只有一句：
+ *   "这个内核是本应用拉起来的吗" —— 是就关，不是就一个字节都不动。
+ *   认领的合法性在 `claimAdoptedKernel` 里已经证过了，这里只管关。
+ *
+ * 用 spawnSync 的 taskkill（同步）⇒ 退出前一定已经关完。
+ */
+function shutdownKernels(opts = {}) {
+  const withAdopted = opts.adopted !== false;
+  let touched = false;
+  if (kernelProc) {
+    log(`退出：关掉本应用启动的内核 pid=${kernelProc.pid}`);
+    try { K.killTree(kernelProc); touched = true; } catch (e) { log("退出：关内核失败:", (e && e.message) || e); }
+    kernelProc = null;
+  }
+  if (withAdopted && adoptedKernelPid) {
+    log(`退出：关掉认领来的内核 pid=${adoptedKernelPid}`);
+    try { K.killTree({ pid: adoptedKernelPid }); touched = true; } catch (e) { log("退出：关认领的内核失败:", (e && e.message) || e); }
+    adoptedKernelPid = null;
+  } else if (!withAdopted && adoptedKernelPid) {
+    // ★ 冒烟（`npm run smoke`）用的是**真实 userData** —— 它会认领用户此刻
+    //   正在用的那个内核。冒烟是"自检"，**不该把别人的客户端弄停**：
+    //   它只负责关自己 spawn 的那个，认领来的一律放过。
+    log(`冒烟收尾：不动认领来的内核 pid=${adoptedKernelPid}（自检不该打断正在用的客户端）`);
+    adoptedKernelPid = null;
+  }
+  if (!touched) log("退出：没有需要关的内核（端口上那个不是本应用拉起来的）");
+  // 记录指向的内核已经被我们关了 ⇒ 它是死的，留着是垃圾（下次启动会报"不可复用"）
+  if (touched) clearKernelRecord();
+}
+
+/**
+ * 退出客户端。**托盘那条「退出」、安装包那条、以及验收脚本用的都是它**
+ * —— 只有一处实现，不会分叉（`scripts/quit-check.js` 就是靠这个拿到真实路径的）。
+ */
+function quitApp(reason) {
+  quitting = true;
+  log(`退出：开始了（来源：${reason}）`);
+  app.quit();
+}
+
+/**
+ * ★ 验收专用的退出开关（`npm run quit:check` 用）。
+ *
+ * 为什么需要它：主进程的 inspector 上下文里 `require` / `process.mainModule` / `module`
+ * **一个都拿不到**（2026-09-23 实测三种写法全是 `NO_LOADER`），
+ * 所以"从外面让外壳退出"没有别的入口。这里开一个**文件开关**而不是定时器：
+ * 由验收脚本在"该检查的都检查完"之后再写文件 ⇒ 检查与退出**不会抢跑**。
+ *
+ * ⚠️ 两道闸：**打包版永远不读它**（`!app.isPackaged`），
+ *    并且必须显式给环境变量 `DSH_QUIT_ON_FILE` 才武装。
+ *    装到用户机器上的东西里，这段代码等于不存在。
+ */
+function armQuitOnFileHook() {
+  if (app.isPackaged || SMOKE) return;
+  if (!process.env.DSH_QUIT_ON_FILE) return;
+  const marker = path.resolve(String(process.env.DSH_QUIT_ON_FILE));
+  log(`[验收] 已武装退出开关：一旦出现文件 ${marker} 就走一次真实退出路径`);
+  const timer = setInterval(() => {
+    if (!fs.existsSync(marker)) return;
+    clearInterval(timer);
+    log("[验收] 看到退出开关文件 ⇒ 触发退出");
+    quitApp("验收 DSH_QUIT_ON_FILE");
+  }, 300);
 }
 
 /**
@@ -1031,7 +1208,14 @@ async function restartKernel(opts = {}) {
 
   settings.profile = target;
   saveSettings();
-  stopOwnedKernel();
+  // ★ 连**认领来的**内核一起停（否则端口被它占着，下面 reuse:false 必撞 EADDRINUSE），
+  //   并且**等端口真的放开**再起新的 —— 杀掉一个进程和它放开监听不是同一时刻，
+  //   不等就会拿到 `listen EADDRINUSE`（2026-09-23 实测过：旧内核 00:34:07 退出、
+  //   新内核 00:34:07.7 起来，直接崩在 webserver 那一层）。
+  stopOwnedKernel({ adopted: true });
+  if (!(await K.waitPortFree(settings.port || DEFAULT_PORT, 15000))) {
+    log(`端口 ${settings.port || DEFAULT_PORT} 在 15 秒内没放开，仍然尝试启动新内核…`);
+  }
 
   try {
     await ensureServer({ profile: target, reuse: false });
@@ -1043,7 +1227,8 @@ async function restartKernel(opts = {}) {
       log(`自动回退到档案 ${prev} …`);
       settings.profile = prev;
       saveSettings();
-      stopOwnedKernel();
+      stopOwnedKernel({ adopted: true });
+      await K.waitPortFree(settings.port || DEFAULT_PORT, 15000);
       try {
         await ensureServer({ profile: prev, reuse: false });
         await loadUi();
@@ -1078,9 +1263,16 @@ function handleServerDown() {
 
   restarting = (async () => {
     log("内核不可用，尝试恢复…");
+    const killedOurs = !!kernelProc;
     if (kernelProc) { K.killTree(kernelProc); kernelProc = null; }
+    // ★ 认领也会失效：它都掉线了，还留着这个 pid 只会让我在退出时去杀一个
+    //   已经被系统复用了 pid 的**别的进程**。
+    adoptedKernelPid = null;
     serverUrl = null;
     serverOwned = false;
+    // 刚杀掉的进程不一定立刻放开端口 ⇒ 不等的话下一步会撞 EADDRINUSE，
+    // 或者更糟：探活探到那个正在死的内核，把它又复用回来。
+    if (killedOurs) await K.waitPortFree(settings.port || DEFAULT_PORT, 10000);
     showStatus({ title: "内核掉线，正在恢复…", stage: "重新拉起内核…", stageKey: "spawn", failed: false, detail: "" });
     try {
       await ensureServer();
@@ -1191,6 +1383,11 @@ function trayTemplate() {
           `档案     : ${settings.profile || "web"}`,
           `DSH_HOME : ${getDshHome()}`,
           `当前页面 : ${active === SITES.LOCAL_ID ? "本机 DSH" : active}`,
+          // ★ 「这个内核归谁」直接决定「退出时会不会被一起关掉」——
+          //   用户 2026-09-23 报"退不干净"时，最需要看到的就是这一行。
+          `内核归属 : ${kernelProc ? "本应用启动（退出时会关掉它）"
+            : adoptedKernelPid ? `认领来的本应用内核 pid=${adoptedKernelPid}（退出时会关掉它）`
+            : serverUrl ? "不是本应用启动的（退出时不动它）" : "未启动"}`,
           "",
           "外壳只负责窗口、托盘与进程管理，不改内核的任何文件。",
         ].join("\n"),
@@ -1198,7 +1395,7 @@ function trayTemplate() {
       }),
     },
     { type: "separator" },
-    { label: "退出", click: () => { quitting = true; app.quit(); } },
+    { label: "退出", click: () => quitApp("托盘") },
   ];
 }
 
@@ -1870,7 +2067,7 @@ function registerIpc() {
       log("已启动安装包；外壳稍后退出，好让安装器替换正在运行的文件");
       // 外壳不退出的话，安装器替换不了正在运行的 exe。
       // 给安装器一点起来的时间再退（装完它会自己把新版本拉起来）。
-      setTimeout(() => { quitting = true; app.quit(); }, 1500);
+      setTimeout(() => quitApp("安装包（让安装器替换文件）"), 1500);
     }
     return r;
   });
@@ -2119,7 +2316,11 @@ function finishSmoke(code, note) {
       path.join(app.getPath("userData"), "smoke-result.json"),
       JSON.stringify({ code, ok: code === 0, note, time: Date.now() }));
   } catch { /* 忽略 */ }
-  if (kernelProc) K.killTree(kernelProc);
+  // ★ 冒烟收尾也要走同一套内核收尾 —— `app.exit()` 会**跳过 before-quit**，
+  //   所以这里必须自己调（否则冒烟跑完同样会留下一个没人关的内核）。
+  //   `adopted: false`：冒烟用**真实 userData**，会认领到用户此刻正在用的内核，
+  //   而自检**不该把正在用的客户端弄停**（托盘退出那条才允许关认领来的）。
+  shutdownKernels({ adopted: false });
   setTimeout(() => app.exit(code), 300);
 }
 
@@ -2167,6 +2368,7 @@ async function bootstrap() {
           failed: false, detail: "", percent: 0,
         });
         stopOwnedKernel();
+        await K.waitPortFree(settings.port || DEFAULT_PORT, 15000);
         await ensureServer({ reuse: false });
       }
     }
@@ -2237,11 +2439,13 @@ if (!gotLock) {
     quitting = true;
     if (healthTimer) clearInterval(healthTimer);
     if (retryTimer) clearInterval(retryTimer);
-    if (kernelProc && serverOwned) K.killTree(kernelProc);
-    // 自己起的那个内核已经被杀了 ⇒ 记录也必须删掉，
-    // 否则下次启动会拿一个死 pid 去复用（虽然有 isPidAlive 兜着，但留着是垃圾）
-    if (serverOwned) clearKernelRecord();
+    // ★ 内核收尾：本应用启动的 + **认领来的**，一起关（见 shutdownKernels）。
+    //   以前这里只关 `kernelProc && serverOwned` ⇒ 复用的内核永远关不掉，
+    //   用户看到的就"退不干净"（2026-09-23 报的 bug）。
+    shutdownKernels();
+    log("退出：收尾完成");
   });
   app.on("window-all-closed", () => { /* 驻留托盘 */ });
+  armQuitOnFileHook();
   app.whenReady().then(bootstrap);
 }

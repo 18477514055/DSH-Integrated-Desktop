@@ -27,7 +27,7 @@
  *    导致旧内核再也读不了（退路会被毁掉）。
  */
 
-const { spawn, spawnSync } = require("node:child_process");
+const { spawn, spawnSync, execFile } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -182,21 +182,122 @@ function isPortBusy(port) {
   return new RegExp(`[:.]${port}\\s+\\S+\\s+LISTENING`, "i").test(r.stdout);
 }
 
+/** 端口此刻由哪个 pid LISTENING。取不到返回 null。 */
+function portOwner(port) {
+  const r = spawnSync("netstat", ["-ano"], { encoding: "utf8", windowsHide: true });
+  if (!r.stdout) return null;
+  const m = String(r.stdout).match(new RegExp(`[:.]${port}\\s+\\S+\\s+LISTENING\\s+(\\d+)`, "i"));
+  return m ? Number(m[1]) : null;
+}
+
+/** 等端口放开。杀完一个内核不能立刻起新的 —— 端口没释放就会撞 EADDRINUSE。 */
+async function waitPortFree(port, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isPortBusy(port)) return true;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return !isPortBusy(port);
+}
+
+/**
+ * 读一个进程的 pid / 父 pid / 完整命令行（**异步**）。
+ *
+ * Windows 上没有便宜的 Node 原生办法（`wmic` 在新系统上已被移除，
+ * `tasklist /V` 不给命令行），所以走一次 WMI 查询 —— 而 PowerShell 冷启动要
+ * 几百毫秒，**绝不能同步做**：那会卡住主进程（UI 正在渲染的那一刻尤其明显）。
+ * ⇒ 用 `execFile` 异步拿结果；调用方（认领）本来也不需要等它。
+ *
+ * @returns {Promise<{pid:number, ppid:number, cmd:string}|null>}
+ */
+function processInfo(pid) {
+  return new Promise((resolve) => {
+    if (!pid) return resolve(null);
+    const ps = `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}" -ErrorAction SilentlyContinue; ` +
+      `if ($null -eq $p) { 'null' } else { $p | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress }`;
+    execFile("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps],
+      { windowsHide: true, timeout: 20000, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => {
+        const out = String(stdout || "").trim();
+        if (!out || out === "null") return resolve(null);
+        try {
+          const o = JSON.parse(out);
+          resolve({ pid: o.ProcessId, ppid: o.ParentProcessId, cmd: String(o.CommandLine || "") });
+        } catch { resolve(null); }
+      });
+  });
+}
+
+/**
+ * **这个 pid 是不是"本外壳自己拉起来的内核"？**
+ *
+ * 为什么要这么麻烦（2026-09-23，用户报「无法彻底退出 dsh」的现场）：
+ * 端口上有一个内核在跑，但外壳没有它的记录 ⇒ 走「裸 origin 复用」⇒
+ * `serverOwned = false` ⇒ 退出时谁都不关它。**它到底是我们的还是别人的，
+ * 决定我们有没有权力关它** ——
+ *   · 我们自己 spawn 的内核（含内核自身脱离式重启留下的孤儿）：命令行是
+ *     我们这个 exe + `--expose-internals` + `bin.js` + 同一个端口 ⇒ 可以关；
+ *   · 用户在终端里自己 `dsh web` 起的（命令行是 node.exe）⇒ **一个字都不许动**。
+ *
+ * 三条判据缺一不可。取不到命令行时返回 ok=false（**认不出就不认领**，
+ * 宁可少关一个，也绝不误关别人的内核）。
+ *
+ * @returns {{ok:boolean, why:string, info:object|null}} 用 await 取
+ */
+async function ourKernelProcess(pid, port) {
+  const info = await processInfo(pid);
+  if (!info) return { ok: false, why: "取不到它的命令行（WMI 查询没结果）", info: null };
+
+  const m = info.cmd.match(/^\s*"([^"]+)"/) || info.cmd.match(/^\s*(\S+)/);
+  const exe = m ? m[1] : "";
+  if (!exe) return { ok: false, why: "命令行里读不出可执行文件", info };
+
+  // ★⚠️ 判据**只用 ASCII 片段**，绝不拿完整路径去逐字节比 —— 实测踩过：
+  //   WMI 的 CommandLine 经 PowerShell 往返之后，路径里的中文段会被改掉
+  //   （本机控制台里 `5.DSH集成桌面端` 一直显示成乱码），
+  //   ⇒ `exe.toLowerCase() === process.execPath.toLowerCase()` **永远为假**，
+  //   于是"本应用自己的内核"一次都认领不到（第一版就是这么错的）。
+  //   改成比**文件名**（`electron.exe` / `DSH Integrated.exe` / `node.exe` 都是 ASCII），
+  //   足够把"我们的 exe"与"用户在终端里用 node 起的内核"分开。
+  const want = path.basename(String(process.execPath)).toLowerCase();
+  const got = path.basename(exe).toLowerCase();
+  if (!want || !got || !exe.toLowerCase().endsWith(want)) {
+    return { ok: false, why: `它的可执行文件不是本外壳（是 ${path.basename(exe) || "?"}）`, info };
+  }
+  if (!/--expose-internals/i.test(info.cmd)) {
+    return { ok: false, why: "命令行里没有 --expose-internals（不是按内核方式起的）", info };
+  }
+  if (!/lib[\\/]bin\.js/i.test(info.cmd)) {
+    return { ok: false, why: "命令行里没有 dsh 的 lib/bin.js（不是内核进程）", info };
+  }
+  if (!new RegExp(`--port\\s+${Number(port)}(\\s|$)`, "i").test(info.cmd)) {
+    return { ok: false, why: `命令行里的端口不是 ${port}`, info };
+  }
+  return { ok: true, why: "可执行文件与命令行都指向本外壳拉起来的内核", info };
+}
+
 /**
  * 启动内核。
  *
  * 返回 { child, url, logFile }；url 是**带 token 的完整地址**。
  * 调用方负责在失败时 killTree。
  */
-function spawnKernel({ kernel, dshHome, port, profile = "web", logDir, workspace }) {
-  fs.mkdirSync(logDir, { recursive: true });
+function spawnKernel({ kernel, dshHome, port, profile = "web", logDir, workspace, detached = false }) {
   fs.mkdirSync(dshHome, { recursive: true });
 
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const logFile = path.join(logDir, `kernel-${stamp}.log`);
-
-  const out = fs.openSync(logFile, "a");
-  const err = fs.openSync(logFile.replace(/\.log$/, ".err.log"), "a");
+  // ★ detached：后台化启动 —— 不写日志文件、丢弃 stdio，并且**脱离父进程的 job 对象**
+  //   （libuv 对 Windows 的 detached 会加 CREATE_BREAKAWAY_FROM_JOB + DETACHED_PROCESS
+  //   + CREATE_NEW_PROCESS_GROUP）⇒ 父进程死了它也不会被一起带走。
+  //   正常路径**不用它**（默认 false），只有验收脚本 `scripts/quit-check.js` 靠它
+  //   造出「孤儿内核」这个现场。为什么要造：见那个脚本的顶部说明。
+  let out = null, err = null, logFile = null;
+  if (!detached) {
+    fs.mkdirSync(logDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    logFile = path.join(logDir, `kernel-${stamp}.log`);
+    out = fs.openSync(logFile, "a");
+    err = fs.openSync(logFile.replace(/\.log$/, ".err.log"), "a");
+  }
 
   // ★ 参数语法（实测）：`web` 是别名子命令，与 `--profile` **互斥**
   //   ✅ dsh web --host ...          ✅ dsh --profile clean --host ...
@@ -218,8 +319,9 @@ function spawnKernel({ kernel, dshHome, port, profile = "web", logDir, workspace
       // 用 Electron 自带的 node 跑内核，不需要用户另装 node
       ELECTRON_RUN_AS_NODE: "1",
     },
-    stdio: ["ignore", out, err],
+    stdio: detached ? "ignore" : ["ignore", out, err],
     windowsHide: true,
+    detached,
   });
 
   return { child, logFile, out, err };
@@ -274,6 +376,10 @@ module.exports = {
   isProbeAlive,
   healthTargetUrl,
   isPortBusy,
+  portOwner,
+  waitPortFree,
+  processInfo,
+  ourKernelProcess,
   spawnKernel,
   killTree,
   waitForUrl,
