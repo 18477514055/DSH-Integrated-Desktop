@@ -55,7 +55,7 @@ const ROOT = path.join(__dirname, "..");
  *     联接都是**写死的绝对路径**，改目录名 = 当场弄坏这个插件（全局规矩）。
  *   合成一个常量就会出现"改包名把路径一起改掉、脚本再也找不到源码"这种静默故障。
  */
-const PLUGIN_NAME = "@zjh18477514055/dsh-int-mobile-remote";
+const PLUGIN_NAME = "dsh-int-mobile-remote";
 const PLUGIN_DIR_NAME = "dsh-mobile-remote";
 const PLUGIN_DIR = path.join(ROOT, "plugin", PLUGIN_DIR_NAME);
 const CDP_PORT = Number(process.env.DSH_MMR_CDP || 9346);
@@ -362,6 +362,55 @@ function rpc(token, method, params) {
         ], { encoding: "utf8", windowsHide: true });
         check(`宿主半边能被真实 import（exports.apply 是函数）：${rel}`, probe.status === 0,
           probe.status === 0 ? "import OK" : String(probe.stderr || "").trim().slice(0, 200));
+      }
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+     * Android 壳的"白屏"修复：**机械核对源码里的判据**（2026-09-23）
+     * ══════════════════════════════════════════════════════════════
+     * 用户原话：「连上同一个WIFI的时候，还是加载不出来，必须拿系统相机扫码才能进入软件，
+     *   不然依旧是白屏。」
+     *
+     * ★ 为什么用"读源码 + 正则"来验，而不是真机跑：
+     *   这个仓没有 Android 设备（见 README 的验证状态表），真机跑不了。
+     *   但这次 bug 的性质**恰好适合静态核对** —— 它是一个**纯逻辑判据写错了**
+     *   （用 String.equals 比"规范化前后形态不同"的两个 URL），
+     *   而修复也是"改成规范化后比较 + 补上 cur==null 这一支"。
+     *   所以这里做两件事，都是**可机械复核**的：
+     *     ① 断言源码里**不再**出现那个错误判据（`cur.equals(watchdogUrl)`）；
+     *     ② 断言新判据的**两个分支都在**（null 分支 + sameUrl 分支）。
+     *   ★ 诚实标注：这不等于"真机验过"。真机表现仍未验证（没有设备），
+     *     这里的断言只保证"改对了、没改回去"。
+     *   ★ 另有一条**行为**证据在脚本外：用真 Chromium 复现过规范化差异
+     *     （"http://ip:port" → location.href 变成带尾斜杠），见 commit 说明。 */
+    {
+      const shellRel = "android/app/src/main/java/com/dsh/mobileremote/MainActivity.java";
+      const shellAbs = path.join(PLUGIN_DIR, shellRel);
+      if (fs.existsSync(shellAbs)) {
+        const src = fs.readFileSync(shellAbs, "utf8");
+        check("Android 壳不再用 String.equals 比 URL（白屏真因：规范化后多了尾斜杠）",
+          !/cur\.equals\(watchdogUrl\)/.test(src),
+          /cur\.equals\(watchdogUrl\)/.test(src)
+            ? "仍然存在旧判据 cur.equals(watchdogUrl) —— 看门狗在冷启动时恒为假"
+            : "旧判据已清除");
+        check("看门狗补上了 cur==null 分支（死地址 TCP 挂起时 getUrl() 就是 null）",
+          /cur\s*==\s*null/.test(src) && /sameUrl\(cur,\s*watchdogUrl\)/.test(src),
+          "两个分支都要在：null（未提交）与 sameUrl（提交了没加载完）");
+        check("有 URL 规范化比较函数（忽略尾斜杠差异）",
+          /private boolean sameUrl\(/.test(src) && /stripTrailingSlash/.test(src),
+          "sameUrl + stripTrailingSlash");
+        check("有局域网自动找电脑（不再只能靠扫码）",
+          /private void autoDiscover\(/.test(src) && /probeDsHost\(/.test(src)
+            && /candidatesFor\(/.test(src),
+          "autoDiscover + probeDsHost + candidatesFor");
+        check("找电脑的判据是**页面标记**而不是「端口开着」（避免误认同网段其它服务）",
+          /dsh手机遥控/.test(src) && /pairView/.test(src),
+          "要求响应体里出现 dsh手机遥控 或 pairView");
+        check("token 能跨 origin 交接（换 IP 后不必重新配对）",
+          /saveToken/.test(src) && /getToken/.test(src) && /clearToken/.test(src),
+          "saveToken / getToken / clearToken 三个桥方法");
+      } else {
+        console.log("  SKIP  Android 壳静态核对（找不到 MainActivity.java）");
       }
     }
   }

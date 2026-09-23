@@ -57,7 +57,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: "@zjh18477514055/dsh-multi-session",
+  id: "dsh-int-multi-session",
   factory: (require) => {
     "use strict";
 
@@ -70,7 +70,7 @@ window.__ModuleLoader__.load({
     // ─────────────────────────────────────────────────────────────────────
     // 常量
     // ─────────────────────────────────────────────────────────────────────
-    const PLUGIN_ID = "dsh-multi-session";
+    const PLUGIN_ID = "dsh-int-multi-session";
     const CSS_ID = PLUGIN_ID + "/multi-session.css";
     const TRIGGER_SLOT = "conversation.input.right";
     const MODAL_SLOT = "shell.overlay";

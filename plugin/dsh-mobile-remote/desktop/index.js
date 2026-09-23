@@ -65,7 +65,7 @@ import qrcode from './qr.cjs';
 /** 插件名（Cordis bundle tree 中的 id）。
  *  ★ 必须与 package.json 的 name 一致 —— loader 拿它当模块标识符 import。
  *  2026-09-22 由 dsh-int-mobile-remote 改名而来：那个名字在 npm 上已被占用。 */
-export const name = '@zjh18477514055/dsh-int-mobile-remote';
+export const name = 'dsh-int-mobile-remote';
 
 /**
  * 运行参数。

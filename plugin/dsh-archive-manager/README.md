@@ -29,7 +29,7 @@
 ## 安装
 
 ```bash
-dsh plugin --profile web add @zjh18477514055/dsh-int-archive-manager
+dsh plugin --profile web add dsh-int-archive-manager
 ```
 
 装完**重启一次**客户端 / 内核生效。

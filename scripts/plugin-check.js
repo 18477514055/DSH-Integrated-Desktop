@@ -58,7 +58,7 @@ const { spawn, spawnSync } = require("node:child_process");
 
 const ROOT = path.join(__dirname, "..");
 const PLUGIN_DIR = path.join(ROOT, "plugin", "dsh-multi-session");
-const PLUGIN_NAME = "@zjh18477514055/dsh-multi-session";
+const PLUGIN_NAME = "dsh-int-multi-session";
 const CDP_PORT = Number(process.env.DSH_PLUGIN_CHECK_CDP || 9344);
 const FREE_PORT = Number(process.env.DSH_PLUGIN_CHECK_PORT || 3179);
 const KEEP = process.argv.includes("--keep");

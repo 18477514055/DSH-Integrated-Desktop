@@ -52,7 +52,7 @@ const val = (f, d) => { const i = argv.indexOf(f); return i >= 0 && argv[i + 1] 
  * 对所有插件是同一套逻辑。复制一份脚本只会让两处以后分叉
  * （项目 AGENTS.md 的规矩：装/验/退只走脚本，不手敲）。
  */
-const PLUGIN_NAME = val("--plugin", "@zjh18477514055/dsh-multi-session");
+const PLUGIN_NAME = val("--plugin", "dsh-int-multi-session");
 const REPO = path.join(__dirname, "..");
 const PLUGIN_SRC = path.join(REPO, "plugin", PLUGIN_NAME);
 

@@ -33,7 +33,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: '@zjh18477514055/dsh-int-mobile-remote',
+  id: 'dsh-int-mobile-remote',
   factory: (require) => {
     'use strict';
 
