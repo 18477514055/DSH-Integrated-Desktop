@@ -292,13 +292,56 @@ public class MainActivity extends Activity {
                 // 还停在原 URL 上才算超时（期间 onPageFinished 会 cancel）
                 if (webView == null || failPanel != null) return;
                 String cur = webView.getUrl();
-                if (cur != null && cur.equals(watchdogUrl)) {
+                /* ★ 两种都算超时（2026-09-23，两处缺一不可）：
+                 *   ① **cur 为空** —— 这是"死地址 TCP 挂起"的真实状态：
+                 *      连接还没提交，WebView 压根没有当前地址（`getUrl()` 返回 null）。
+                 *      只判 ② 的话，这种情况**永远不弹浮层** ⇒ 就是用户看到的白屏。
+                 *      （上一版只判相等，等于把最常见的那种失败漏掉了。）
+                 *   ② **cur 仍是目标地址** —— 提交了但没加载完（服务器半死不活）。
+                 *   若已经跳到别的地址（重定向），说明有东西加载了，不算超时。 */
+                if (cur == null || cur.isEmpty() || sameUrl(cur, watchdogUrl)) {
                     showFailPanel("连不上电脑（加载超时）",
                             "电脑可能换了 IP、关机了，或客户端没在运行。");
                 }
             }
         };
         webView.postDelayed(watchdog, 8000);
+    }
+
+    /**
+     * 比两个地址是不是"同一个"（★ 2026-09-23 修白屏的关键，见文件头"白屏第二因"）。
+     *
+     * ══════════════════════════════════════════════════════════════════
+     * 为什么不能直接用 String.equals（这就是"必须扫码才能进"的真因）
+     * ══════════════════════════════════════════════════════════════════
+     * `remember()` 存进去的是**没有尾斜杠**的 `http://ip:port`（见 remember 的拼接），
+     * 而 WebView 的 `getUrl()` 返回的是**规范化后**的 `http://ip:port/`。
+     * 实测（真 Chromium 复现，本机 2026-09-23）：
+     *     传入 "http://127.0.0.1:3110"  → location.href = "http://127.0.0.1:3110/"  equals? false
+     *     传入 "http://127.0.0.1:3110/" → location.href = "http://127.0.0.1:3110/"  equals? true
+     * ⇒ 旧写法 `cur.equals(watchdogUrl)` 在**冷启动加载记住的地址**时**恒为假**，
+     *   看门狗静默失效 ⇒ 死地址（TCP 挂 30~120 秒）期间**既不加载也不报错 = 白屏**。
+     *
+     * ★ 为什么"扫码那条路"没事、只有冷启动白屏（这条对上了用户的描述）：
+     *   扫码回来后拼的地址是 `"http://" + host + ":" + port + "/"` —— **带**尾斜杠，
+     *   恰好与 WebView 的规范化结果相等 ⇒ 看门狗生效。
+     *   而 `remember()` 存的那份**不带**斜杠 ⇒ 只有"冷启动走存档"这条路坏掉。
+     *   用户原话「必须拿系统相机扫码才能进入软件，不然依旧是白屏」正是这个形状。
+     *
+     * 现在按"规范化后再比"：忽略尾斜杠差异，其余仍要求完全一致
+     * （不放松成"前缀相同"—— 那会让跳转后的页面被误判成超时）。
+     */
+    private boolean sameUrl(String a, String b) {
+        if (a == null || b == null) return false;
+        if (a.equals(b)) return true;
+        return stripTrailingSlash(a).equals(stripTrailingSlash(b));
+    }
+
+    private String stripTrailingSlash(String s) {
+        if (s == null) return null;
+        int end = s.length();
+        while (end > 0 && s.charAt(end - 1) == '/') end--;
+        return s.substring(0, end);
     }
 
     private void cancelWatchdog() {
@@ -406,6 +449,37 @@ public class MainActivity extends Activity {
                         startActivityForResult(new Intent(MainActivity.this, ScanActivity.class), REQ_SCAN);
                     } catch (Exception ignored) { }
                 });
+            }
+
+            /**
+             * token 交接（2026-09-23）—— 解决"换了 IP 就得重新配对"。
+             *
+             * 网页在配对成功 / 每次启动恢复 token 后调 `dshNative.saveToken(t)`；
+             * 打开一个新 origin 时先调 `dshNative.getToken()` 取回。
+             * 为什么必须由壳来存：localStorage 按 origin 隔离，
+             * 而电脑换 IP 就换了 origin（见上面 token 那一节的说明）。
+             */
+            @android.webkit.JavascriptInterface
+            public void saveToken(final String t) {
+                if (t == null || t.length() < 16) return;
+                getPreferences(MODE_PRIVATE).edit().putString(KEY_TOKEN, t).apply();
+            }
+
+            @android.webkit.JavascriptInterface
+            public String getToken() {
+                return storedToken();
+            }
+
+            /** 网页点「断开连接」时调用 —— 把壳里那份 token 也清掉。 */
+            @android.webkit.JavascriptInterface
+            public void clearToken() {
+                getPreferences(MODE_PRIVATE).edit().remove(KEY_TOKEN).apply();
+            }
+
+            /** 自动找电脑（2026-09-23）：失败浮层上的按钮 / 网页也可以主动调。 */
+            @android.webkit.JavascriptInterface
+            public void findHost() {
+                runOnUiThread(() -> autoDiscover());
             }
 
             /**
@@ -525,12 +599,43 @@ public class MainActivity extends Activity {
     //   ② 重新配对 —— 回到配对页（那里有内嵌扫码 + 手输码），白屏的真正出口
     private FrameLayout failPanel;
 
+    /** 本次 App 生命周期是否已经自动找过一次电脑（见 showFailPanel 的说明）。 */
+    private boolean autoTried = false;
+
+    /**
+     * 这个失败是不是"连不上电脑"这一类（而不是"局域网里没找到"）。
+     * 只有前者才值得自动扫一遍网段 —— 后者是扫完的结果，再扫一遍毫无意义
+     * （会变成死循环：找不到 → 弹浮层 → 又自动扫 → 又找不到…）。
+     */
+    private boolean looksLikeConnectionFailure(String title) {
+        if (title == null) return false;
+        if (title.contains("没找到")) return false;      // 这是扫描的**结论**
+        if (title.contains("正在")) return false;        // 这是进行中的状态文案
+        return true;
+    }
+
     private void showFailPanel(String title, String hint) {
         if (failPanel != null) {
             // 已在显示：只刷新文案
             ((TextView) failPanel.getChildAt(0)).setText(title);
             ((TextView) failPanel.getChildAt(1)).setText(hint);
             return;
+        }
+        /* ★ 连不上就**自动**找一次（2026-09-23）—— 用户的原话是
+         *   「必须拿系统相机扫码才能进入软件，不然依旧是白屏」，
+         *   也就是说他不想动手。所以这里不再只给按钮，而是**先自动找一遍**：
+         *   找到了直接切过去（token 也跟着走，见 token 交接那一节）；
+         *   找不到才把按钮留给用户。
+         *   ★ 每次 App 生命周期只自动找一次（`autoTried`）—— 否则用户每点一次
+         *   「重试」都会触发一轮 254 个地址的扫描，费电且没必要。
+         *   ★ 扫描要 5~10 秒，所以**先把面板立起来**并写明"正在找"，
+         *   绝不能让用户对着白屏等（那正是这次要消灭的东西）。 */
+        boolean scanning = false;
+        if (!autoTried && looksLikeConnectionFailure(title)) {
+            autoTried = true;
+            scanning = true;
+            title = "正在局域网里找电脑…";
+            hint = "大约 5~10 秒。请确认电脑上的 DSH 客户端正在运行。";
         }
         FrameLayout box = new FrameLayout(this);
         box.setBackgroundColor(0xF5F6F8);
@@ -563,6 +668,22 @@ public class MainActivity extends Activity {
         col.addView(retry, new android.widget.LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
+        /* ★ 自动找电脑（2026-09-23）：放在「重试」下面、「重新配对」上面。
+         *   顺序是按"用户最可能想要什么"排的：
+         *   重试（可能只是电脑还没起来）→ 自动找（换了 IP，最常见）→ 重扫（兜底）。
+         *   把它放在重扫之前，正是为了让"换 IP"这个高频场景**不必再掏相机**。 */
+        android.widget.Button find = new android.widget.Button(this);
+        find.setText("自动找电脑（同一 Wi-Fi）");
+        find.setOnClickListener(v -> {
+            t1.setText("正在局域网里找电脑…");
+            t2.setText("大约 5~10 秒。请确认电脑上的 DSH 客户端正在运行。");
+            autoDiscover();
+        });
+        android.widget.LinearLayout.LayoutParams flp = new android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        flp.topMargin = pad / 3;
+        col.addView(find, flp);
+
         android.widget.Button repair = new android.widget.Button(this);
         repair.setText("重新配对（扫码 / 手输码）");
         repair.setOnClickListener(v -> {
@@ -581,6 +702,10 @@ public class MainActivity extends Activity {
         root.addView(box, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         failPanel = box;
+
+        /* 面板已经立起来了（用户看到的是"正在找"而不是白屏），现在才真正开扫。
+         * 顺序很重要：先立面板再开扫 ⇒ 扫描那 5~10 秒里屏幕上有字。 */
+        if (scanning) autoDiscover();
     }
 
     private void removeFailPanel() {
@@ -667,6 +792,193 @@ public class MainActivity extends Activity {
             String base = u.getScheme() + "://" + u.getHost() + (u.getPort() > 0 ? ":" + u.getPort() : "");
             getPreferences(MODE_PRIVATE).edit().putString(KEY_URL, base).apply();
         } catch (Exception ignored) { }
+    }
+
+    /* ══════════════════════════════════════════════════════════════════
+     * 局域网自动找电脑（2026-09-23，用户需求）
+     * ══════════════════════════════════════════════════════════════════
+     * 用户原话：「连上同一个WIFI的时候，还是加载不出来，必须拿系统相机扫码才能进入软件，
+     *   不然依旧是白屏。」
+     *
+     * 场景：手机和电脑都在同一个 Wi-Fi，但电脑的 IP 变了（DHCP 重新分配是常态）。
+     * App 里存的还是旧 IP ⇒ 连不上 ⇒ 白屏 ⇒ 只能重扫二维码。
+     * 这一节就是把这个"重扫"消掉：**失败时自动在局域网里找那台电脑**。
+     *
+     * ── 怎么找（不依赖任何第三方库、不加任何权限）──────────────────────
+     * ① 取手机自己的 IPv4 地址（`NetworkInterface`，零权限）；
+     * ② 按 /24 推出同网段的所有候选（192.168.1.x ⇒ .1 ~ .254）；
+     * ③ 并发探测 `http://<ip>:<port>/`（连接 400ms / 读 600ms，都很短）；
+     * ④ 判定"是它"的依据不是"能连上"，而是**页面里带着我们的标记**
+     *    （`dsh手机遥控`）—— 否则同一网段里任何一个 80/3110 端口的服务器
+     *    都会被误认成电脑。
+     *
+     * ── 为什么敢把 token 交给"找到的那台"（安全边界，诚实说）──────────
+     * 见 `getToken()` 的注释：这个插件的 token 本来就在**明文 HTTP** 上传输
+     * （本插件没有 TLS），同一 Wi-Fi 下能嗅探的人早就拿得到；
+     * 而"找到"这一步要求对方返回**本插件页面的标记**。两者相加，
+     * 把它存进 App 私有目录并不比现状更危险，但确实**不再按 origin 隔离**了。
+     */
+
+    /** 正在找（防止重复触发）。 */
+    private volatile boolean discovering = false;
+
+    /**
+     * 从存档地址里取端口（取不到就用插件默认的 3110）。
+     * 端口几乎不会变，所以自动找电脑时沿用它。
+     */
+    private int savedPort() {
+        String last = getPreferences(MODE_PRIVATE).getString(KEY_URL, null);
+        if (last != null) {
+            try {
+                int p = Uri.parse(last).getPort();
+                if (p > 0) return p;
+            } catch (Exception ignored) { }
+        }
+        return 3110;
+    }
+
+    /** 取本机所有非回环 IPv4（含前缀长度，用来推同网段）。 */
+    private java.util.List<String[]> localIpv4() {
+        java.util.List<String[]> out = new java.util.ArrayList<>();
+        try {
+            for (java.net.NetworkInterface nif : java.util.Collections.list(
+                    java.net.NetworkInterface.getNetworkInterfaces())) {
+                if (!nif.isUp() || nif.isLoopback()) continue;
+                for (java.net.InterfaceAddress ia : nif.getInterfaceAddresses()) {
+                    java.net.InetAddress a = ia.getAddress();
+                    if (a instanceof java.net.Inet4Address) {
+                        out.add(new String[]{ a.getHostAddress(), String.valueOf(ia.getNetworkPrefixLength()) });
+                    }
+                }
+            }
+        } catch (Exception ignored) { }
+        return out;
+    }
+
+    /** 由 ip + 前缀长度算出该网段内的全部候选地址（最多 1024 个，防呆）。 */
+    private java.util.List<String> candidatesFor(String ip, int prefix) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try {
+            byte[] raw = java.net.InetAddress.getByName(ip).getAddress();
+            int ipInt = ((raw[0] & 0xFF) << 24) | ((raw[1] & 0xFF) << 16)
+                    | ((raw[2] & 0xFF) << 8) | (raw[3] & 0xFF);
+            // 只扫 /24 及更小的网段；比 /24 大的（如 /16）太广，扫完要好几分钟
+            if (prefix < 24) prefix = 24;
+            int mask = prefix == 0 ? 0 : (0xFFFFFFFF << (32 - prefix));
+            int net = ipInt & mask;
+            int count = 1 << (32 - prefix);
+            if (count > 1024) count = 1024;
+            for (int i = 1; i < count - 1; i++) {          // 跳过网络号与广播地址
+                int cur = net + i;
+                out.add(((cur >>> 24) & 0xFF) + "." + ((cur >>> 16) & 0xFF) + "."
+                        + ((cur >>> 8) & 0xFF) + "." + (cur & 0xFF));
+            }
+        } catch (Exception ignored) { }
+        return out;
+    }
+
+    /**
+     * 探测一个地址上是不是**我们这台电脑**。
+     * 判据是页面内容里的标记，不是"端口开着" —— 见本节开头第 ④ 条。
+     */
+    private boolean probeDsHost(String ip, int port) {
+        java.net.HttpURLConnection c = null;
+        try {
+            java.net.URL u = new java.net.URL("http://" + ip + ":" + port + "/");
+            c = (java.net.HttpURLConnection) u.openConnection();
+            c.setConnectTimeout(400);
+            c.setReadTimeout(700);
+            c.setRequestMethod("GET");
+            c.setInstanceFollowRedirects(false);
+            if (c.getResponseCode() != 200) return false;
+            java.io.InputStream in = c.getInputStream();
+            byte[] buf = new byte[4096];
+            int n = in.read(buf);
+            if (n <= 0) return false;
+            String head = new String(buf, 0, n, "UTF-8");
+            // 页面标题或配对视图的 id —— 两者任一即可确认"这是本插件的手机页"
+            return head.contains("dsh手机遥控") || head.contains("pairView");
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (c != null) { try { c.disconnect(); } catch (Exception ignored) { } }
+        }
+    }
+
+    /**
+     * 后台扫描局域网，找到电脑就切过去。
+     * 全程不阻塞 UI；找到/找不到都回到 UI 线程改界面。
+     */
+    private void autoDiscover() {
+        if (discovering) return;
+        discovering = true;
+
+        final int port = savedPort();
+        final java.util.List<String> targets = new java.util.ArrayList<>();
+        for (String[] pair : localIpv4()) {
+            int prefix;
+            try { prefix = Integer.parseInt(pair[1]); } catch (Exception e) { prefix = 24; }
+            targets.addAll(candidatesFor(pair[0], prefix));
+        }
+        // 去重（手机同时有 Wi-Fi 与热点的网段时可能重复）
+        java.util.LinkedHashSet<String> uniq = new java.util.LinkedHashSet<>(targets);
+        final java.util.List<String> list = new java.util.ArrayList<>(uniq);
+
+        new Thread(() -> {
+            String found = null;
+            try {
+                // 32 并发：254 个地址约 8 轮 × 0.7s ≈ 6 秒扫完
+                java.util.concurrent.ExecutorService pool =
+                        java.util.concurrent.Executors.newFixedThreadPool(32);
+                java.util.List<java.util.concurrent.Future<String>> futures = new java.util.ArrayList<>();
+                for (String ip : list) {
+                    futures.add(pool.submit(() -> probeDsHost(ip, port) ? ip : null));
+                }
+                pool.shutdown();
+                for (java.util.concurrent.Future<String> f : futures) {
+                    try {
+                        String r = f.get();
+                        if (r != null) { found = r; break; }
+                    } catch (Exception ignored) { }
+                }
+                pool.shutdownNow();
+            } catch (Exception ignored) { }
+
+            final String hit = found;
+            runOnUiThread(() -> {
+                discovering = false;
+                if (hit != null) {
+                    String url = "http://" + hit + ":" + port + "/";
+                    Toast.makeText(this, "找到电脑了：" + hit, Toast.LENGTH_SHORT).show();
+                    loadUrl(url);
+                } else {
+                    // 找不到就把浮层文案改成"确实找不到"，并保留手动出口
+                    showFailPanel("局域网里没找到电脑",
+                            "确认电脑上的 DSH 客户端正在运行、且和手机在同一个 Wi-Fi。\n"
+                          + "也可以直接扫码 / 手输地址。");
+                }
+            });
+        }, "ds-lan-scan").start();
+    }
+
+    /* ── token 跨地址携带（2026-09-23）─────────────────────────────────
+     * 为什么需要：token 存在网页的 `localStorage` 里，而 **localStorage 按 origin 隔离** ——
+     * `http://192.168.1.5:3110` 与 `http://192.168.1.6:3110` 是**两个不同的 origin**。
+     * 所以就算自动找到了电脑的新 IP，页面在新 origin 上也读不到旧 token，
+     * 用户还是得重新配对一次。
+     * 修法：让网页把 token 交给壳保存（App 私有 SharedPreferences，**不按 origin 隔离**），
+     * 新地址加载时再由网页主动取回。
+     *
+     * ★ 安全边界（诚实说，别夸大）：这确实让 token **不再按 origin 隔离**。
+     *   但要看清现状：本插件**没有 TLS**，token 本来就在局域网里明文传输，
+     *   同一 Wi-Fi 下能嗅探的人早就拿得到；而"自动找到"那一步还要求对方
+     *   返回本插件页面的标记。两者相加，这里并没有把风险从"低"变成"高"。
+     *   仍然做的收敛：只存在 App 私有目录、卸载即消失、网页「断开」时一并清掉。 */
+
+    private static final String KEY_TOKEN = "device_token";
+
+    private String storedToken() {
+        return getPreferences(MODE_PRIVATE).getString(KEY_TOKEN, "");
     }
 
     @Override

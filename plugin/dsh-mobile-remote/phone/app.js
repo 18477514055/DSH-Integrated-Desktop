@@ -230,7 +230,7 @@
       return r.json().then(function (j) {
         if (!r.ok || !j.token) throw new Error(j.message || '配对失败');
         token = j.token;
-        try { localStorage.setItem(TOKEN_KEY, token); } catch (e) { }
+        rememberToken(token);   // ★ 本地 + 壳里各存一份（壳那份跨 origin 有效）
         setMsg(pairMsg, '');
         openStream();
         loadAll();
@@ -1937,6 +1937,23 @@
       try { window.dshNative.startScan(); } catch (e) { setMsg(pairMsg, '扫码不可用', 'bad'); }
     };
     pairForm.parentNode.insertBefore(scanBtn, pairForm.nextSibling);
+
+    /* ★「自动找电脑」（2026-09-23）：与扫码并列的第二个出口。
+     *   用户原话是「连上同一个WIFI的时候，还是加载不出来，必须拿系统相机扫码才能进入软件」——
+     *   也就是说"扫码"是他唯一走得通的路。但换 IP 这个场景其实**不需要**扫码：
+     *   电脑就在同一个 Wi-Fi 里，扫一遍网段就能找到（见壳里的 autoDiscover）。
+     *   这个按钮让配对页上也有这条路，而且**找到之后 token 会自动跟过去**
+     *   （壳里存了一份，见 token 交接那一节）⇒ 连配对码都不用。 */
+    if (window.dshNative.findHost) {
+      var findBtn = el('button', 'btn', '自动找电脑（同一 Wi-Fi）');
+      findBtn.type = 'button';
+      findBtn.style.marginTop = '8px';
+      findBtn.onclick = function () {
+        setMsg(pairMsg, '正在局域网里找电脑…大约 5~10 秒');
+        try { window.dshNative.findHost(); } catch (e) { setMsg(pairMsg, '找不了', 'bad'); }
+      };
+      pairForm.parentNode.insertBefore(findBtn, scanBtn.nextSibling);
+    }
   }
 
   $('refreshBtn').onclick = function () { loadAll(); };
@@ -1961,8 +1978,42 @@
     loadList();
   };
 
-  function logout() {
+  /* ── token 跨地址交接（2026-09-23）─────────────────────────
+   * 用户原话：「连上同一个WIFI的时候，还是加载不出来，必须拿系统相机扫码才能进入软件，
+   *   不然依旧是白屏。」
+   *
+   * 场景：电脑的 IP 变了（DHCP 重新分配是常态）。App 现在能自动在局域网里找到电脑
+   * （见壳里的 autoDiscover），但**找到也没用** ——
+   * token 存在 `localStorage` 里，而 **localStorage 按 origin 隔离**：
+   * `http://192.168.1.5:3110` 与 `http://192.168.1.6:3110` 是两个不同的 origin
+   * ⇒ 新地址上读不到旧 token ⇒ 还是得重新配对。
+   *
+   * 修法：让壳（App 私有 SharedPreferences，**不按 origin 隔离**）替我们保管一份。
+   *   · 配对成功 / 从 localStorage 恢复后 ⇒ 调 saveToken 交一份给壳；
+   *   · 打开新地址时 ⇒ 先看本地，没有就问壳要；
+   *   · 用户点「断开」⇒ 两边一起清掉。
+   * 浏览器里没有 dshNative，这一整块自动退化成"只用 localStorage"（行为不变）。 */
+  function nativeToken() {
+    try {
+      if (window.dshNative && window.dshNative.getToken) {
+        var t = window.dshNative.getToken();
+        return (t && t.length > 16) ? t : '';
+      }
+    } catch (e) { }
+    return '';
+  }
+  function rememberToken(t) {
+    if (!t) return;
+    try { localStorage.setItem(TOKEN_KEY, t); } catch (e) { }
+    try { if (window.dshNative && window.dshNative.saveToken) window.dshNative.saveToken(t); } catch (e) { }
+  }
+  function forgetToken() {
     try { localStorage.removeItem(TOKEN_KEY); } catch (e) { }
+    try { if (window.dshNative && window.dshNative.clearToken) window.dshNative.clearToken(); } catch (e) { }
+  }
+
+  function logout() {
+    forgetToken();
     if (es) { try { es.close(); } catch (e) { } es = null; }
     token = null; current = null; sessions = [];
     setMsg(pairMsg, '已断开，请重新扫码');
@@ -1980,6 +2031,13 @@
     pair(codeInput.value);
   } else {
     try { token = localStorage.getItem(TOKEN_KEY); } catch (e) { }
+    /* ★ 本地没有就问**壳**要（2026-09-23）：电脑换 IP ⇒ 换了 origin ⇒
+     *   localStorage 里那份在新地址上读不到，但壳里那份还在。
+     *   这一步就是"自动找到电脑之后不用重新配对"的关键。 */
+    if (!token) {
+      var nt = nativeToken();
+      if (nt) { token = nt; rememberToken(nt); }
+    }
     if (token) {
       openStream(); loadAll(); probeCapabilities(); show(listView);
     }

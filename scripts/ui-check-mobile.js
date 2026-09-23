@@ -695,28 +695,56 @@ app.whenReady().then(() => {
           active: pills.filter(p => p.classList.contains('on')).map(p => p.textContent.trim()),
           before,
         };
-        // 真点一个**非当前**的工作区胶囊
-        const other = pills.find(p => !p.classList.contains('on'));
-        if (!other) return JSON.stringify(Object.assign(info, { switched: false }));
-        other.click();
-        await new Promise(r => setTimeout(r, 2800));
-        const b3 = document.getElementById('sheetBody');
+        /* ★ 要真点一个**落点确实不同**的工作区胶囊（2026-09-23 修尺子）。
+         *
+         * 旧写法是"找第一个非当前胶囊点一下，断言落点变了"。
+         * 但**当前会话自己就住在某个工作区里** —— 实测那个会话的 cwd 是
+         * D:\DSH工作区002，而列表里恰好也有一颗「DSH工作区002」胶囊
+         * ⇒ 点它之后落点**本来就该不变**（它俩是同一个目录），
+         * 于是报了一个**假 FAIL**：D:\DSH工作区002 → D:\DSH工作区002。
+         * 这不是功能坏了，是**判据把"正确地没变"当成了"坏掉"**。
+         *
+         * 现在改成：依次试每一颗非当前胶囊，直到**落点真的变了**为止。
+         * 判据仍然是"切换生效"（本次改动的效果），但不再假设
+         * "第一颗非当前胶囊一定指向另一个目录"。
+         * ⚠️ 注意本段在**模板字符串里**，注释中不许出现反引号（会提前闭合）。 */
+        const candidates = pills.filter(p => !p.classList.contains('on'));
+        const tried = [];
+        let after = before, otherLabel = null;
+        for (const c of candidates) {
+          otherLabel = c.textContent.trim();
+          c.click();
+          await new Promise(r => setTimeout(r, 2600));
+          const b3 = document.getElementById('sheetBody');
+          const now = (b3.querySelector('.xfer-path')||{}).textContent || '';
+          tried.push(otherLabel + '→' + now);
+          if (now && now !== before) { after = now; break; }
+        }
+        const b4 = document.getElementById('sheetBody');
         return JSON.stringify(Object.assign(info, {
-          switched: true,
-          otherLabel: other.textContent.trim(),
-          after: (b3.querySelector('.xfer-path')||{}).textContent || '',
-          note: (b3.querySelector('.xfer-note')||{}).textContent || '',
+          switched: candidates.length > 0,
+          otherLabel,
+          tried,
+          after,
+          note: (b4.querySelector('.xfer-note')||{}).textContent || '',
         }));
       })()`, 40000);
       const WS = JSON.parse(wsRaw);
       console.log(`\n── ③g 跨工作区切换 ──`);
       console.log(`     ${WS.pillCount} 颗胶囊：${(WS.labels || []).join(" / ")}　当前=${(WS.active || []).join(",")}`);
       console.log(`     点「${WS.otherLabel || "-"}」：${WS.before || "(空)"} → ${WS.after || "(空)"}`);
+      if (WS.tried && WS.tried.length > 1) {
+        console.log(`     （试过的落点：${WS.tried.join("；")}）`);
+      }
       check("上传抽屉里有工作区切换条（多个工作区时）",
         (WS.pillCount || 0) >= 2, `${WS.pillCount} 颗：${(WS.labels || []).join("、")}`);
-      check("点别的工作区胶囊，落点**真的换了**（不是只有高亮变）",
+      /* 判据：**至少有一颗胶囊能把落点换到别处**。
+       * 注意不能要求"每一颗都变" —— 当前会话自己所在的那个工作区
+       * 在列表里也有一颗胶囊，点它落点本来就该不变（那是正确行为）。 */
+      check("点工作区胶囊能把落点换到别的工作区（不是只有高亮变）",
         WS.switched === true && !!WS.after && WS.after !== WS.before,
-        `${WS.before || "(空)"} → ${WS.after || "(空)"}`);
+        `${WS.before || "(空)"} → ${WS.after || "(空)"}`
+        + (WS.tried ? `；试过 ${WS.tried.length} 颗` : ''));
     }
     // 关掉抽屉
     await cdpEval(ws, `(() => { const s = document.getElementById('sheet'); if (s) s.classList.add('hidden'); return 1; })()`);

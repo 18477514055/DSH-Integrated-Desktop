@@ -388,23 +388,34 @@ function rpc(token, method, params) {
       const shellAbs = path.join(PLUGIN_DIR, shellRel);
       if (fs.existsSync(shellAbs)) {
         const src = fs.readFileSync(shellAbs, "utf8");
+        /* ★ 先剥掉注释再判（2026-09-23 实测踩到）：
+         *   第一版直接在**全文**上找 `cur.equals(watchdogUrl)`，结果**我自己写的
+         *   解释性注释里就有这串字符**（"⇒ 旧写法 `cur.equals(watchdogUrl)` 恒为假"）
+         *   ⇒ 报了一个**假 FAIL**，而代码其实早就修好了。
+         *   教训：**静态断言的尺子要量"代码"，不能量"代码 + 注释"** ——
+         *   注释里引用的旧写法是文档，不是缺陷。
+         *   这里做最朴素的剥离：去掉 `//…` 行注释与 `/* … *\/` 块注释。
+         *   （不追求完整词法分析 —— 目标是"别把注释当代码"，够用且可读。） */
+        const code = src
+          .replace(/\/\*[\s\S]*?\*\//g, '')     // 块注释
+          .replace(/^\s*\/\/.*$/gm, '');        // 行注释
         check("Android 壳不再用 String.equals 比 URL（白屏真因：规范化后多了尾斜杠）",
-          !/cur\.equals\(watchdogUrl\)/.test(src),
-          /cur\.equals\(watchdogUrl\)/.test(src)
+          !/cur\.equals\(watchdogUrl\)/.test(code),
+          /cur\.equals\(watchdogUrl\)/.test(code)
             ? "仍然存在旧判据 cur.equals(watchdogUrl) —— 看门狗在冷启动时恒为假"
-            : "旧判据已清除");
+            : "旧判据已清除（注释里引用它不算）");
         check("看门狗补上了 cur==null 分支（死地址 TCP 挂起时 getUrl() 就是 null）",
-          /cur\s*==\s*null/.test(src) && /sameUrl\(cur,\s*watchdogUrl\)/.test(src),
+          /cur\s*==\s*null/.test(code) && /sameUrl\(cur,\s*watchdogUrl\)/.test(code),
           "两个分支都要在：null（未提交）与 sameUrl（提交了没加载完）");
         check("有 URL 规范化比较函数（忽略尾斜杠差异）",
-          /private boolean sameUrl\(/.test(src) && /stripTrailingSlash/.test(src),
+          /private boolean sameUrl\(/.test(code) && /stripTrailingSlash/.test(code),
           "sameUrl + stripTrailingSlash");
         check("有局域网自动找电脑（不再只能靠扫码）",
-          /private void autoDiscover\(/.test(src) && /probeDsHost\(/.test(src)
-            && /candidatesFor\(/.test(src),
+          /private void autoDiscover\(/.test(code) && /probeDsHost\(/.test(code)
+            && /candidatesFor\(/.test(code),
           "autoDiscover + probeDsHost + candidatesFor");
         check("找电脑的判据是**页面标记**而不是「端口开着」（避免误认同网段其它服务）",
-          /dsh手机遥控/.test(src) && /pairView/.test(src),
+          /dsh手机遥控/.test(code) && /pairView/.test(code),
           "要求响应体里出现 dsh手机遥控 或 pairView");
         check("token 能跨 origin 交接（换 IP 后不必重新配对）",
           /saveToken/.test(src) && /getToken/.test(src) && /clearToken/.test(src),
@@ -482,22 +493,45 @@ function rpc(token, method, params) {
     // ── ②+ 点开弹窗，看二维码是不是真的画出来了 ──
     console.log("\n── ②+ 交互：点开弹窗 → 二维码与配对码 ──");
     await cdpEval(ws, `document.querySelector('.mmr-fab').click(), true`);
-    await sleep(1200);
-    const panelRaw = await cdpEval(ws, `(() => {
-      const p = document.querySelector('.mmr-panel');
-      const svg = document.querySelector('.mmr-qr svg');
-      const code = document.querySelector('.mmr-code');
-      return JSON.stringify({
-        panel: !!p,
-        svg: !!svg,
-        svgRects: svg ? svg.querySelectorAll('path,rect').length : 0,
-        code: code ? code.textContent : null
-      });
-    })()`);
-    const panel = JSON.parse(panelRaw);
-    check("弹窗渲染出来了（.mmr-panel）", panel.panel === true, panelRaw);
-    check("弹窗里有二维码 SVG", panel.svg === true && panel.svgRects > 0, `图形节点 ${panel.svgRects} 个`);
-    check("弹窗里显示了 8 位配对码", typeof panel.code === 'string' && panel.code.length === 8, `「${panel.code}」`);
+
+    /* ★ 轮询等"内容真的渲染出来"，**不要睡固定时长**（2026-09-23 实测）。
+     *
+     * 旧写法是 `await sleep(1200)` 再读一次。而弹窗是**两段式**渲染的：
+     *   ① 组件挂载（立刻就有 .mmr-panel，但 state=null）
+     *   ② `fetchState()` 拿到 /state 之后才画出二维码与配对码
+     * ⇒ 固定睡 1200ms 是在赌"② 一定在 1.2 秒内完成"，而这个往返要经过
+     *   内核 HTTP + QR 生成（两份 SVG，实测 /state 响应 32 KB）。
+     * 实测证据（同一份代码、连跑两次）：
+     *     第 1 次：FAIL 图形节点 0 个 / 配对码「null」
+     *     第 2 次：PASS 图形节点 2 个 / 配对码「9E3AQ9DF」
+     * ⇒ **典型 flaky 尺子**。本项目的纪律：flaky 的判据比没有判据更糟
+     *   （它会让人不再相信 FAIL）。
+     * 现在改成轮询到"出现了就继续"，超时才判 FAIL，并把当时的真实 DOM 打出来。 */
+    let panel = null;
+    const panelDeadline = Date.now() + 20000;
+    while (Date.now() < panelDeadline) {
+      const raw = await cdpEval(ws, `(() => {
+        const p = document.querySelector('.mmr-panel');
+        const svg = document.querySelector('.mmr-qr svg');
+        const code = document.querySelector('.mmr-code');
+        const errEl = document.querySelector('.mmr-err');
+        return JSON.stringify({
+          panel: !!p,
+          svg: !!svg,
+          svgRects: svg ? svg.querySelectorAll('path,rect').length : 0,
+          code: code ? code.textContent : null,
+          err: errEl ? errEl.textContent : null,
+        });
+      })()`);
+      panel = JSON.parse(raw);
+      if (panel.svg && panel.code) break;     // 两样都出来了才算渲染完
+      await sleep(400);
+    }
+    check("弹窗渲染出来了（.mmr-panel）", panel.panel === true, JSON.stringify(panel));
+    check("弹窗里有二维码 SVG", panel.svg === true && panel.svgRects > 0,
+      `图形节点 ${panel.svgRects} 个${panel.err ? '（页面报错：' + panel.err + '）' : ''}`);
+    check("弹窗里显示了 8 位配对码", typeof panel.code === 'string' && panel.code.length === 8,
+      `「${panel.code}」${panel.err ? '（页面报错：' + panel.err + '）' : ''}`);
     // 关掉弹窗，避免挡住后面的断言
     await cdpEval(ws, `(document.querySelector('.mmr-x')||{click(){}}).click(), true`);
     await sleep(300);
