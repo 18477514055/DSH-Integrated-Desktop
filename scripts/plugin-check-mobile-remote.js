@@ -719,6 +719,102 @@ function rpc(token, method, params) {
         cmds.status === 200 && cmdItems.length > 0,
         `${cmdItems.length} 条：${cmdItems.slice(0, 5).map((c) => "/" + c.name).join(" ")}`);
 
+      /* ══════════════════════════════════════════════════════════════
+       * 斜杠命令要**真的走命令通道**（2026-09-24 用户报的 bug）
+       * ══════════════════════════════════════════════════════════════
+       * 用户原话：「我这个指令是在手机上发给你的，他作为文本发出去了，你看能不能修一下。」
+       * （他在手机上打 `/compact`，那句话被当成普通消息发给了模型 —— 压缩没发生。）
+       *
+       * 真因：`sessionController.prompt()` 只做提示词准入，**没有斜杠命令解析**
+       *   ⇒ `/compact` 原样进了模型上下文。
+       * 修法：宿主先拿它去问 `ctx.commands.execute(agent, line, [], signal)`
+       *   （源码注释原话："execute a known command **without sending it to the model**"），
+       *   返回 undefined 才当普通提示词发。
+       *
+       * ★ 这里用 `/permission` 而不是 `/compact` 来验：
+       *   `/compact` 会**真的压缩这个临时会话**（有副作用且慢），
+       *   而 `/permission` 只读地报当前档位 —— 验的是同一条通路，代价小得多。 */
+      const cmdRun = await rpc(token, "session.prompt", { sessionId: sid, text: "/permission" });
+      const cr = cmdRun.json && cmdRun.json.result;
+      check("斜杠命令走的是命令通道（不是当文本发给模型）",
+        cmdRun.status === 200 && cr && cr.command === true && cr.accepted === true,
+        cr ? `command=${cr.command} kind=${cr.kind} text=${String(cr.text || "").slice(0, 60)}` : JSON.stringify(cmdRun.json));
+
+      /* 反向：**普通文本**不能被命令通道吞掉（否则用户发的话会凭空消失）。 */
+      const plainRun = await rpc(token, "session.prompt", { sessionId: sid, text: "这是一句普通消息" });
+      const pr = plainRun.json && plainRun.json.result;
+      check("普通文本仍然当消息发（没被命令通道吞掉）",
+        plainRun.status === 200 && pr && pr.accepted === true && !pr.command,
+        pr ? `accepted=${pr.accepted} command=${pr.command}` : JSON.stringify(plainRun.json));
+
+      /* 再反向一条：**长得像命令但内核不认**的（`/usr/local/bin` 这类路径）
+       * 必须落到普通消息，而不是报错或静默吞掉。
+       * 这验的是"判据用内核返回的 undefined，而不是我自己猜的正则"。 */
+      const fakeCmd = await rpc(token, "session.prompt", { sessionId: sid, text: "/nosuchcmd123" });
+      const fr = fakeCmd.json && fakeCmd.json.result;
+      check("不存在的 /命令 落到普通消息（不报错、不吞掉）",
+        fakeCmd.status === 200 && fr && fr.accepted === true && !fr.command,
+        fr ? `accepted=${fr.accepted} command=${fr.command}` : JSON.stringify(fakeCmd.json));
+
+      /* ══════════════════════════════════════════════════════════════
+       * 排队消息 / 插话（steer）（2026-09-24 用户需求）
+       * ══════════════════════════════════════════════════════════════
+       * 用户原话：「在你思考的过程中，我发一条指令给你……如果这个时候我再点一下这条待发出去的
+       *   信息，他就会直接插入你的对话和思考让你直接收到这条指令，这条在手机上没有体现。」
+       *
+       * ★ 这里只验**只读**的那一半（queue.list 的形状与字段）。
+       *   为什么不在这个脚本里真跑 steer：steer 要求 `agent.status==='running'`
+       *   且那条消息落在 `next-turn` 里（内核源码 844 行），
+       *   而这需要"让 Agent 真的在跑 + 在跑的瞬间把消息塞进队列"——
+       *   在这个夹具里做等于引入时序竞态，会变成 flaky 判据。
+       *   ⇒ 真跑那条留给手机端界面验收，这里先保证**契约没写错**。 */
+      const q = await rpc(token, "queue.list", { sessionId: sid });
+      const qr = q.json && q.json.result;
+      check("能读排队消息（官方 inbox 投影，字段形状正确）",
+        q.status === 200 && qr && Array.isArray(qr.items) && typeof qr.running === "boolean",
+        qr ? `items=${qr.items.length} running=${qr.running}` : JSON.stringify(q.json));
+      check("排队条目带 id/placement/text/canSteer（手机端靠这四项渲染）",
+        !!qr && qr.items.every((it) => typeof it.id === "string" && typeof it.placement === "string"
+          && typeof it.text === "string" && typeof it.canSteer === "boolean"),
+        qr && qr.items.length ? JSON.stringify(qr.items[0]) : "(队列为空 —— 没在跑的时候本来就该是空的)");
+      // 负向：action 只认 steer/remove
+      const badAct = await rpc(token, "queue.update", { sessionId: sid, itemId: "nope", action: "explode" });
+      check("非法的队列动作被拒（只认 steer / remove）",
+        badAct.status === 500 && /steer|remove/.test(String(badAct.json && badAct.json.message)),
+        badAct.json && badAct.json.message);
+      // 负向：操作一条不存在的排队项 ⇒ 明确报"不在了"，不是静默成功
+      const ghost = await rpc(token, "queue.update", { sessionId: sid, itemId: "no-such-item", action: "remove" });
+      check("操作不存在的排队项被明确拒绝（不静默成功）",
+        ghost.status === 500, ghost.json && ghost.json.message);
+
+      /* ── 真跑一次 steer（插话）──────────────────────────────────
+       * ★ 这是用户那句话的**直接证据**：
+       *   「我再点一下这条待发出去的信息，他就会直接插入你的对话和思考让你直接收到这条指令」。
+       *
+       * 做法：先发一条**会排队**的消息（此刻 Agent 正在跑 ⇒ 它进 next-turn），
+       * 然后对那条队列项调 `{kind:'steer'}`，断言：
+       *   ① 调用成功（没有 steer-unavailable）；
+       *   ② 它**从 next-turn 队列里消失**（被移出去插进当前轮了）。
+       * ② 是关键：光看"调用返回 ok"不够 —— 官方实现是
+       * `agent.inbox.remove(itemId)` **然后** `agent.steer(message)`
+       * （内核源码 859-860 行），所以"队列里没了"正是"插进去了"的可观测证据。
+       *
+       * ★ 前置条件（内核源码 844 行）：`agent.status === 'running'`。
+       *   ★★ 这一步**在这个脚本里做不到，已实测确认**（2026-09-24）：
+       *   我试过"主动发提示词把它跑起来 + 轮询 20 秒等 running"，
+       *   结果**永远等不到** —— 因为 `buildTempHome()` 刻意**不复制凭据**
+       *   （`settings.yaml` / `.credentials.yaml` 一个都不带，见那个函数的说明），
+       *   临时环境里**没有任何可用模型** ⇒ Agent 永远进不了 running。
+       *   这不是"没验"，而是"这个夹具里验不了"：
+       *   **真跑 steer 放在 `ui-check-mobile.js` 的 ③h 段** ——
+       *   那里连的是**用户真实运行的 3110**，有真凭据、能真跑。
+       *   这里只验**契约**（上面那三条只读断言），并如实说明为什么不在这里跑。 */
+      {
+        console.log("  SKIP  真跑插话（steer）—— 本夹具无凭据、Agent 进不了 running；"
+          + "真跑在 ui-check-mobile 的 ③h 段（对真实实例）");
+      }
+
+
       // 文件浏览：**逐层**浏览是这套设计的关键，所以既验根目录、也验进子目录
       const fl = await rpc(token, "file.list", { sessionId: sid, path: "" });
       const fItems = (fl.json && fl.json.result && fl.json.result.items) || [];

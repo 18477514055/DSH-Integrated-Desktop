@@ -117,6 +117,14 @@
 
   <div id="messages" class="scroll messages"></div>
 
+  <!--
+    排队条（2026-09-24 用户需求）：电脑端在"正在思考"时发消息会排队，
+    点一下那条待发消息就能"插话"（steer）让它立刻进入当前轮。
+    手机上原来没有这个 —— 用户原话：「这条在手机上没有体现」。
+    位置与电脑端一致：**输入框上方**（因为它讲的是"还没发出去的下一步"）。
+  -->
+  <div id="queueBar" class="queuebar hidden"></div>
+
   <div id="attachBar" class="attachbar hidden"></div>
 
   <form id="promptForm" class="composer">

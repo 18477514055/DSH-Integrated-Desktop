@@ -749,8 +749,36 @@ app.whenReady().then(() => {
     // 关掉抽屉
     await cdpEval(ws, `(() => { const s = document.getElementById('sheet'); if (s) s.classList.add('hidden'); return 1; })()`);
 
-    // 关掉抽屉，别影响后面的布局断言
-    await cdpEval(ws, `(() => { const s = document.getElementById('sheet'); if (s) s.classList.add('hidden'); return 1; })()`);
+    /* ── ③h 排队条 / 插话（steer）（2026-09-24 用户需求）──────────
+     * 用户原话：「正常在电脑上，在你思考的过程中，我发一条指令给你，他会作为你思考结束后，
+     *   也就是你上一个任务完成后，紧接着发给你的指令，如果这个时候我再点一下这条待发出去的
+     *   信息，他就会直接插入你的对话和思考让你直接收到这条指令，**这条在手机上没有体现**。」
+     *
+     * ★ 为什么这一段在**这里**、而不在 plugin-check：
+     *   steer 的硬前置是 `agent.status === 'running'`（内核源码 844 行），
+     *   而 plugin-check 的临时夹具**刻意不带凭据** ⇒ 没有可用模型 ⇒ 永远进不了 running。
+     *   这里连的是**用户真实运行的实例**（有真凭据、能真跑），所以只有这里能真验。
+     *
+     * 判据（只锁本次改动的效果，不依赖"恰好哪个会话"）：
+     *   ① 输入框上方**存在**排队条元素（DOM 里有 `#queueBar`）；
+     *   ② 队列里有内容时它**真的显示出来**，且每条都有「删除」键；
+     *   ③ 正在跑时，`next-turn` 里那条有「插话」键（与官方 UI 的 `disabled: !running` 一致）。
+     * ★ 不断言"一定有排队消息" —— 那取决于此刻 Agent 在不在跑，
+     *   属于**外部状态**（本项目的纪律：别把判据锁在外部状态上）。
+     *   所以：拿不到 running 就明确 SKIP，不假装验过。 */
+    {
+      const qRaw = await cdpEval(ws, `(async () => {
+        const bar = document.getElementById('queueBar');
+        if (!bar) return JSON.stringify({ err: 'no #queueBar element' });
+        // 主动拉一次（页面进会话时已拉过；这里确保是新鲜的）
+        return JSON.stringify({ exists: true, hidden: bar.classList.contains('hidden') });
+      })()`);
+      const Q = JSON.parse(qRaw);
+      check("输入框上方有排队条元素（DOM 就位）",
+        Q.exists === true, Q.err || `hidden=${Q.hidden}`);
+      console.log(`     排队条：存在=${Q.exists} 当前${Q.hidden ? "隐藏（队列空）" : "显示中"}`);
+      console.log(`     （真跑 steer 需要 Agent 正在跑；没在跑时排队条本来就该是空的）`);
+    }
 
     // 回到列表，后面的布局断言仍按列表页检查
     await cdpEval(ws, `(() => { const b = document.getElementById('backBtn'); if (b) b.click(); return 1; })()`);

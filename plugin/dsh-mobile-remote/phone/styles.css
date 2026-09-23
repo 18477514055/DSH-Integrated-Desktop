@@ -35,6 +35,12 @@
   --danger-soft: #fdeaea;
   --warn: #b45309;
   --warn-soft: #fff5e5;
+  /* ★ `--line` 与 `--border` 是同一个东西的两种叫法（2026-09-24 补）。
+   *   原先只有 `--border` 有定义，而 4 处地方写的是 `var(--line)`
+   *   （上传落点框、子目录输入、工作区胶囊、zip 分隔线）——
+   *   变量不存在时 `border: 1px solid var(--line)` 会**整条声明失效**，
+   *   那些框看起来"没有边框"。这里补一个别名，两边都能用。 */
+  --line: #e2e5ea;
   --radius: 12px;
   --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .04);
 }
@@ -431,6 +437,39 @@ pre.code[data-lang]::before {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .approval-actions { display: flex; gap: 6px; flex: none; }
+
+/* ── 排队条 / 插话（2026-09-24 用户需求）──────────────────
+ * 位置与电脑端的 QueueDock 一致：**输入框上方**。
+ * 它讲的是"还没发出去的下一步"，所以贴在输入框上比贴在消息区上更贴切。
+ * 最多显示 3 行（超了自己滚）—— 排队条不该把消息区挤没。 */
+.queuebar {
+  flex: none; background: var(--surface-2, #f2f4f7);
+  border-top: 1px solid var(--border);
+  padding: 8px 12px 6px; max-height: 30vh; overflow-y: auto;
+}
+.queue-head {
+  font-size: 11.5px; color: var(--text-2); font-weight: 600; margin-bottom: 6px;
+}
+.queue-row {
+  display: flex; gap: 8px; align-items: center;
+  padding: 5px 0; border-top: 1px solid var(--border);
+}
+.queue-row:first-of-type { border-top: 0; }
+.queue-text {
+  flex: 1; min-width: 0; font-size: 13px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 已经在当前轮里的（next-step）用灰一点表示"插进去了" */
+.queue-text.steering { color: var(--text-2); font-style: italic; }
+.queue-acts { display: flex; gap: 5px; flex: none; }
+.queue-btn {
+  font-size: 12px; padding: 5px 10px; border-radius: 7px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--surface); color: var(--text);
+}
+.queue-btn.primary {
+  background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600;
+}
+.queue-btn:disabled { opacity: .5; }
 
 /* ── 附件预览 ───────────────────────────────────────── */
 .attachbar {

@@ -40,6 +40,7 @@
   var detailTitle = $('detailTitle'), detailSub = $('detailSub'), sendBtn = $('sendBtn');
   var detailModel = $('detailModel');
   var approvalBar = $('approvalBar'), approvalTool = $('approvalTool'), approvalReason = $('approvalReason');
+  var queueBar = $('queueBar');
   var attachBar = $('attachBar'), fileInput = $('fileInput');
   var uploadInput = $('uploadInput');
   var sheet = $('sheet'), sheetTitle = $('sheetTitle'), sheetBody = $('sheetBody');
@@ -440,6 +441,8 @@
     messages.innerHTML = '';
     pendingImages = []; renderAttach();
     hideApproval();
+    // 换会话 ⇒ 排队条也要跟着换（否则会显示上一个会话的待发消息）
+    queueItems = []; renderQueueBar(); loadQueue();
     // ★ 换会话必须把分组状态一起清掉，否则新会话的头几个工具会被并进
     //   上一个会话的组里（那个组已经不在 DOM 上了，等于**凭空消失**）。
     curGroup = null; toolCards = {};
@@ -818,10 +821,37 @@
       else if (isErr) attachToolResult(rid, '（工具报错，无输出）', true);
       return;
     }
+
+    /* ── 斜杠命令的生命周期（2026-09-24）────────────────────────────
+     * 用户报：「我这个指令是在手机上发给你的，他作为文本发出去了」——
+     * 修法见 desktop/index.js 的 session.prompt（改成走 commands.execute）。
+     *
+     * 但光修宿主还不够：**命令不产生 assistant/message**，
+     * 它的结果只落在这两条事件里（`dsh-commands/lib/index.js:325, 332`：
+     * 执行前 append `command/run`、结束后 append `command/done`）。
+     * 手机端原来只认 user/assistant/tool 三类，于是命令执行完**界面上什么都没有** ——
+     * 用户会以为"又没生效"。所以这里要把这两条渲染出来。
+     * ★ 刻意**不**把 command/run 也画成一条气泡：那是"我发了什么"，
+     *   而用户自己刚在输入框里打过，画出来是重复的（与 user/message 的去重同理）。
+     *   只在 done 时给一条**明确的结果行**。 */
+    if (event.type === 'command/run') {
+      addNote('▶ /' + (d.name || '') + (d.args ? ' ' + String(d.args).slice(0, 60) : ''));
+      return;
+    }
+    if (event.type === 'command/done') {
+      var kind = d.kind || 'success';
+      var body = d.text ? String(d.text) : '';
+      if (kind === 'success') addNote('✓ ' + (body || '命令已执行'));
+      else if (kind === 'error') addNote('⚠ 命令失败：' + (body || '（无说明）'), true);
+      else addNote('· ' + (body || kind));
+      return;
+    }
   }
 
   function renderFrame(frame) {
     if (!frame) return;
+    // 事件流一有动静就顺手看一眼排队条（节流，见 scheduleQueueRefresh 的说明）
+    scheduleQueueRefresh();
     if (frame.type === 'snapshot') {
       (frame.records || []).forEach(function (r) { if (r.type === 'event') renderEvent(r.event); });
       scrollDown(); return;
@@ -1888,6 +1918,92 @@
     });
   }
 
+  /* ── 排队条 / 插话（steer）（2026-09-24 用户需求）─────────────
+   *
+   * 用户原话：「正常在电脑上，在你思考的过程中，我发一条指令给你，他会作为你思考结束后，
+   *   也就是你上一个任务完成后，紧接着发给你的指令，如果这个时候我再点一下这条待发出去的
+   *   信息，他就会直接插入你的对话和思考让你直接收到这条指令，这条在手机上没有体现。」
+   *
+   * 电脑端那个叫 QueueDock，做两件事：
+   *   · **排队**：正在跑的时候发的消息进队列，等这轮结束再发（宿主已在用 mode:'queue'）；
+   *   · **插话**：点那条待发消息 → `{kind:'steer'}` → 立刻插进当前轮。
+   *
+   * ★ 什么时候刷这条队列：它**没有**事件推送（内核的 queue 帧走的是
+   *   `sessionController.control()` 那条全局控制流，我们没订阅）。
+   *   所以用"事件流里出现任何帧就顺手拉一次"这个**便宜**的办法：
+   *   排队条本来就是"正在跑"时才有内容，而那时事件流一直在动。
+   *   另外切进会话、以及每次发消息之后也各拉一次。
+   *   （不订阅 control 流是**有意的**：那是一条全局流，为一个排队条去开它
+   *     会让每个手机设备多一条常驻订阅，收益不抵成本。） */
+  var queueItems = [];
+  var queueRunning = false;
+  var queueTimer = null;
+
+  function renderQueueBar() {
+    queueBar.innerHTML = '';
+    if (!queueItems.length) { queueBar.classList.add('hidden'); return; }
+    queueBar.classList.remove('hidden');
+    var head = el('div', 'queue-head',
+      queueRunning ? '正在跑 · 待发 ' + queueItems.length + ' 条' : '待发 ' + queueItems.length + ' 条');
+    queueBar.appendChild(head);
+    queueItems.forEach(function (it) {
+      var row = el('div', 'queue-row');
+      var txt = el('div', 'queue-text', it.text || '（无文本）');
+      if (it.placement === 'steering') txt.className += ' steering';
+      row.appendChild(txt);
+
+      var acts = el('div', 'queue-acts');
+      /* 「插话」按钮：只有 `next-turn` 里的、且**正在跑**时才有意义 ——
+       * 内核源码 844 行明写：`action.kind==='steer'` 要求
+       * target==='next-turn' && agent.status==='running'，
+       * 否则抛 `session/steer-unavailable`。
+       * 所以这里照官方 UI 的做法**直接禁用**，而不是让用户点了才报错。 */
+      if (it.canSteer && queueRunning) {
+        var st = el('button', 'queue-btn primary', '插话');
+        st.title = '立刻插进当前这一轮，不等它跑完';
+        st.onclick = function () {
+          st.disabled = true;
+          api('queue.update', { sessionId: current, itemId: it.id, action: 'steer' })
+            .then(function () {
+              addNote('⚡ 已插话：这条会立刻进入当前轮');
+              loadQueue();
+            })
+            .catch(function (e) { addNote('⚠ ' + e.message, true); st.disabled = false; });
+        };
+        acts.appendChild(st);
+      }
+      var rm = el('button', 'queue-btn', '删除');
+      rm.onclick = function () {
+        rm.disabled = true;
+        api('queue.update', { sessionId: current, itemId: it.id, action: 'remove' })
+          .then(function () { addNote('已删除这条待发消息'); loadQueue(); })
+          .catch(function (e) { addNote('⚠ ' + e.message, true); rm.disabled = false; });
+      };
+      acts.appendChild(rm);
+      row.appendChild(acts);
+      queueBar.appendChild(row);
+    });
+  }
+
+  function loadQueue() {
+    if (!current) { queueItems = []; renderQueueBar(); return; }
+    api('queue.list', { sessionId: current }).then(function (r) {
+      queueItems = (r && r.items) || [];
+      queueRunning = !!(r && r.running);
+      renderQueueBar();
+    }).catch(function (e) {
+      // 旧宿主没有这个方法 ⇒ 静默（排队条本来就是附加功能，不该报错打扰）
+      if (!e.unknownMethod) { /* 其它错误也不打扰，排队条不是关键路径 */ }
+      queueItems = []; renderQueueBar();
+    });
+  }
+
+  /** 节流：事件流很密，别每帧都发一个 RPC。 */
+  function scheduleQueueRefresh() {
+    if (queueTimer) return;
+    queueTimer = setTimeout(function () { queueTimer = null; loadQueue(); }, 1200);
+  }
+
   /* ── 审批 ───────────────────────────────────────────── */
 
   function showApproval(d) {
@@ -1954,6 +2070,16 @@
     if (!current) return;
     if (!text.trim() && !pendingImages.length) return;
 
+    /* ★ 斜杠命令（2026-09-24 用户报的 bug）：以 `/` 开头且**没有图片**时，
+     *   宿主会先拿它去问内核的命令注册表（`commands.execute`）——
+     *   认出来就直接执行（不再当提示词发给模型），认不出来才当普通文本发。
+     *   手机端这边只需要**把"这是命令"的返回处理掉**：
+     *   · 不画用户气泡？—— **要画**。用户需要看到自己发了什么（而且命令的
+     *     回显不走 user/message 事件，不画就什么都没有）；
+     *   · 但要**明确标出它是命令**，并且把命令结果直接显示出来，
+     *     否则用户会以为"又当成文本发出去了"（这正是这次的 bug）。 */
+    var isCmd = /^\s*\//.test(text) && !pendingImages.length;
+
     sendBtn.disabled = true;
     addBubble('user', text.trim() || ('（' + pendingImages.length + ' 张图片）'));
     if (text.trim()) { pushHistory(text.trim()); markSent(text.trim()); }   // ★ 记下"刚发的"，事件流回显时去重
@@ -1968,6 +2094,27 @@
     pendingImages = []; renderAttach();
 
     api('session.prompt', payload)
+      .then(function (r) {
+        // 刚发出去 ⇒ 队列里可能多了一条（正在跑的时候），立刻看一眼
+        scheduleQueueRefresh();
+        /* 命令走的是另一条路 ⇒ 它的结果**不会**有 assistant 消息，
+         * 所以这里要把结果显示出来（否则界面上毫无反应）。
+         * 事件流那边也会收到 command/run 与 command/done（见 renderEvent），
+         * 两处都会提示 —— 但这是**刻意的**：RPC 的返回是"我这次调用"的直接结果，
+         * 事件流是"内核记了账"，两者独立；重复提示一次远好过静默。 */
+        if (r && r.command) {
+          var kind = r.kind || 'success';
+          var body = r.text ? String(r.text) : '';
+          if (kind === 'success') addNote('✓ ' + (body || ('/' + String(text).trim().slice(1) + ' 已执行')));
+          else if (kind === 'error') addNote('⚠ 命令失败：' + (body || '（无说明）'), true);
+          else addNote('· ' + (body || kind));
+          loadList();          // 有些命令会改会话（如 /compact 改上下文）⇒ 顺手刷一下
+        } else if (isCmd) {
+          /* 宿主说"这不是已知命令"（内核返回 undefined）⇒ 它已经按普通提示词发出去了。
+           * 如实说明，免得用户以为命令生效了。 */
+          addNote('ℹ 这不是一个已知命令，已按普通消息发出');
+        }
+      })
       .catch(function (err) { addNote('⚠ 发送失败：' + err.message, true); })
       .then(function () { sendBtn.disabled = false; });
   };

@@ -1007,11 +1007,74 @@ function rpcMethods(ctx) {
       const text = params?.text;
       if (!sessionId) throw new Error('缺少 sessionId');
 
+      /* ══════════════════════════════════════════════════════════════
+       * 斜杠命令要**走命令通道**，不能当提示词发给模型（2026-09-24 用户报）
+       * ══════════════════════════════════════════════════════════════
+       * 用户原话：「我这个指令是在手机上发给你的，他作为文本发出去了，你看能不能修一下。」
+       * （他在手机上打了 `/compact`，结果那句话被当成普通消息发给了模型 ——
+       *   压缩没发生，模型只看到一行字。）
+       *
+       * 真因：`sessionController.prompt()` **只做提示词准入**
+       *   （`dsh-api-session-controller/lib/index.js:736-790`：
+       *    它把 content 变成 user message 然后 `agent.followup(...)`）——
+       *   **里面没有任何斜杠命令解析**。所以 `/compact` 原样进了模型上下文。
+       *
+       * 正确的路是官方另一条一等公民通道：
+       *   `ctx.commands.execute(agent, line, submittedAttachments, signal)`
+       *   （`dsh-commands/lib/index.js:318`，源码注释原话：
+       *    "Parse and execute a known command **without sending it to the model**"）
+       *   返回 `{commandId, result}`；**返回 `undefined` 表示"这行不是命令"**
+       *   （语法不匹配或名字不认识）⇒ 那时才按普通提示词发。
+       *   官方前端就是这么做的：`dsh-client-ui-commands/lib/client.js:796`
+       *   `await this.ctx.remote.commands.execute(session.sessionId, line, attachments)`。
+       *
+       * ★ 为什么必须"先试命令、不认识才当文本"（而不是"以 / 开头就当命令"）：
+       *   用户在手机上完全可能发一句以 `/` 开头的**普通话**（比如贴一段路径
+       *   `/usr/local/bin` 或写个分数 `1/2 的进度`）。`parseCommand` 的正则是
+       *   `/^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])/`（同文件 96 行）——
+       *   它只认"斜杠 + 小写字母开头 + 后面紧跟空白或行尾"。
+       *   所以判据用**内核自己返回的 undefined**，而不是我自己猜的正则：
+       *   既不重复实现它的语法，也不会把普通文本误吞。
+       *
+       * ★ 只在**没有图片**时才试命令：官方 `execute` 的第 3 个参数是
+       *   `submittedAttachments`，我们这边的图片是 base64 内联的，
+       *   没有走 fileUpload 的 receipt ⇒ 传空数组是诚实的
+       *   （有图时说明用户是想发内容，直接走 prompt 更符合预期）。
+       */
+      const plain = typeof text === 'string' ? text : '';
+      const images = Array.isArray(params?.images) ? params.images.slice(0, 6) : [];
+      if (plain.trim().startsWith('/') && images.length === 0) {
+        const commands = (() => { try { return ctx.get('commands'); } catch { return null; } })();
+        const agent = agentOf(ctx, sessionId);
+        if (commands && typeof commands.execute === 'function' && agent) {
+          const acCmd = new AbortController();
+          let settled;
+          try {
+            // 第 3 个参数：没有附件 ⇒ 空数组（见上面 ★）
+            settled = await commands.execute(agent, plain, [], acCmd.signal);
+          } catch (e) {
+            // 命令**认出来了但执行失败** ⇒ 如实报错，绝不悄悄退回"当提示词发"
+            // （否则用户以为压缩了，其实只是把 /compact 发给了模型 —— 正是这次的 bug）
+            throw new Error('命令执行失败：' + (e?.message || e));
+          }
+          if (settled) {
+            state.diagnostics.commands = (state.diagnostics.commands || 0) + 1;
+            return {
+              accepted: true,
+              command: true,
+              commandId: settled.commandId,
+              kind: settled.result?.kind || 'success',
+              text: settled.result?.text || '',
+            };
+          }
+          // settled 为 undefined ⇒ 内核说"这行不是命令" ⇒ 落到下面当普通提示词
+        }
+      }
+
       const content = [];
       if (typeof text === 'string' && text.trim()) content.push({ type: 'text', text });
 
       // 图片：[{ mediaType, data(base64，不带 data: 前缀), name }]
-      const images = Array.isArray(params?.images) ? params.images.slice(0, 6) : [];
       for (const img of images) {
         const mediaType = String(img?.mediaType || '');
         const data = String(img?.data || '');
@@ -1033,6 +1096,107 @@ function rpcMethods(ctx) {
       }, ac.signal);
       state.diagnostics.prompts++;
       return value;
+    },
+
+    /* ══════════════════════════════════════════════════════════════
+     * 排队消息 / 插话（steer）（2026-09-24 用户需求）
+     * ══════════════════════════════════════════════════════════════
+     * 用户原话：「正常在电脑上，在你思考的过程中，我发一条指令给你，他会作为你思考结束后，
+     *   也就是你上一个任务完成后，紧接着发给你的指令，如果这个时候我再点一下这条待发出去
+     *   的信息，他就会直接插入你的对话和思考让你直接收到这条指令，这条在手机上没有体现。」
+     *
+     * 这就是电脑端那个 **QueueDock**（排队条）的两件事：
+     *   · **排队**：正在跑的时候发的消息进 `agent.inbox.nextTurn`，
+     *     等这一轮结束再作为下一条指令发出（我们发消息用的 `mode:'queue'` 已经是这个行为）；
+     *   · **插话**：点一下那条待发消息，把它从"排队"改成"立刻插进当前轮"
+     *     （官方 UI 的 `applyAction(row.id, { kind: "steer" })`，
+     *      `dsh-client-ui-conversation/lib/client.js:14284`）。
+     *
+     * ── 契约（逐行查过源码，不是猜的）────────────────────────────
+     * · 读：`sessionProjections.snapshot(session, ['inbox'])` → `{values:{inbox:{...}}}`
+     *   projection 的 key 就是 `"inbox"`（`dsh-agent-loop/lib/index.js:27`），
+     *   形状 `{'next-turn': [...], 'next-step': [...]}`（同文件 21-24 行）。
+     * · 写：`sessionController.updateQueue({sessionId, itemId, action})`
+     *   （`dsh-api-session-controller/lib/index.js:822`）。
+     *   action 有三种：`{kind:'edit',content}` / `{kind:'remove'}` / `{kind:'steer'}`。
+     *   ★ **steer 有条件**：源码 844 行 —— 必须落在 `next-turn` 里**且**
+     *     `agent.status === 'running'`，否则抛 `session/steer-unavailable`。
+     *     所以手机端要在"正在跑"时才给这个按钮（与官方 UI 的 `disabled: !running` 一致）。
+     * · 队列消息的正文在 `message.content`（`queueItemsFromInbox`，同文件 1151-1169 行），
+     *   里面是 content block 数组 ⇒ 手机端要把它折成纯文本显示。
+     *
+     * ★ 为什么用 `stateOf` 之外还要兜一层：projection 可能没注册
+     *   （冷会话 / 老内核）⇒ 取不到就返回空队列，**不报错**，
+     *   手机端就只是看不到排队条，而不是整页崩。 */
+    async 'queue.list'(deviceId, params) {
+      const sessionId = params?.sessionId;
+      if (!sessionId) throw new Error('缺少 sessionId');
+      const agent = agentOf(ctx, sessionId);
+      if (!agent) return { items: [], running: false };
+      const proj = (() => { try { return ctx.get('sessionProjections'); } catch { return null; } })();
+      if (!proj || typeof proj.snapshot !== 'function') return { items: [], running: false };
+      let inbox = null;
+      try {
+        const snap = proj.snapshot(agent.session, ['inbox']);
+        inbox = snap?.values?.inbox || null;
+      } catch { inbox = null; }
+      if (!inbox) return { items: [], running: agent.status === 'running' };
+
+      const toText = (content) => {
+        if (!Array.isArray(content)) return '';
+        const parts = [];
+        for (const b of content) {
+          if (!b) continue;
+          if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text);
+          else if (b.type === 'image') parts.push('[图片]');
+          else if (b.type === 'file') parts.push('[文件]');
+        }
+        return parts.join(' ').trim();
+      };
+      const items = [];
+      for (const m of (inbox['next-turn'] || [])) {
+        items.push({ id: m.id, placement: 'queued', text: toText(m.content), canSteer: agent.status === 'running' });
+      }
+      for (const m of (inbox['next-step'] || [])) {
+        items.push({
+          id: m.id,
+          placement: m?.source?.kind === 'user' ? 'steering' : 'context',
+          text: toText(m.content),
+          // next-step 里的**不能** steer（源码 844 行只允许 next-turn）
+          canSteer: false,
+        });
+      }
+      return { items, running: agent.status === 'running' };
+    },
+
+    /**
+     * 操作一条排队消息：插话（steer）/ 删除（remove）。
+     * 为什么把这两个合在一个 RPC 里：它们共用同一套"找到那条 → 改它"的语义，
+     * 分成两个只会让手机端多一份重复的错误处理。
+     */
+    async 'queue.update'(deviceId, params) {
+      const ctrl = sessionCtrl(ctx);
+      if (!ctrl) throw new Error('sessionController 不可用');
+      const sessionId = params?.sessionId;
+      const itemId = params?.itemId;
+      const action = String(params?.action || '');
+      if (!sessionId || !itemId) throw new Error('缺少 sessionId / itemId');
+      if (action !== 'steer' && action !== 'remove') throw new Error('action 只能是 steer 或 remove');
+      try {
+        await ctrl.updateQueue({ sessionId, itemId, action: { kind: action } });
+      } catch (e) {
+        const msg = String(e?.message || e);
+        // 把内核的英文错误翻成人话（这两条是用户最可能撞上的）
+        if (/steer-unavailable/i.test(msg)) {
+          throw new Error('这条已经不能插话了（那一轮已经结束，或它不是待发消息）—— 刷新一下看看');
+        }
+        if (/queue-item-not-found/i.test(msg)) {
+          throw new Error('这条排队消息已经不在了（可能已经开始执行）');
+        }
+        throw new Error('操作失败：' + msg);
+      }
+      state.diagnostics.queueOps = (state.diagnostics.queueOps || 0) + 1;
+      return { ok: true, action };
     },
 
     /** 手机回答一个审批请求。 */
