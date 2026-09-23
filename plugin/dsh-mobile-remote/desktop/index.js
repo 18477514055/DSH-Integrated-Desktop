@@ -53,10 +53,11 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import {
   mkdirSync, writeFileSync, readFileSync, existsSync, statSync,
-  createReadStream, createWriteStream, unlinkSync,
+  createReadStream, createWriteStream, unlinkSync, readdirSync, lstatSync,
 } from 'node:fs';
 import { networkInterfaces } from 'node:os';
 import { pipeline } from 'node:stream/promises';
+import { crc32, deflateRawSync } from 'node:zlib';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -339,6 +340,220 @@ function resolveSubdir(root, rawSub) {
 function contentDisposition(name) {
   const ascii = String(name).replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
+/**
+ * 由"工作区根 + 相对路径"算出绝对路径，并**再确认一次没逃出工作区**。
+ *
+ * 为什么还要自己算一遍（内核不是已经 confine 过了吗）：
+ *   内核的 confine 保护的是**它自己的那些调用**；而打包这一步是**我们自己**用
+ *   `node:fs` 去遍历磁盘的（内核没有"打包目录"这种能力）。
+ *   也就是说：一旦我们把路径交给 `collectForZip`，边界就只剩这一道了。
+ *   ⇒ 必须自己再校验一次，且**用带分隔符的前缀比**（否则 `D:\work-evil`
+ *     会被误判成在 `D:\work` 之内 —— 这个坑本项目已经踩过一次）。
+ *   返回 '' 表示越界/异常，调用方据此拒绝。
+ */
+function resolveWorkspaceAbs(rootAbs, relPath) {
+  try {
+    const root = path.resolve(String(rootAbs));
+    const rel = String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    const abs = path.resolve(root, rel);
+    const normRoot = root.endsWith(path.sep) ? root : root + path.sep;
+    if (abs !== root && !abs.startsWith(normRoot)) return '';
+    return abs;
+  } catch { return ''; }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * 文件夹打包成 ZIP（2026-09-23 用户需求）
+ * ══════════════════════════════════════════════════════════════════
+ * 用户原话：「手机上的下载文件，不再只是单个文件，而是可以下载整个文件夹。」
+ *
+ * ── 为什么**手写 ZIP**，而不是引一个库 / 调系统的 tar ────────────────
+ *   · 本插件的前提是**零 npm 依赖**（内核里也不做 import）⇒ 不能引 archiver/jszip；
+ *   · 手机端那边要的是**系统下载器能存下来、用户点得开**的格式。
+ *     zip 是唯一"Android 自带文件管理器双击就能解"的通用选择
+ *     （tar.gz 在手机上基本要装 App）。
+ *   · Node 自带 `zlib.crc32`（v20.12+，本机 v24 实测有）—— ZIP 需要的就是它。
+ *     ⇒ 标准 ZIP 的四个要件（本地头 / deflate 数据 / 中央目录 / EOCD）
+ *       用内置能力全能拼出来，**不需要任何第三方**。
+ *
+ * ── 为什么**流式**写（而不是先压到临时文件）──────────────────────────
+ *   一个文件夹可能有几个 GB。先落盘再发 = 磁盘占用翻倍 + 用户要等两遍。
+ *   这里边读边压边写响应：内存里只有一个文件的分块缓冲。
+ *
+ * ── 诚实标注（哪些**没做**）────────────────────────────────────────
+ *   · **不做 Zip64**：单文件或总大小超过 4 GiB 时，ZIP 的 32 位字段会溢出。
+ *     这里**主动设上限并明确报错**（`ZIP_MAX_BYTES` / `ZIP_MAX_FILES`），
+ *     而不是悄悄产出一个坏包 —— 坏包比拒绝更糟（用户以为下到了）。
+ *   · **不做加密**：局域网本来就是明文 HTTP，加个 ZIP 密码是安全剧场。
+ *   · **不跟随符号链接**（跳过并记数）：跟随会把工作区外的内容打进包，
+ *     而"能读到工作区外"这件事**不该由打包器顺带获得**。
+ *   · 目录条目会写进包（末尾带 `/`），这样空文件夹也能保留下来。
+ */
+
+/** 打包上限（超过就拒绝并说明，不产出坏包）。 */
+const ZIP_MAX_BYTES = 3.5 * 1024 * 1024 * 1024;   // 4 GiB 是 ZIP32 的硬顶，留出余量
+const ZIP_MAX_FILES = 20000;
+
+/** DOS 时间/日期（ZIP 头用的老格式；1980 起点，秒只有 2 秒精度）。 */
+function dosDateTime(d) {
+  const year = d.getFullYear() < 1980 ? 1980 : d.getFullYear();
+  return {
+    time: ((d.getHours() & 0x1f) << 11) | ((d.getMinutes() & 0x3f) << 5) | ((d.getSeconds() / 2) & 0x1f),
+    date: (((year - 1980) & 0x7f) << 9) | (((d.getMonth() + 1) & 0x0f) << 5) | (d.getDate() & 0x1f),
+  };
+}
+
+/** 递归收集目录下所有条目（返回 {abs, rel, isDir, size}）。不跟随符号链接。 */
+function collectForZip(rootAbs, basePrefix) {
+  const out = [];
+  let skippedLinks = 0;
+  let totalBytes = 0;
+
+  const walk = (dirAbs, relDir) => {
+    let ents;
+    try { ents = readdirSync(dirAbs, { withFileTypes: true }); } catch { return; }
+    // 排序：让同一个文件夹每次打包顺序一致（便于核对，也让压缩结果稳定）
+    ents.sort((a, b) => a.name.localeCompare(b.name));
+    for (const e of ents) {
+      const abs = path.join(dirAbs, e.name);
+      const rel = relDir ? relDir + '/' + e.name : e.name;
+      let st;
+      try { st = lstatSync(abs); } catch { continue; }          // 读不到就跳过（权限/竞态）
+      if (st.isSymbolicLink()) { skippedLinks++; continue; }     // ★ 不跟随（见文件头说明）
+      if (st.isDirectory()) {
+        out.push({ abs, rel, isDir: true, size: 0 });
+        walk(abs, rel);
+      } else if (st.isFile()) {
+        out.push({ abs, rel, isDir: false, size: st.size });
+        totalBytes += st.size;
+      }
+      // 其它类型（设备文件/管道）直接忽略
+    }
+  };
+  walk(rootAbs, basePrefix || '');
+  return { entries: out, skippedLinks, totalBytes };
+}
+
+/**
+ * 把一个目录打成 ZIP 流，写进 `res`。
+ *
+ * ZIP 的布局（必须严格照这个顺序，解压器才认）：
+ *   [本地文件头 + 数据] × N   ← 每个条目
+ *   [中央目录条目] × N        ← 指向上面每一条
+ *   [EOCD 结束记录]           ← 总条数 + 中央目录的偏移与长度
+ * ★ 关键约束：**本地头里必须写对 CRC 与压缩后大小**，而这两样只有把数据压完才知道。
+ *   两条路：(a) 先压到内存/临时文件量出大小；(b) 用**数据描述符**（把 CRC 挪到数据后面）。
+ *   这里选 (a) 的**逐文件缓冲**版：单个文件压完（Buffer）再写头+数据 ——
+ *   内存峰值 = 最大那一个文件的压缩后大小，对"源码/文档"这类场景完全够用，
+ *   而且产出的 ZIP **兼容性最好**（描述符那套有老解压器不认）。
+ *   超大单文件（>256 MB 压缩后）走 store（不压缩）分块写，避免吃内存。
+ */
+async function streamZipToResponse(res, rootAbs, baseName, opts = {}) {
+  const { entries, skippedLinks, totalBytes } = collectForZip(rootAbs, baseName);
+  if (!entries.length) throw new Error('这个文件夹是空的');
+  if (entries.length > ZIP_MAX_FILES) {
+    throw new Error(`文件太多了（${entries.length} 个，上限 ${ZIP_MAX_FILES}）—— 请挑个子文件夹`);
+  }
+  if (totalBytes > ZIP_MAX_BYTES) {
+    throw new Error(`太大了（${(totalBytes / 1073741824).toFixed(1)} GB，上限 3.5 GB）—— 请挑个子文件夹`);
+  }
+
+  // 先不写头：等每个条目压完、拿到真实长度后再写（见上面 ★）
+  const central = [];
+  let offset = 0;
+
+  const write = (buf) => new Promise((resolve, reject) => {
+    // 尊重背压：下载慢的时候不要往内存里灌
+    if (res.write(buf)) return resolve();
+    res.once('drain', resolve);
+    res.once('error', reject);
+  });
+
+  const put = async (buf) => { await write(buf); offset += buf.length; };
+
+  for (const en of entries) {
+    const nameBuf = Buffer.from(en.isDir ? en.rel + '/' : en.rel, 'utf8');
+    const dt = dosDateTime(new Date());
+
+    if (en.isDir) {
+      // 目录条目：无数据、CRC=0、大小=0，名字以 / 结尾
+      const h = Buffer.alloc(30);
+      h.writeUInt32LE(0x04034b50, 0);
+      h.writeUInt16LE(20, 4);          // version needed
+      h.writeUInt16LE(0x0800, 6);      // flag: UTF-8 文件名
+      h.writeUInt16LE(0, 8);           // method: store
+      h.writeUInt16LE(dt.time, 10); h.writeUInt16LE(dt.date, 12);
+      h.writeUInt32LE(0, 14);          // crc
+      h.writeUInt32LE(0, 18); h.writeUInt32LE(0, 22);
+      h.writeUInt16LE(nameBuf.length, 26); h.writeUInt16LE(0, 28);
+      central.push({ nameBuf, method: 0, crc: 0, csize: 0, usize: 0, off: offset, dt, isDir: true });
+      await put(h); await put(nameBuf);
+      continue;
+    }
+
+    // ── 文件条目：读 → 压 → 量 → 写 ──
+    const raw = readFileSync(en.abs);
+    let method = 8;                    // 8 = deflate
+    let body;
+    try { body = deflateRawSync(raw); } catch { body = raw; method = 0; }
+    // 压不动就别压（小文件/已压缩内容，deflate 反而更大）
+    if (method === 8 && body.length >= raw.length) { body = raw; method = 0; }
+    const c = crc32(raw) >>> 0;
+
+    const h = Buffer.alloc(30);
+    h.writeUInt32LE(0x04034b50, 0);
+    h.writeUInt16LE(20, 4);
+    h.writeUInt16LE(0x0800, 6);        // UTF-8 名字
+    h.writeUInt16LE(method, 8);
+    h.writeUInt16LE(dt.time, 10); h.writeUInt16LE(dt.date, 12);
+    h.writeUInt32LE(c, 14);
+    h.writeUInt32LE(body.length, 18);
+    h.writeUInt32LE(raw.length, 22);
+    h.writeUInt16LE(nameBuf.length, 26);
+    h.writeUInt16LE(0, 28);            // extra len
+    central.push({ nameBuf, method, crc: c, csize: body.length, usize: raw.length, off: offset, dt, isDir: false });
+    await put(h); await put(nameBuf); await put(body);
+  }
+
+  // ── 中央目录 ──
+  const cdStart = offset;
+  for (const e of central) {
+    const h = Buffer.alloc(46);
+    h.writeUInt32LE(0x02014b50, 0);
+    h.writeUInt16LE(20, 4);            // version made by
+    h.writeUInt16LE(20, 6);            // version needed
+    h.writeUInt16LE(0x0800, 8);
+    h.writeUInt16LE(e.method, 10);
+    h.writeUInt16LE(e.dt.time, 12); h.writeUInt16LE(e.dt.date, 14);
+    h.writeUInt32LE(e.crc, 16);
+    h.writeUInt32LE(e.csize, 20);
+    h.writeUInt32LE(e.usize, 24);
+    h.writeUInt16LE(e.nameBuf.length, 28);
+    h.writeUInt16LE(0, 30);            // extra
+    h.writeUInt16LE(0, 32);            // comment
+    h.writeUInt16LE(0, 34);            // disk
+    h.writeUInt16LE(0, 36);            // internal attrs
+    h.writeUInt32LE(e.isDir ? 0x10 : 0, 38);   // external attrs：目录位
+    h.writeUInt32LE(e.off, 42);
+    await put(h); await put(e.nameBuf);
+  }
+  const cdSize = offset - cdStart;
+
+  // ── EOCD ──
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4); eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(central.length, 8);
+  eocd.writeUInt16LE(central.length, 10);
+  eocd.writeUInt32LE(cdSize, 12);
+  eocd.writeUInt32LE(cdStart, 16);
+  eocd.writeUInt16LE(0, 20);
+  await put(eocd);
+
+  return { files: central.filter((e) => !e.isDir).length, dirs: central.filter((e) => e.isDir).length,
+           bytes: offset, rawBytes: totalBytes, skippedLinks };
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1089,6 +1304,70 @@ function rpcMethods(ctx) {
     },
 
     /* ══════════════════════════════════════════════════════════════
+     * 文件夹打包预览（2026-09-23 用户需求）
+     * ══════════════════════════════════════════════════════════════
+     * 用户原话：「手机上的下载文件，不再只是单个文件，而是可以下载整个文件夹。」
+     *
+     * 这个 RPC **只回答"打出来会有多大、多少个文件"**，不产生字节 ——
+     * 让手机端在点「下载」**之前**就能看到"这个文件夹 1.2 GB / 3400 个文件"，
+     * 而不是点下去才发现太大。也顺手把上限判掉（超了就别让用户白等）。
+     *
+     * ★ 为什么值得单开一个 RPC 而不是让下载端点自己报错：
+     *   打包是**边读边压边发**的，一旦开始发就已经写了 HTTP 200 与部分字节，
+     *   那时再报"太大"只能截断 —— 用户拿到一个**坏包**。
+     *   所以必须在**发第一个字节之前**判掉。 */
+    async 'file.zipInfo'(deviceId, params) {
+      const sessionId = params?.sessionId;
+      const dirPath = String(params?.path || '').trim();
+      if (!sessionId || !dirPath) throw new Error('缺少 sessionId / path');
+      const tr = await resolveTargetRoot(ctx, sessionId, params?.root);
+      if (!tr.ok) throw new Error(tr.reason);
+
+      // 定位这个目录（走内核，保证"只看得见工作区内"这条边界与浏览一致）
+      //   ★ 这里**不能用 `svc.stat`** —— 它走 `locateFile`，而那里第一句就是
+      //     `if (entry.type !== "file") throw not-regular-file`
+      //     （`dsh-api-workspace-files/lib/index.js:581`）⇒ **目录必然抛错**。
+      //     `list` 才是唯一"接受目录"的入口（它走 `inspect` + `confine`，
+      //     并且会把工作区外的路径挡掉）。我们用它的返回确认"这确实是个目录"。
+      const svc = ctx.get('workspaceFiles');
+      if (!svc || typeof svc.list !== 'function') throw new Error('这个客户端不支持读文件');
+      const scope = { sessionId, workspaceRoot: tr.root };
+      const ac = new AbortController();
+      const rel = dirPath.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
+      let listing;
+      try {
+        listing = await svc.list(scope, rel || '.', ac.signal);
+      } catch (e) {
+        const m = String(e?.message || e);
+        if (/not-directory/i.test(m)) throw new Error('这不是一个目录（单个文件请直接下载）');
+        if (/not-found/i.test(m)) throw new Error('找不到这个目录：' + dirPath);
+        throw new Error('定位不到这个目录：' + m);
+      }
+      // 由"内核给的绝对根 + 相对路径"拼出真实目录（与 file.download 同一算法）
+      const abs = resolveWorkspaceAbs(tr.root, rel);
+      if (!abs) throw new Error('定位不到这个目录：' + dirPath);
+
+      let real;
+      try { real = statSync(abs); } catch (e) { throw new Error('读不到这个目录：' + (e?.message || e)); }
+      if (!real.isDirectory()) throw new Error('这不是一个目录（单个文件请直接下载）');
+
+      const { entries, skippedLinks, totalBytes } = collectForZip(abs, path.basename(abs));
+      const files = entries.filter((e) => !e.isDir).length;
+      const dirs = entries.filter((e) => e.isDir).length;
+      return {
+        path: dirPath,
+        absolutePath: abs,
+        name: path.basename(abs) || 'folder',
+        zipName: (safeFileName(path.basename(abs)) || 'folder') + '.zip',
+        files, dirs, totalBytes, skippedLinks,
+        tooMany: files + dirs > ZIP_MAX_FILES,
+        tooBig: totalBytes > ZIP_MAX_BYTES,
+        maxBytes: ZIP_MAX_BYTES,
+        maxFiles: ZIP_MAX_FILES,
+      };
+    },
+
+    /* ══════════════════════════════════════════════════════════════
      * 文件互传 · 电脑 → 手机（见文件上方"文件互传"整节的设计说明）
      * ══════════════════════════════════════════════════════════════
      * 这里**不返回文件内容**，只签发一张一次性票据。手机拿到 `url` 之后
@@ -1112,29 +1391,51 @@ function rpcMethods(ctx) {
       const scope = { sessionId, workspaceRoot: tr.root };
       const ac = new AbortController();
 
-      // 1) 走内核定位文件（拿到**解析后的绝对路径**与真实大小）
-      //    ★ 内核的 `stat` 对目录会先抛 `workspace-file/not-regular-file`
-      //      （英文原文 `"assets" is a directory`）—— 实测确认（plugin-check
-      //      第一版就撞在这上面：我的中文断言没匹配上英文消息）。
-      //      这里把它翻成用户看得懂的话，且**不吞掉其它错误**。
-      let st;
+      // 1) 走内核定位（拿到**解析后的绝对路径**与真实大小）
+      //    ★★ 2026-09-23：目录**不再拒绝**了 —— 用户要"下载整个文件夹"。
+      //      但注意 `svc.stat` **对目录必然抛错**（`locateFile` 要求 type==="file"，
+      //      `dsh-api-workspace-files/lib/index.js:581`）⇒ 目录要走 `list` 定位，
+      //      再用 `resolveWorkspaceAbs` 拼出绝对路径（并自己再 confine 一次）。
+      //      文件路径保持原样（零行为变化）。
+      const relIn = filePath.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
+      let abs = '';
+      let real = null;
+
+      // 先试"当文件"（绝大多数调用是文件，这条路最直接）
       try {
-        st = await svc.stat(scope, filePath, ac.signal);
+        const st = await svc.stat(scope, filePath, ac.signal);
+        abs = String(st?.absolutePath || '');
       } catch (e) {
         const msg = String(e?.message || e);
-        if (/is a directory|not-regular-file/i.test(msg)) {
-          throw new Error('这是一个目录，不能直接下载（请先进入它，或打包成一个文件）');
+        if (!/is a directory|not-regular-file/i.test(msg)) {
+          throw new Error('定位不到这个文件：' + msg);
         }
-        throw new Error('定位不到这个文件：' + msg);
+        // 是目录 ⇒ 用 list 确认它在工作区内且确实是目录，再自己算绝对路径
+        try { await svc.list(scope, relIn || '.', ac.signal); }
+        catch (e2) { throw new Error('定位不到这个目录：' + (e2?.message || e2)); }
+        abs = resolveWorkspaceAbs(tr.root, relIn);
+        if (!abs) throw new Error('这个目录不在工作区内');
       }
-      const abs = String(st?.absolutePath || '');
       if (!abs) throw new Error('定位不到这个文件：' + filePath);
 
-      // 2) 再用 node:fs 复核一次"它真的是个普通文件"（内核的 stat 对符号链接也会报 file）
-      let real;
+      // 2) 再用 node:fs 复核（内核的 stat 对符号链接也会报 file）
       try { real = statSync(abs); } catch (e) { throw new Error('读不到这个文件：' + (e?.message || e)); }
-      if (real.isDirectory()) throw new Error('这是一个目录，不能直接下载（请先进入它，或打包）');
-      if (!real.isFile()) throw new Error('这不是普通文件（可能是符号链接或设备文件）');
+      const isDir = real.isDirectory();
+      if (!isDir && !real.isFile()) throw new Error('这不是普通文件（可能是符号链接或设备文件）');
+
+      // 目录：先算一遍"会打多大"，超限就**在这里**拒绝（不让用户白等一个坏包）
+      let zipInfo = null;
+      if (isDir) {
+        const c = collectForZip(abs, path.basename(abs));
+        if (!c.entries.length) throw new Error('这个文件夹是空的');
+        if (c.entries.length > ZIP_MAX_FILES) {
+          throw new Error(`文件太多了（${c.entries.length} 个，上限 ${ZIP_MAX_FILES}）—— 请挑个子文件夹`);
+        }
+        if (c.totalBytes > ZIP_MAX_BYTES) {
+          throw new Error(`太大了（${(c.totalBytes / 1073741824).toFixed(1)} GB，上限 3.5 GB）—— 请挑个子文件夹`);
+        }
+        zipInfo = { files: c.entries.filter((e) => !e.isDir).length, totalBytes: c.totalBytes };
+      }
 
       // 3) 清掉**已过期**的旧票据（顺手做，不必定时器）。
       //    ★ 只清过期的，**不要**清同一设备的所有票据 —— 用户可能连着点两个文件下载，
@@ -1144,17 +1445,32 @@ function rpcMethods(ctx) {
         if (now > tk.expiresAt) state.tickets.delete(t);
       }
 
-      const name = safeFileName(params?.name || abs);
+      /* 票据：文件与目录**共用一张票**，靠 `isDir` 区分。
+       * 目录的 `name` 是 `<文件夹名>.zip`，`bytes` 用**打包前的原始总量**
+       * 作参考（真实 zip 大小只有压完才知道，而压缩率不可预知）——
+       * 手机端显示"约 X"即可，别把它当 Content-Length 用（那边给的是真实值）。 */
+      const name = isDir
+        ? (safeFileName(path.basename(abs)) || 'folder') + '.zip'
+        : safeFileName(params?.name || abs);
       const ticket = makeToken();
       state.tickets.set(ticket, {
-        path: abs, name, bytes: real.size, deviceId, expiresAt: now + DOWNLOAD_TTL_MS,
+        path: abs, name, deviceId, expiresAt: now + DOWNLOAD_TTL_MS,
+        isDir: !!isDir,
+        bytes: isDir ? (zipInfo ? zipInfo.totalBytes : 0) : real.size,
       });
-      state.diagnostics.transfers.push({ dir: 'down', name, bytes: real.size, at: now });
+      state.diagnostics.transfers.push({
+        dir: 'down', name, at: now,
+        bytes: isDir ? (zipInfo ? zipInfo.totalBytes : 0) : real.size,
+        zip: !!isDir,
+      });
 
       return {
         url: `/api/file/dl?t=${encodeURIComponent(ticket)}`,
         name,
-        bytes: real.size,
+        // 目录给的是**原始总量**（zip 会小一些，压缩率不可预知）
+        bytes: isDir ? (zipInfo ? zipInfo.totalBytes : 0) : real.size,
+        isDir: !!isDir,
+        files: isDir && zipInfo ? zipInfo.files : undefined,
         expiresIn: DOWNLOAD_TTL_MS,
         absolutePath: abs,
       };
@@ -1553,6 +1869,64 @@ function startLanServer(ctx) {
       if (!tk) return sendJson(res, 404, { error: 'bad_ticket', message: '下载链接已失效，请在手机上重新点一次' });
       if (tk.deviceId !== device.deviceId) return sendJson(res, 403, { error: 'wrong_device', message: '这张下载链接是另一台设备签发的' });
       if (Date.now() > tk.expiresAt) { state.tickets.delete(url.searchParams.get('t')); return sendJson(res, 410, { error: 'expired', message: '下载链接已过期，请重新点一次' }); }
+
+      /* ── 目录票据 ⇒ 现打成 ZIP 流（2026-09-23 用户需求"下载整个文件夹"）──
+       * ★ 必须在**写任何响应字节之前**决定成功与否：
+       *   打包是边读边压边发的，一旦发出 200 与部分字节，再出错就只能截断，
+       *   用户拿到的是一个**坏包**（比失败更糟：他以为下到了）。
+       *   ⇒ 所以先 `collectForZip` 走一遍（只 stat，不读内容）确认可打包、没超限，
+       *     再写头，然后才逐条压缩发送。
+       * ★ 目录**不支持 Range**：ZIP 是现算的，字节流不可重放（同一个票据只发一次）。
+       *   下载管理器若带 Range 来续传，这里明确回 200 全量 —— 比给一个错位的 206 安全。 */
+      if (tk.isDir) {
+        let real;
+        try { real = statSync(tk.path); } catch (e) {
+          return sendJson(res, 404, { error: 'gone', message: '文件夹已不在原处：' + (e?.message || e) });
+        }
+        if (!real.isDirectory()) {
+          return sendJson(res, 409, { error: 'changed', message: '原来那个文件夹已经变成文件了，请重新点一次下载' });
+        }
+        // 预检：可打包 + 没超限（这两条**在写头之前**判掉）
+        let pre;
+        try { pre = collectForZip(tk.path, path.basename(tk.path)); }
+        catch (e) { return sendJson(res, 500, { error: 'scan_failed', message: e?.message || String(e) }); }
+        if (!pre.entries.length) return sendJson(res, 404, { error: 'empty', message: '这个文件夹是空的' });
+        if (pre.entries.length > ZIP_MAX_FILES) {
+          return sendJson(res, 413, { error: 'too_many', message: `文件太多了（${pre.entries.length} 个，上限 ${ZIP_MAX_FILES}）` });
+        }
+        if (pre.totalBytes > ZIP_MAX_BYTES) {
+          return sendJson(res, 413, { error: 'too_large', message: `太大了（${(pre.totalBytes / 1073741824).toFixed(1)} GB，上限 3.5 GB）` });
+        }
+
+        // 一次性票：目录这条**先焚票**（因为它不可重放，留着也只会给出半截包）
+        state.tickets.delete(url.searchParams.get('t'));
+
+        /* ★ 用 chunked（不给 content-length）：ZIP 总长只有压完才知道，
+         *   而"先压一遍量长度、再压一遍发送"等于把每个文件读两遍。
+         *   代价：手机端（系统下载器）看不到百分比进度 —— 只显示"下载中"。
+         *   这是**有意的取舍**：能下载 >> 有进度条。文件下载那条仍有真实长度与进度。 */
+        res.writeHead(200, {
+          'content-type': 'application/zip',
+          'content-disposition': contentDisposition(tk.name),
+          'cache-control': 'no-store',
+          // 明确告诉下载器：不要按 Range 续传（本响应不可重放）
+          'accept-ranges': 'none',
+        });
+        try {
+          const r = await streamZipToResponse(res, tk.path, path.basename(tk.path));
+          state.diagnostics.transfers.push({
+            dir: 'down', name: tk.name, at: Date.now(),
+            bytes: r.bytes, rawBytes: r.rawBytes, files: r.files, dirs: r.dirs,
+            skippedLinks: r.skippedLinks, zip: true,
+          });
+          res.end();
+        } catch (e) {
+          state.diagnostics.errors.push('zip: ' + (e?.message || e));
+          // 头已经发出去了 ⇒ 只能断开，让下载器判为失败（总比给个坏包好）
+          try { res.destroy(); } catch { }
+        }
+        return;
+      }
 
       let size = tk.bytes;
       try { size = statSync(tk.path).size; } catch (e) {

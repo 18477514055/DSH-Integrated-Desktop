@@ -606,6 +606,10 @@ pre.code[data-lang]::before {
 .file-size {
   margin-left: auto; flex: none; font-size: 11px; color: var(--text-2);
 }
+/* 文件夹的"打包下载"块（2026-09-23）：与上面的"进去看看"拉开一点距离 ——
+ * 它是一次**较慢**的动作（现打包、无百分比进度），视觉上该有个分隔，
+ * 免得用户以为点错了。 */
+.zipbox { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
 
 /* ── 权限档位 ───────────────────────────────────────── */
 .btn.danger { border-color: #f3c6c6; }

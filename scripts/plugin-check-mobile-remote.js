@@ -972,12 +972,105 @@ function rpc(token, method, params) {
           `list=${r1.status} dl=${r2.status} ul=${up3.status}`);
       }
 
-      // 目录不能被下载（必须明确拒绝，而不是给一个 0 字节的"文件"）
+      /* ══════════════════════════════════════════════════════════════
+       * 文件夹打包下载（2026-09-23 用户需求）
+       * ══════════════════════════════════════════════════════════════
+       * 用户原话：「手机上的下载文件，不再只是单个文件，而是可以下载整个文件夹。」
+       *
+       * ★★ 判据是**用独立的解压器把包解开、逐字节比对**，不是"我的代码说它对了"。
+       *   ZIP 是手写的（零依赖，见 desktop/index.js 的 ZIP 一节），
+       *   手写二进制格式最容易"看起来对、其实偏移错一个字节"——
+       *   而那种包在**某些**解压器上能开、另一些上报损坏，非常难查。
+       *   所以这里：下载 → 存盘 → **用 PowerShell 的 Expand-Archive（.NET 的
+       *   System.IO.Compression）解** → 比对每个文件的内容与目录结构。
+       *   .NET 的实现与我们完全无关 ⇒ 它认了才算数。 */
       if (dirItem) {
-        const dlDir = await rpc(token, "file.download", { sessionId: sid, path: dirItem.path });
-        check("目录被拒绝下载（不是给个空文件）",
-          dlDir.status === 500 && /目录/.test(String(dlDir.json && dlDir.json.message)),
-          dlDir.json && dlDir.json.message);
+        // 先造一个**内容可自证**的夹具目录：中文名 / 空格名 / 二进制 / 嵌套 / 空目录
+        const zipFix = path.join(ROOT, "mmr-probe", "zipfix");
+        const zipFixFiles = {
+          "a.txt": "hello 中文内容\n",
+          "sub/b with space.txt": "x".repeat(5000),
+          "sub/deep/c.bin": null,               // 二进制，单独写
+          "空目录/.keep": "",
+        };
+        try {
+          fs.mkdirSync(path.join(zipFix, "sub", "deep"), { recursive: true });
+          fs.mkdirSync(path.join(zipFix, "空目录"), { recursive: true });
+          for (const [rel, content] of Object.entries(zipFixFiles)) {
+            const abs = path.join(zipFix, rel);
+            if (content === null) fs.writeFileSync(abs, Buffer.from([0, 1, 2, 255, 254, 0, 7]));
+            else fs.writeFileSync(abs, content, "utf8");
+          }
+        } catch (e) { console.log("  ⚠ 造 zip 夹具失败：" + e.message); }
+
+        // ① zipInfo：只读地算"多大、多少个"
+        const zi = await rpc(token, "file.zipInfo", { sessionId: sid, path: "mmr-probe/zipfix" });
+        const z = zi.json && zi.json.result;
+        check("能预览文件夹打包信息（文件数 / 大小 / 上限）",
+          zi.status === 200 && z && z.files === 4 && z.dirs >= 2 && typeof z.totalBytes === "number",
+          z ? `${z.files} 文件 / ${z.dirs} 目录 / ${z.totalBytes} B → ${z.zipName}` : JSON.stringify(zi.json));
+        check("预览里给了 .zip 文件名（手机端据此命名下载）",
+          !!(z && /\.zip$/.test(z.zipName || "")), z ? z.zipName : "(无)");
+
+        // ② 真下载整个文件夹
+        const dlDir = await rpc(token, "file.download", { sessionId: sid, path: "mmr-probe/zipfix" });
+        const dz = dlDir.json && dlDir.json.result;
+        check("目录不再被拒绝，而是签一张 zip 票据",
+          dlDir.status === 200 && dz && dz.isDir === true && /\.zip$/.test(dz.name || ""),
+          dz ? `${dz.name}（${dz.files} 文件，原始 ${dz.bytes} B）` : JSON.stringify(dlDir.json));
+
+        if (dz && dz.url) {
+          const got = await fetch(`${LAN}${dz.url}&token=${encodeURIComponent(token)}`);
+          const buf = Buffer.from(await got.arrayBuffer());
+          check("下载到的确实是 ZIP（魔数 PK\\x03\\x04 + 末尾 EOCD）",
+            got.status === 200
+            && buf.subarray(0, 4).toString("hex") === "504b0304"
+            && buf.subarray(-22, -18).toString("hex") === "504b0506",
+            `HTTP ${got.status}, ${buf.length} B, 头=${buf.subarray(0, 4).toString("hex")}, 尾=${buf.subarray(-22, -18).toString("hex")}`);
+          check("响应的 content-type 是 application/zip",
+            /application\/zip/i.test(got.headers.get("content-type") || ""),
+            got.headers.get("content-type") || "(无)");
+
+          // ③ ★ 用**独立解压器**（.NET）解开，再逐字节比对
+          const zipFile = path.join(ROOT, "mmr-probe", "dl.zip");
+          const outDir = path.join(ROOT, "mmr-probe", "unzipped");
+          try { fs.writeFileSync(zipFile, buf); } catch (e) { console.log("  ⚠ 写 zip 失败：" + e.message); }
+          const ex = spawnSync("powershell", ["-NoProfile", "-Command",
+            `Expand-Archive -LiteralPath '${zipFile}' -DestinationPath '${outDir}' -Force`],
+            { encoding: "utf8", windowsHide: true });
+          const inner = path.join(outDir, "zipfix");
+          const unpacked = fs.existsSync(inner);
+          check("独立解压器（.NET Expand-Archive）能解开这个包",
+            ex.status === 0 && unpacked,
+            ex.status === 0 ? (unpacked ? "解出 zipfix/ 目录" : "解压成功但没找到内层目录") : String(ex.stderr || "").slice(0, 200));
+
+          if (unpacked) {
+            let allOk = true;
+            const detail = [];
+            for (const [rel, content] of Object.entries(zipFixFiles)) {
+              const p = path.join(inner, rel);
+              let ok = false, note = "";
+              try {
+                const b = fs.readFileSync(p);
+                if (content === null) { ok = b.equals(Buffer.from([0, 1, 2, 255, 254, 0, 7])); note = b.join(","); }
+                else { ok = b.toString("utf8") === content; note = `${b.length} B`; }
+              } catch (e) { note = "读不到：" + e.message; }
+              if (!ok) allOk = false;
+              detail.push(`${rel}=${ok ? "✓" : "✗(" + note + ")"}`);
+            }
+            check("解出来的每个文件内容与原文件**逐字节一致**（含中文名/空格名/二进制）",
+              allOk, detail.join(" "));
+            check("空目录也被保留（ZIP 目录条目写对了）",
+              fs.existsSync(path.join(inner, "空目录")), "空目录/");
+          }
+
+          // ④ 一次性：同一张目录票再拉一次必须 404（ZIP 不可重放）
+          const again = await fetch(`${LAN}${dz.url}&token=${encodeURIComponent(token)}`);
+          check("目录下载票据是一次性的（ZIP 现算，不可重放）",
+            again.status === 404, `HTTP ${again.status}`);
+        }
+      } else {
+        console.log("  SKIP  文件夹打包下载（根目录下没有子目录）");
       }
 
       /* ★ 收尾：把探针写进工作区的文件**删掉**。
@@ -1106,10 +1199,72 @@ function rpc(token, method, params) {
         check("新宿主下**不该**出现「旧版本」提示", D.unsupported === false,
           D.unsupported ? "出现了 unsupportedBox" : "OK");
 
+        /* ── 文件夹打包下载的**界面入口**（2026-09-23 用户需求）──
+         * 用户原话：「手机上的下载文件，不再只是单个文件，而是可以下载整个文件夹。」
+         * 这里在真浏览器里：进「选电脑文件」→ 点一个**文件夹** → 断言抽屉里
+         * 出现「下载整个文件夹（zip）」并且**算出了大小**（不是永远停在"正在算"）。
+         * ★ 只断言"有那个按钮"不够 —— 按钮 disabled 直到 zipInfo 回来，
+         *   所以必须同时断言它**变成了可点**（说明 RPC 真的通了）。 */
+        const zipUiRaw = await cdpEval(pws, `(async () => {
+          // 关掉当前抽屉，重开「选电脑文件」
+          const s = document.getElementById('sheet');
+          if (s) s.classList.add('hidden');
+          document.getElementById('plusBtn').click();
+          await new Promise(r => setTimeout(r, 300));
+          const items = Array.from(document.querySelectorAll('#sheetBody .plus-item'));
+          const pick = items.find(b => (b.querySelector('.plus-label')||{}).textContent === '选电脑文件');
+          if (!pick) return JSON.stringify({ err: 'no 选电脑文件' });
+          pick.click();
+          await new Promise(r => setTimeout(r, 2500));
+          // 找一个文件夹行（📁）
+          const rows = Array.from(document.querySelectorAll('#sheetBody .file-item'));
+          const dirRow = rows.find(r => /📁/.test((r.querySelector('.file-ico')||{}).textContent || ''));
+          if (!dirRow) return JSON.stringify({ err: 'no dir row', rows: rows.length });
+          const dirName = (dirRow.querySelector('.file-name')||{}).textContent || '';
+          dirRow.click();
+          await new Promise(r => setTimeout(r, 3000));
+          const b = document.getElementById('sheetBody');
+          const names = Array.from(b.querySelectorAll('.cmd-name')).map(e => e.textContent.trim());
+          const zipBtn = Array.from(b.querySelectorAll('.btn')).find(x =>
+            /下载整个文件夹/.test((x.querySelector('.cmd-name')||{}).textContent || ''));
+          const desc = zipBtn ? ((zipBtn.querySelector('.cmd-desc')||{}).textContent || '') : '';
+          return JSON.stringify({
+            dirName, title: document.getElementById('sheetTitle').textContent,
+            names, hasZipBtn: !!zipBtn, zipDisabled: zipBtn ? zipBtn.disabled : null,
+            desc, hasGoIn: names.some(n => /进去看看/.test(n)),
+          });
+        })()`, 60000);
+        const ZU = JSON.parse(zipUiRaw);
+        console.log(`     点文件夹「${ZU.dirName}」→ 抽屉「${ZU.title}」：${(ZU.names || []).join(" / ")}`);
+        console.log(`     zip 按钮：存在=${ZU.hasZipBtn} 可点=${ZU.zipDisabled === false} 说明="${ZU.desc}"`);
+        check("点文件夹会开出动作抽屉（而不是直接进去）",
+          ZU.hasGoIn === true, (ZU.names || []).join("、") || ZU.err || "(无)");
+        check("抽屉里有「下载整个文件夹（zip）」",
+          ZU.hasZipBtn === true, (ZU.names || []).join("、") || "(无)");
+        check("zip 按钮真的算出了大小并可点（zipInfo RPC 通了）",
+          ZU.zipDisabled === false && /个文件/.test(ZU.desc || ""),
+          ZU.desc || "(说明为空)");
+        // 收尾：关掉抽屉
+        await cdpEval(pws, `(() => { const s = document.getElementById('sheet'); if (s) s.classList.add('hidden'); return 1; })()`);
+
         /* ── 跨工作区切换条（2026-09-22 用户需求）──
          * 用户原话：「有没有办法让手机可以下载三个工作区的文件？以及向三个工作区发送文件。」
          * 这里在**真浏览器 + 新宿主**里真点一下别的工作区胶囊，断言**落点真的变了**
-         * —— 只断言"胶囊出现了"是不够的（那可能只是个装饰）。 */
+         * —— 只断言"胶囊出现了"是不够的（那可能只是个装饰）。
+         * ★ 注意：上面那段（文件夹打包）把抽屉留在了"选电脑文件"上，
+         *   所以这里**必须先重新开一次「传到电脑」**，否则量到的是空抽屉
+         *   （实测：不重开就会报"0 颗胶囊"这个**夹具问题**，不是功能问题）。 */
+        await cdpEval(pws, `(async () => {
+          const s = document.getElementById('sheet');
+          if (s) s.classList.add('hidden');
+          document.getElementById('plusBtn').click();
+          await new Promise(r => setTimeout(r, 300));
+          const items = Array.from(document.querySelectorAll('#sheetBody .plus-item'));
+          const up = items.find(b => (b.querySelector('.plus-label')||{}).textContent === '传到电脑');
+          if (up) up.click();
+          await new Promise(r => setTimeout(r, 2800));
+          return 1;
+        })()`, 30000);
         const wsRaw2 = await cdpEval(pws, `(async () => {
           const b2 = document.getElementById('sheetBody');
           const pills = Array.from(b2.querySelectorAll('.wspill'));

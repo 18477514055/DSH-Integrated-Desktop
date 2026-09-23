@@ -1414,17 +1414,13 @@
             b.appendChild(el('span', 'file-size', fmtBytes(it.size)));
           }
           b.onclick = function () {
-            if (isDir) { openFileSheet(it.path, curRoot); return; }
-            /* 文件有三种用法，让用户选（图片尤其需要 —— 直接引用图片路径
-             * 模型只能看到路径，而"读成图片发出去"它才真的看得见图）：
-             *   · 引用路径：把官方 @提及 文本填进输入框（纯文本，内核靠系统
-             *     提示词让模型用 read 工具读 —— 官方就是这么设计的）
-             *   · 读成图片：走 workspaceFiles.readAll 拿 base64，塞进待发图片
-             *     列表（与手机相册发的图走**完全相同**的发送路径）
-             *   · 下载到手机：交给系统下载器（2026-09-22 新增）
-             * 2026-09-22 改：**所有文件**都进这个抽屉，不再只给图片。
-             * 旧写法对非图片直接 insertMention，于是"下载"这个动作
-             * 在非图片上根本没有入口 —— 而用户要下载的恰恰是 zip / 源码。 */
+            /* ★ 目录现在也有**两个**用法（2026-09-23 用户需求：
+             *   「手机上的下载文件，不再只是单个文件，而是可以下载整个文件夹」）：
+             *     · 进去看看（原行为，一个字没改）
+             *     · 把整个文件夹打包下载（新增）
+             *   所以目录也要进动作抽屉 —— 旧写法是直接 openFileSheet(进去)，
+             *   那样"打包下载"就永远没有入口。 */
+            if (isDir) { openFileActions(it, curRoot); return; }
             openFileActions(it, curRoot);
           };
           body.appendChild(b);
@@ -1450,9 +1446,67 @@
     addNote('已引用：' + (root ? it.mention : it.path));
   }
 
-  /** 文件：问"引用路径 / 读成图片 / 下载到手机"。 */
+  /** 文件 / 文件夹：问"进去 / 引用路径 / 读成图片 / 下载到手机"。 */
   function openFileActions(it, root) {
-    var isImg = /\.(png|jpe?g|webp|gif|bmp|avif)$/i.test(it.path);
+    var isDir = it.kind === 'directory';
+    var isImg = !isDir && /\.(png|jpe?g|webp|gif|bmp|avif)$/i.test(it.path);
+
+    /* ── 目录：只给两件事（进去看 / 打包下载）─────────────────────────
+     * 目录**不给**"引用路径"和"读成图片"：
+     *   · 引用路径对目录意义不大（用户点目录就是想去看看里面有什么）；
+     *   · 读成图片更不可能。少给两条就是少两次误触。 */
+    if (isDir) {
+      openSheet('这个文件夹怎么用', function (body) {
+        body.appendChild(el('div', 'empty', it.path));
+        var go = el('button', 'btn block');
+        go.appendChild(el('div', 'cmd-name', '进去看看'));
+        go.appendChild(el('div', 'cmd-desc', '列出里面的文件'));
+        go.onclick = function () { openFileSheet(it.path, root); };
+        body.appendChild(go);
+
+        /* ★ 打包下载（2026-09-23 用户需求）：
+         *   先问 zipInfo（**只读地算一遍**"多大、多少个文件"），
+         *   把数字摆在按钮下面，让用户在点之前就知道要下多少。
+         *   超限的话这里就直接说清，不让他白等一个坏包。 */
+        var wrap = el('div', 'zipbox');
+        var d = el('button', 'btn block');
+        d.appendChild(el('div', 'cmd-name', '下载整个文件夹（zip）'));
+        var desc = el('div', 'cmd-desc', '正在算大小…');
+        d.appendChild(desc);
+        d.disabled = true;
+        wrap.appendChild(d);
+        body.appendChild(wrap);
+
+        var zp = { sessionId: current, path: it.path };
+        if (root) zp.root = root;
+        api('file.zipInfo', zp).then(function (z) {
+          if (z.tooMany) {
+            desc.textContent = '文件太多（' + (z.files + z.dirs) + ' 个，上限 ' + z.maxFiles + '）—— 请挑个子文件夹';
+            return;
+          }
+          if (z.tooBig) {
+            desc.textContent = '太大了（' + fmtBytes(z.totalBytes) + '，上限 ' + fmtBytes(z.maxBytes) + '）—— 请挑个子文件夹';
+            return;
+          }
+          desc.textContent = z.files + ' 个文件'
+            + (z.dirs ? ' + ' + z.dirs + ' 个文件夹' : '')
+            + '，原始 ' + fmtBytes(z.totalBytes) + '（zip 会小一些）';
+          if (z.skippedLinks) {
+            desc.textContent += '；跳过 ' + z.skippedLinks + ' 个符号链接';
+          }
+          d.disabled = false;
+          d.onclick = function () { startDownload({ path: it.path, name: z.zipName }, root, true); };
+        }).catch(function (e) {
+          if (e.unknownMethod) {
+            desc.textContent = '电脑端插件是旧版本，打包下载不可用（需重启客户端）';
+          } else {
+            desc.textContent = '算大小失败：' + e.message;
+          }
+        });
+      });
+      return;
+    }
+
     openSheet(isImg ? '这张图怎么用' : '这个文件怎么用', function (body) {
       body.appendChild(el('div', 'empty', root ? it.mention : it.path));
       var a = el('button', 'btn block');
@@ -1531,10 +1585,18 @@
     return location.origin + u;
   }
 
-  function startDownload(it, root) {
+  function startDownload(it, root, isDir) {
     if (!current) { addNote('⚠ 先打开一个会话'); return; }
-    var b = el('div', 'empty', '正在准备下载…');
-    openSheet('下载到手机', function (body) { body.appendChild(b); });
+    var b = el('div', 'empty', isDir ? '正在准备打包…' : '正在准备下载…');
+    openSheet(isDir ? '打包下载文件夹' : '下载到手机', function (body) {
+      body.appendChild(b);
+      if (isDir) {
+        body.appendChild(el('div', 'xfer-note',
+          '电脑端会边压缩边发送，不占额外磁盘。\n'
+          + '★ 打包是现算的，所以这一条**没有百分比进度** —— 下载器只显示"下载中"。\n'
+          + '大文件夹请耐心等一会儿，别反复点。'));
+      }
+    });
     var params = { sessionId: current, path: it.path, name: it.name };
     if (root) params.root = root;      // ★ 跨工作区：指定要下载的那个工作区
     api('file.download', params)
@@ -1544,25 +1606,29 @@
          *   所以 token 只能走查询参数（宿主那边 `url.searchParams.get('token')`
          *   就是为这条路留的，SSE 同理）。 */
         url += (url.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(token);
+        var label = r.name || 'file';
+        var sizeTxt = r.bytes ? fmtBytes(r.bytes) : '';
         if (isNative()) {
-          try { window.dshNative.download(url, r.name || 'file'); } catch (e) { }
+          try { window.dshNative.download(url, label); } catch (e) { }
           closeSheet();
-          addNote('已交给系统下载：' + (r.name || '') + '（' + fmtBytes(r.bytes) + '）');
+          addNote((r.isDir ? '已交给系统下载（zip）：' : '已交给系统下载：') + label
+            + (sizeTxt ? '（原始 ' + sizeTxt + '）' : ''));
           return;
         }
         // 浏览器：交给浏览器自己的下载器（同样带原生进度）
         var a = document.createElement('a');
-        a.href = url; a.download = r.name || 'file';
+        a.href = url; a.download = label;
         a.rel = 'noopener';
         document.body.appendChild(a); a.click();
         setTimeout(function () { document.body.removeChild(a); }, 0);
         closeSheet();
-        addNote('已开始下载：' + (r.name || '') + '（' + fmtBytes(r.bytes) + '）');
+        addNote((r.isDir ? '已开始打包下载：' : '已开始下载：') + label
+          + (sizeTxt ? '（原始 ' + sizeTxt + '）' : ''));
       })
       .catch(function (e) {
         closeSheet();
         if (e.unknownMethod) { addNote('⚠ 电脑端插件是旧版本，下载不可用（需重启客户端）', true); return; }
-        addNote('⚠ 下载失败：' + e.message, true);
+        addNote('⚠ ' + (isDir ? '打包' : '下载') + '失败：' + e.message, true);
       });
   }
 
