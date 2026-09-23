@@ -65,6 +65,8 @@ const CHECKS = [
       "localInstallerDirs", "localInstallerFound",
       "dsh:plugins:install-many", "installOneFromIndex",
       "dsh:first-run:state", "dsh:first-run:done", "firstRunDue", "maybeAutoOpenFirstRun",
+      // ★ 0.2.10：退出要能退干净 —— 认领复用的内核、退出时一起关（见 docs/退出退不干净-2026-09-23.md）
+      "claimAdoptedKernel", "adoptedKernelPid", "shutdownKernels", "quitApp", "armQuitOnFileHook",
     ],
   },
   {
@@ -93,7 +95,8 @@ const CHECKS = [
   },
   {
     file: "src/kernel.js",
-    marks: ["dsh-home"],
+    // ★ 0.2.10：判"这个内核是不是本应用拉起来的"要用的三个原语
+    marks: ["dsh-home", "ourKernelProcess", "portOwner", "waitPortFree"],
   },
 ];
 
@@ -258,6 +261,33 @@ function main() {
     console.log(`  FAIL  产物里带了 ${pluginNames.length} 个内置插件 —— 0.2.6 起必须不带。`
       + `\n        插件现在由「首次安装向导」从插件仓库拉（src/first-run.js + src/plugin-catalog.js）。`
       + `\n        若是故意要恢复随包分发，请同时改这里与 AGENTS.md §7，别只改 package.json。`);
+  }
+
+  // ── 产物里的版本号必须等于 package.json 的版本 ────────────────────
+  //   为什么单列一条：`publish-release.py` 是**按 tag 幂等**的，忘了改版本号就把上一版
+  //   已发布的附件无声地换掉（AGENTS.md §8 记过这个坑）。这条断言让"产物属于哪一版"
+  //   再也不能靠人记得。同时也回答装完客户端后「关于」里该显示什么。
+  {
+    const pj = nodeAt(["package.json"]);
+    if (!pj || pj.size === undefined) {
+      structBad += 1;
+      console.log("  FAIL  产物里没有 package.json");
+    } else {
+      // ★ 上面那个 `fd` 早就 close 了（标记那一段用完就关）⇒ 这里必须自己开一个，
+      //   否则 `fs.readSync(已关闭的 fd)` 直接 EBADF。
+      const fd3 = fs.openSync(asar, "r");
+      const buf = Buffer.alloc(pj.size);
+      fs.readSync(fd3, buf, 0, pj.size, base + parseInt(pj.offset, 10));
+      fs.closeSync(fd3);
+      let packedVersion = "?";
+      try { packedVersion = JSON.parse(buf.toString("utf8")).version || "?"; } catch { /* 读不出 */ }
+      const diskVersion = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
+      console.log(`  产物里的版本号: ${packedVersion}（磁盘 package.json: ${diskVersion}）`);
+      if (packedVersion !== diskVersion) {
+        structBad += 1;
+        console.log(`  FAIL  产物版本与 package.json 不一致 —— 这个包不是当前这一版的构建`);
+      }
+    }
   }
 
   console.log("");
