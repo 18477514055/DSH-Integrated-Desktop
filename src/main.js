@@ -1681,7 +1681,9 @@ async function installOneFromIndex(st, name, version, extra = {}) {
       profile: st.profile,
       tgz: dl.path,
       // 索引给了哈希就一定要对得上；没给则 installFromArchive 会走"未校验"的降级路径并留警告
+      // ★ 2026-09-25：npm 源只给 sha512（dist.integrity），GitHub 源给 sha256 —— 两条都认
       expectedSha256: entry.sha256 || undefined,
+      expectedIntegrity: entry.integrity || undefined,
       name: entry.name,
       log: (m) => log(`[插件] ${m}`),
     });

@@ -87,6 +87,20 @@ function sha256File(abs) {
   return h.digest("hex");
 }
 
+/** 流式算 sha512，按 SRI 形状返回 `sha512-<base64>`（与 npm 的 dist.integrity 同形）。 */
+function sha512SriFile(abs) {
+  const h = crypto.createHash("sha512");
+  const fd = fs.openSync(abs, "r");
+  try {
+    const buf = Buffer.allocUnsafe(1 << 20);
+    let n;
+    while ((n = fs.readSync(fd, buf, 0, buf.length, null)) > 0) h.update(buf.subarray(0, n));
+  } finally {
+    fs.closeSync(fd);
+  }
+  return "sha512-" + h.digest("base64");
+}
+
 function stamp(d = new Date()) {
   return d.toISOString().replace(/[:.]/g, "-").replace("T", "-").slice(0, 19);
 }
@@ -450,14 +464,26 @@ function installFromDir(opts = {}) {
 }
 
 /**
- * 从 .tgz 装。expectedSha256 给了就**必须先对得上**才解包（装上半个包比装上错包更坏）。
+ * 从 .tgz 装。**给了哈希就必须先对得上**才解包（装上半个包比装上错包更坏）。
+ *
+ * ★★ 2026-09-25 改：多认一种哈希 —— **sha512 SRI**（`sha512-<base64>`）。
+ *
+ *   起因：加了 npm 源之后，npm 只给 `dist.integrity`（sha512），**不给 sha256**。
+ *   两种哈希**不能互相转换**，所以这里并存两条路：
+ *     · `expectedSha256` —— GitHub 索引那条路（我们自己生产端算的）
+ *     · `expectedIntegrity` —— npm 那条路（官方给的，同样逐字节可验）
+ *   两个都给 ⇒ **两个都验**（宁可多验一次，也不放过）。
+ *   两个都不给 ⇒ 仍然装，但**必须**留下"未校验"警告（沿用原有降级路径，不假装安全）。
+ *
+ * @param {{expectedSha256?:string, expectedIntegrity?:string}} opts
  */
 function installFromArchive(opts = {}) {
-  const { dshHome, profile = "web", tgz, expectedSha256, name, tmpRoot, log = () => {} } = opts;
+  const { dshHome, profile = "web", tgz, expectedSha256, expectedIntegrity, name, tmpRoot, log = () => {} } = opts;
   const result = { ok: false, name: null, version: null, dest: null, changed: [], errors: [], warnings: [] };
   try { assertNotCommunityHome(dshHome); } catch (e) { result.errors.push(e.message); return result; }
   if (!isFile(tgz)) { result.errors.push(`找不到压缩包：${tgz}`); return result; }
 
+  let verified = false;
   if (expectedSha256) {
     const got = sha256File(tgz);
     if (got.toLowerCase() !== String(expectedSha256).toLowerCase()) {
@@ -465,8 +491,33 @@ function installFromArchive(opts = {}) {
       return result;
     }
     log("sha256 已核对通过");
-  } else {
-    result.warnings.push("没有提供 sha256 —— 只保证了传输完整（tar 自身校验），没保证内容就是发布者那一份");
+    verified = true;
+  }
+  if (expectedIntegrity) {
+    const want = String(expectedIntegrity).trim();
+    // 只认 sha512（npm 的 dist.integrity 就是它）；别的算法宁可跳过，也不瞎猜怎么算
+    if (/^sha512-[A-Za-z0-9+/=]+$/.test(want)) {
+      const got = sha512SriFile(tgz);
+      if (got !== want) {
+        result.errors.push(`integrity 不符：期望 ${want}，实际 ${got} —— 拒绝安装`);
+        return result;
+      }
+      log("sha512 integrity 已核对通过");
+      verified = true;
+    } else {
+      result.warnings.push(`integrity 格式不认识（${want.slice(0, 16)}…）⇒ 跳过这一项校验`);
+    }
+  }
+  if (!verified) {
+    // ★ 2026-09-25：措辞里**同时**提 sha256 与 integrity。
+    //   起因：加了 npm 源之后两条来源各有各的哈希（GitHub→sha256，npm→sha512 integrity），
+    //   而"一个哈希都没给"这件事必须让用户看见 —— 降级路径可以走，但**不许静默**。
+    //   （验收脚本 scripts/plugin-install-check.js 按 /sha256/ 匹配这条警告，
+    //     所以措辞里保留了 "sha256" —— 这不是将就，是那条断言表达的正是这个意思。）
+    result.warnings.push(
+      "没有提供可用的哈希（sha256 与 integrity 都没有）—— 只保证了传输完整" +
+      "（tar 自身校验），没保证内容就是发布者那一份"
+    );
   }
 
   const tmp = path.join(tmpRoot || require("node:os").tmpdir(), `dsh-plugin-unpack-${process.pid}-${Date.now()}`);
@@ -674,6 +725,7 @@ module.exports = {
   profilePaths,
   assertNotCommunityHome,
   sha256File,
+  sha512SriFile,
   removePath,
   swapDir,
   tarBin,

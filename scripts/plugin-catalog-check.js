@@ -166,10 +166,27 @@ section("⑤ groupByName —— 同名的多个版本，谁才是「最新」");
   chk(a && a.latest.version === "0.2.10", "★ 最新版挑的是 0.2.10 而不是 0.2.9", a ? a.latest.version : "无");
   chk(a.versions.length === 2 && a.versions[0].version === "0.2.10", "版本列表从高到低排");
 
-  const dev = C.groupByName([mk("dsh-normal", "1.0.0"), mk("dsh-plugin-uploader", "0.1.2")]);
-  chk(dev[dev.length - 1].name === "dsh-plugin-uploader", "★ 开发工具排到最后（普通插件在前）");
+  // ★★ 2026-09-25 修正：这三条断言**曾经是错的**（长期 FAIL，被当成"旧账"）。
+  //
+  //   原断言假设 `DEV_ONLY_FALLBACK` 里有 `dsh-plugin-uploader`，
+  //   但那份名单 **2026-09-23 被刻意清空了** —— 用户原话：
+  //     「我认为它应该是一个普通插件，而不是只局限在开发者工具之上。」
+  //   （`src/plugin-catalog.js` 里 `DEV_ONLY_FALLBACK` 上方那段注释就是这件事，
+  //     而且 commit `814c5cb`「上传器不再是「开发者工具」」也是同一件事。）
+  //   ⇒ **不是代码坏了，是断言没跟着改**。
+  //     这类"长期 FAIL"最危险的地方在于：它会让真 FAIL 混在噪音里没人看。
+  //   现在改成锁**新事实**，并且**用一个自造的 tier=dev 条目**去验"排序"这条规则本身
+  //   （否则"开发工具排最后"这条断言会因为没有开发工具而变得空洞）。
+  const dev = C.groupByName([
+    mk("dsh-normal", "1.0.0"),
+    C.normalizeEntry({ ...GOOD, name: "dsh-dev-tool", tier: "dev" }).entry,
+  ]);
+  chk(dev[dev.length - 1].name === "dsh-dev-tool", "★ 开发工具排到最后（普通插件在前）");
   chk(dev[dev.length - 1].devOnly === true, "并标了 devOnly");
   chk(dev[0].devOnly === false, "普通插件 devOnly=false");
+  chk(C.DEV_ONLY_FALLBACK.size === 0,
+    "★ 兜底名单现在是空的（2026-09-23 刻意清空：上传器是普通插件）",
+    String(C.DEV_ONLY_FALLBACK.size));
 
   chk(C.groupByName([]).length === 0, "空输入 → 空输出");
 }
@@ -179,10 +196,14 @@ section("⑥ isDevOnly —— 优先读索引字段，读不到才退回落名�
 // ═════════════════════════════════════════════════════════════════════════
 {
   const mk = (name, extra = {}) => C.normalizeEntry({ ...GOOD, name, ...extra }).entry;
-  chk(C.isDevOnly(mk("dsh-plugin-uploader")) === true, "落名单里的名字 ⇒ 开发工具");
+  // ★ 2026-09-25 修正：原来断言「dsh-plugin-uploader 在兜底名单里 ⇒ 是开发工具」，
+  //   但那份名单 2026-09-23 已刻意清空（上传器改判为普通插件）。
+  //   现在锁的是**机制**：名单空 ⇒ 不在名单里的一律不是；而 tier/keywords/hidden 仍能判。
+  chk(C.isDevOnly(mk("dsh-plugin-uploader")) === false,
+    "★ 上传器**不再**被当开发者工具（2026-09-23 起它是普通插件）");
   chk(C.isDevOnly(mk("dsh-whatever")) === false, "不在名单里 ⇒ 不是");
   chk(C.isDevOnly(mk("dsh-whatever", { tier: "dev" })) === true, "★ 索引 tier=dev ⇒ 开发工具（生产端补字段后自动生效）");
-  chk(C.isDevOnly(mk("dsh-plugin-uploader", { tier: "normal" })) === false, "★ 索引说 normal 就听索引的（覆盖落名单）");
+  chk(C.isDevOnly(mk("dsh-plugin-uploader", { tier: "normal" })) === false, "★ 索引说 normal 就听索引的");
   chk(C.isDevOnly(mk("dsh-x", { hidden: true })) === true, "索引 hidden=true ⇒ 开发工具");
   chk(C.isDevOnly(mk("dsh-x", { keywords: ["dev"] })) === true, "keywords 里有 dev ⇒ 开发工具");
 }
@@ -352,7 +373,10 @@ section("⑧ 拿线上真实索引跑一遍（连不上就 SKIP，不当成通�
     chk(ms && ms.latest.version === "0.1.1", "dsh-multi-session 最新版 = 0.1.1", ms ? ms.latest.version : "无");
     chk(ms && ms.latest.downloadUrl.startsWith("https://github.com/"), "下载地址是 GitHub");
     const up = g.find((x) => x.name === "dsh-plugin-uploader");
-    chk(up && up.devOnly === true, "★ 上传器被认成开发工具（默认不勾）");
+    // ★ 2026-09-25 修正：这条原断言「上传器必须被认成开发工具」**已经过期** ——
+    //   2026-09-23 起上传器就是**普通插件**（兜底名单清空 + commit 814c5cb）。
+    //   现在反过来锁：**它必须是普通插件**，否则界面上它会缩进"开发者工具"里、默认不勾。
+    chk(up && up.devOnly === false, "★ 上传器是**普通插件**（2026-09-23 起，默认就该勾）");
     // ★★ 别把外面世界的版本号写死在断言里 —— 生产端随时会发新版本。
     //    第一版这里写死 "0.1.2"，结果写这份脚本的**当天**它就变成了 0.1.4（假 FAIL）。
     //    改成**自洽判据**：groupByName 挑出的「最新」，必须等于索引里这个包的最高版本
@@ -371,7 +395,95 @@ section("⑧ 拿线上真实索引跑一遍（连不上就 SKIP，不当成通�
       "★ 每组的最新版都确实是该组的第一条（排序自洽）");
   }
 
-  // ── 收尾 ──
+  // ═════════════════════════════════════════════════════════════════════════
+section("⑨ npm 源（2026-09-25 加：没梯子时唯一通的那条）");
+// ═════════════════════════════════════════════════════════════════════════
+{
+  // ── ⑨a 白名单：npm registry 必须在，且**不能顺手把第三方镜像也放进来** ──
+  chk(C.ALLOWED_HOSTS.includes("registry.npmjs.org"),
+    "★ 白名单里有 registry.npmjs.org（没它 = 没梯子的用户装不了插件）");
+  chk(!C.ALLOWED_HOSTS.some((h) => /npmmirror|taobao|cnpm/i.test(h)),
+    "★ 白名单里**没有**第三方镜像（淘宝镜像更快，但那是别人的信任决定，不许顺手加）",
+    C.ALLOWED_HOSTS.join(","));
+  chk(C.NPM_REGISTRY === "https://registry.npmjs.org", "npm registry 常量是官方地址且 https");
+
+  // ── ⑨b 地址拼装：用 /latest 而不是整包元数据 ──
+  chk(C.npmLatestUrl("dsh-int-multi-session") === "https://registry.npmjs.org/dsh-int-multi-session/latest",
+    "npmLatestUrl 拼对了", C.npmLatestUrl("dsh-int-multi-session"));
+  chk(C.npmLatestUrl("@scope/pkg").includes("%2F"),
+    "★ 带 scope 的包名要转义 /（否则拼出的是另一个地址）", C.npmLatestUrl("@scope/pkg"));
+
+  // ── ⑨c normalizeNpmLatest：把 npm 元数据变成内部条目 ──
+  const fakeNpm = {
+    name: "dsh-int-demo", version: "1.2.3",
+    description: "演示用",
+    dist: {
+      tarball: "https://registry.npmjs.org/dsh-int-demo/-/dsh-int-demo-1.2.3.tgz",
+      integrity: "sha512-" + "A".repeat(86) + "==",
+    },
+  };
+  const nn = C.normalizeNpmLatest("dsh-int-demo", fakeNpm);
+  chk(!!nn.entry, "★ 合法 npm 元数据能变成条目");
+  if (nn.entry) {
+    chk(nn.entry.version === "1.2.3" && nn.entry.name === "dsh-int-demo", "name/version 带对了");
+    chk(nn.entry.integrity.startsWith("sha512-"), "★ integrity（sha512）带过来了");
+    chk(nn.entry.sha256 === "", "★ sha256 刻意留空（npm 不给 sha256，不许瞎填）");
+    chk(nn.entry.source === "npm", "★ 标了 source=npm（验收要能分清来源）");
+    chk(nn.entry.npmUrl === C.NPM_PAGE_BASE + "dsh-int-demo", "npmUrl 给了（界面能画那个按钮）");
+    chk(C.isAllowedDownloadUrl(nn.entry.downloadUrl), "★ npm 的 tarball 地址能过白名单");
+  }
+  // 坏数据：不许猜
+  const nnBad = C.normalizeNpmLatest("x", { version: "1.0.0", dist: { tarball: "https://evil.example.com/a.tgz" } });
+  chk(nnBad.entry === null, "★ 非白名单主机的 tarball ⇒ 整条拒绝（不猜、不放行）");
+  const nnNoVer = C.normalizeNpmLatest("x", { dist: { tarball: "https://registry.npmjs.org/x/-/x-1.tgz" } });
+  chk(nnNoVer.entry === null, "缺 version ⇒ 拒绝");
+
+  // ── ⑨d mergeSources：同名同版本时 GitHub 优先（它带 sha256，校验更强）──
+  const hubE = { name: "a", version: "1.0.0", sha256: "b".repeat(64), source: "hub" };
+  const npmE = { name: "a", version: "1.0.0", sha256: "", integrity: "sha512-x", source: "npm" };
+  const merged = C.mergeSources([hubE], [npmE]);
+  chk(merged.length === 1, "★ 同名同版本只留一条（去重）", String(merged.length));
+  chk(merged[0].sha256 === "b".repeat(64), "★ 去重时 GitHub 那条赢（它带 sha256）");
+  const merged2 = C.mergeSources([hubE], [{ ...npmE, version: "2.0.0" }]);
+  chk(merged2.length === 2, "不同版本两条都留（让 groupByName 去排）", String(merged2.length));
+
+  // ── ⑨e 种子清单：全新机器 + 没梯子 + 没缓存时，靠它兜底 ──
+  chk(Array.isArray(C.SEED_PACKAGES) && C.SEED_PACKAGES.length >= 3,
+    "★ 有包名种子清单（npm 搜索接口不做名称匹配，只能靠写死的种子）",
+    String(C.SEED_PACKAGES.length));
+  chk(C.SEED_PACKAGES.every((n) => n.startsWith("dsh-int-")),
+    "★ 种子里全是我们自己的 dsh-int-* 命名");
+
+  // ── ⑨f 真连一次 npm（连不上 SKIP，不当通过）──
+  //   判据是"**真拿到** tarball 地址与 integrity"，不是"函数没抛错"。
+  const https = require("node:https");
+  const getJson = (u, ms = 12000) => new Promise((resolve, reject) => {
+    const req = https.get(u, { headers: { "User-Agent": "dsh-catalog-check", Accept: "application/json" }, timeout: ms }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error("HTTP " + res.statusCode)); }
+      let s = ""; res.setEncoding("utf8");
+      res.on("data", (d) => { s += d; });
+      res.on("end", () => { try { resolve(JSON.parse(s)); } catch (e) { reject(e); } });
+    });
+    req.on("timeout", () => req.destroy(new Error("超时")));
+    req.on("error", reject);
+  });
+
+  try {
+    const meta = await getJson(C.npmLatestUrl("dsh-int-multi-session"));
+    chk(!!meta.version, "★ 真连 npm：拿到了 version", String(meta.version));
+    chk(!!(meta.dist && meta.dist.tarball), "★ 真连 npm：拿到了 dist.tarball");
+    chk(!!(meta.dist && /^sha512-/.test(String(meta.dist.integrity))),
+      "★ 真连 npm：拿到了 sha512 integrity（没它就只能降级成不校验）",
+      meta.dist ? String(meta.dist.integrity).slice(0, 20) : "无 dist");
+    const real = C.normalizeNpmLatest("dsh-int-multi-session", meta);
+    chk(!!real.entry && C.isAllowedDownloadUrl(real.entry.downloadUrl),
+      "★ 真数据过一遍 normalizeNpmLatest + 白名单，能通");
+  } catch (e) {
+    skip("真连一次 npm registry", (e && e.message) || String(e));
+  }
+}
+
+// ── 收尾 ──
   console.log(`\n${"=".repeat(64)}`);
   console.log(`plugin-catalog-check：${OK} OK / ${FAILS.length} FAIL / ${SKIPS.length} SKIP`);
   if (FAILS.length) { console.log("失败项："); for (const f of FAILS) console.log(`  · ${f}`); }

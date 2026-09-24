@@ -1534,8 +1534,23 @@ async function verifyPlugins(tmpDir) {
       [...raw.subarray(0, 3)].join(","));
 
     // ⑦ 界面状态应该跟着变成「已装」
-    const after2 = JSON.parse(await cdpEval(ws, probe, 20000));
-    const card2 = after2.cards.find((c) => c.name === pick.name);
+    //
+    // ★★ 2026-09-25 修：这里原来是**竞态**（真跑挂出来的）。
+    //   现象：安装成功、盘上三处契约全对，但卡片标签读到 `[]`。
+    //   真因：`settings.js` 里 `plProg("已装 …")` **写在 `await loadPlugins(false)` 之前**，
+    //     所以"结果文案出现"≠"清单刷新完了"。原来刷新很快（只取一次 hub 索引），
+    //     探针碰巧总是赢；这一轮我加了 npm 源之后刷新路径变长，**探针就输了**。
+    //   ⇒ 判据不能靠"文案出现了"，要**等界面自己说刷新完了**：
+    //     轮询到卡片上真的出现「已装」为止（有上限），而不是只读一次。
+    //     （加 sleep 是治标；轮询到目标状态才是治本 —— 而且失败时能看到它到底停在哪。）
+    let card2 = null;
+    const sd = Date.now() + 30000;
+    while (Date.now() < sd) {
+      const after2 = JSON.parse(await cdpEval(ws, probe, 20000));
+      card2 = after2.cards.find((c) => c.name === pick.name);
+      if (card2 && card2.tags.includes("已装")) break;
+      await sleep(500);
+    }
     check("★ 卡片状态跟着变成「已装」",
       !!(card2 && card2.tags.includes("已装")), card2 ? JSON.stringify(card2.tags) : "卡片不见了");
 
@@ -1769,10 +1784,24 @@ async function verifyFirstRun(tmpDir) {
       checkable.some((x) => x.checked), JSON.stringify(checkable.map((x) => [x.name, x.checked])));
     const uploader = fr.items.find((x) => x.name === "dsh-plugin-uploader");
     if (uploader) {
-      check("★ 开发者工具（dsh-plugin-uploader）默认**不**勾",
-        uploader.checked === false, `checked=${uploader.checked}`);
+      // ★ 2026-09-25 修正：这条原断言「上传器是开发者工具 ⇒ 默认不勾」**已经过期**。
+      //   2026-09-23 起上传器就是**普通插件**（兜底名单清空 + commit 814c5cb，
+      //   用户原话：「我认为它应该是一个普通插件，而不是只局限在开发者工具之上。」）
+      //   ⇒ 它现在**应该**默认勾上。原来那条会一直 FAIL，
+      //     而"长期 FAIL"最坏的地方是让真 FAIL 混在噪音里没人看（这一轮已清掉 4 条同类）。
+      check("★ 上传器是普通插件 ⇒ 默认**该**勾上（2026-09-23 起）",
+        uploader.checked === true, `checked=${uploader.checked}`);
     } else {
-      console.log("  SKIP  开发者工具默认不勾 —— 这一版清单里没有 dsh-plugin-uploader");
+      console.log("  SKIP  上传器默认勾选 —— 这一版清单里没有 dsh-plugin-uploader");
+    }
+    // ★ 规则本身仍要有人看守：拿清单里**任何** dev 条目验一次"默认不勾"。
+    //   （没有 dev 条目时明确 SKIP，不当成通过 —— 否则这条规则会静默失守。）
+    const devItem = fr.items.find((x) => (x.tags || []).includes("开发者工具"));
+    if (devItem) {
+      check("★ 开发者工具默认**不**勾（规则本身仍成立）",
+        devItem.checked === false, `${devItem.name} checked=${devItem.checked}`);
+    } else {
+      console.log("  SKIP  开发者工具默认不勾 —— 这一版清单里没有 dev 条目（规则没被验到，**不算通过**）");
     }
     check("★ 按钮文案跟着勾选数走，且此刻是可点的",
       /安装选中的 \d+ 个插件/.test(fr.btnLabel) && fr.btnDisabled === false,
@@ -2292,8 +2321,14 @@ async function verifyFiles(tmpDir) {
       }
     }
     await sleep(300);
-    try { fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 3 }); }
-    catch (e) { console.error(`（临时目录没删干净: ${tmpDir}）`); }
+    // ★ 2026-09-25 加 `--keep`：失败时**留住临时目录**，否则证据随目录一起被删，
+    //   只能靠猜（这一轮我就是这么被卡住的：卡片标签是空的，却看不到那个家里的实际状态）。
+    if (process.argv.includes("--keep")) {
+      console.error(`（--keep：临时目录保留在 ${tmpDir}）`);
+    } else {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 3 }); }
+      catch (e) { console.error(`（临时目录没删干净: ${tmpDir}）`); }
+    }
   }
 
   console.log("");
