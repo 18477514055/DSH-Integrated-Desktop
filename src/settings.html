@@ -184,6 +184,15 @@
           <span class="note" id="up-status">还没检查</span>
         </div>
       </div>
+      <!-- ★ 扫过哪些本地目录 —— 让「本机没找到新包」成为**可解释**的，
+           而不是只报一句「已是最新」（2026-09-24 那个 bug 就是这么藏住的） -->
+      <div class="row" id="up-row-scan" style="display:none">
+        <div class="k">扫过的本机目录</div>
+        <div class="v">
+          <div class="mono" id="up-scan-list"
+               style="font-size:11.5px;color:var(--fg-faint);white-space:pre-wrap;word-break:break-all"></div>
+        </div>
+      </div>
       <!-- ★ 本机已有的、比当前更新的安装包（线上可能还没发出去） -->
       <div class="row" id="up-row-local" style="display:none">
         <div class="k">本机已有新包</div>

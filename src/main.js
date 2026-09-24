@@ -1591,13 +1591,23 @@ function updateEmit(payload) {
  *   本机真实场景：自己 `npm run dist` 打出了新版本，但因为工作区不干净一直没发到
  *   GitHub ⇒ 线上还停在旧版本，只查线上就永远报「已是最新」。
  *
- *   ① 下载临时目录 —— 更新流程自己下过的那些；
- *   ② 设置里那个工作目录下的 `release\` —— 开发机上 `npm run dist` 的产出就在那儿。
+ * ★★ 2026-09-24 修 bug：原来这里**只**给 `settings.workspace\release`，
+ *   而 `settings.workspace` 是**内核的工作目录**（默认空串 —— 用户现场实测
+ *   `settings.json` 里 `workspace=''`）⇒ 打好的 0.2.10 躺在
+ *   `D:\deepseek-workspace\5.DSH集成桌面端\release\` 却**一个候选目录都没扫到它**，
+ *   用户点「检查更新」永远只看到「已是最新」。
+ *   ⇒ 清单改由 `U.candidateInstallerDirs()` 从"包实际会落在哪"推导（含**每个已注册
+ *   工作区**的根 + 一层子目录 + `release`），这里只负责把事实喂给它。
  */
 function localInstallerDirs() {
-  const dirs = [app.getPath("temp")];
-  if (settings && settings.workspace) dirs.push(path.join(settings.workspace, "release"));
-  return dirs;
+  return U.candidateInstallerDirs({
+    tempDir: app.getPath("temp"),
+    workspace: settings && settings.workspace ? settings.workspace : "",
+    // ★ 开发机：`npm run dist` 的产出就在外壳自己的项目目录下
+    appPath: app.getAppPath(),
+    // ★ 权威来源仍是内核的注册表（见 workspaceRoots 的注释）
+    workspaceRoots: workspaceRoots(),
+  });
 }
 
 /**
@@ -2031,8 +2041,13 @@ function registerIpc() {
   ipcMain.handle("dsh:update:check", async (e) => {
     assertShellSender(e);
     log("检查更新…（同时看线上与本机）");
-    const r = await U.check({ localDirs: localInstallerDirs() });
+    const dirs = localInstallerDirs();
+    // ★ 把"扫了哪些目录"记进日志 —— 出问题时能一眼看出是不是漏扫了
+    //   （2026-09-24 那个 bug：只扫了临时目录，项目 release\ 从没进过清单）
+    const r = await U.check({ localDirs: dirs });
     localInstallerFound = (r && r.localNewer && r.localNewer.path) ? r.localNewer.path : null;
+    const exist = (r && Array.isArray(r.scannedDirs)) ? r.scannedDirs.filter((d) => d.exists).length : 0;
+    log(`检查更新：扫了 ${dirs.length} 个本机目录（${exist} 个存在）：${dirs.join(" | ")}`);
     log(`检查更新：ok=${r.ok} 当前=${r.current} 线上最新=${r.latest || "-"} 线上有更新=${r.hasUpdate}`
       + ` 本地有更新=${localInstallerFound ? r.localNewer.version : "无"} ${r.reason || ""}`);
     return r;

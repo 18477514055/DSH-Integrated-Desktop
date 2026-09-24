@@ -1125,6 +1125,28 @@ async function verifyPages(tmpDir) {
       } else {
         console.log("  SKIP  造不出假的本地安装包 —— 这一段没验到，**不算通过**");
       }
+
+      // ★★ 扫过哪些目录必须**看得见**（2026-09-24 用户报的 bug：打好的 0.2.10 扫不到）
+      //    这一段走的是**真实 main.js 的 localInstallerDirs() 接线**，
+      //    与 update:check 探针里直接调 candidateInstallerDirs() 不是一回事 ——
+      //    探针过了不代表接线对了，所以必须在这儿再钉一条。
+      const scanRaw = await cdpEval(setT.webSocketDebuggerUrl, `(() => {
+        const row = document.getElementById('up-row-scan');
+        return JSON.stringify({
+          display: row ? getComputedStyle(row).display : null,
+          text: (document.getElementById('up-scan-list')||{}).textContent||'',
+        });
+      })()`, 20000);
+      const sr = JSON.parse(scanRaw);
+      console.log(`  扫过的目录那一行: ${(sr.text||'').replace(/\\n/g,' ; ').slice(0, 300)}`);
+      check("★ 「扫过的本机目录」那一行显示出来了", !!sr.display && sr.display !== "none", String(sr.display));
+      check("★ 清单里**真的**包含了本仓库的 release\\（这就是 0.2.10 扫不到的正解）",
+        /5\.DSH集成桌面端[\\/]release/i.test(sr.text), (sr.text||'').slice(0, 300));
+      check("★ 清单里也包含系统临时目录（更新流程自己下的包在那儿）",
+        /[\\/]Temp$/im.test(sr.text) || /Temp\\?\s*$/m.test(sr.text) || /Temp/i.test(sr.text),
+        (sr.text||'').slice(0, 300));
+      check("★ 每条目录都标了存在与否（[有]/[无]）—— 「没找到」才是可解释的",
+        /\[有\]/.test(sr.text) && /\[无\]/.test(sr.text), (sr.text||'').slice(0, 300));
     }
   } finally {
     await stopApp(child);

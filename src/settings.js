@@ -136,6 +136,21 @@
     $("up-row-local").style.display = "";
   }
 
+  /**
+   * ★ 把「扫了哪些本地目录」列出来 —— 只扫了临时目录、没扫项目 `release\`
+   * 这种事必须**看得见**。2026-09-24 用户报的 bug（打好的 0.2.10 扫不到）
+   * 之所以能藏那么久，就是因为界面只报一句「已是最新」，没人知道它扫过哪里。
+   */
+  function renderScan(r) {
+    const dirs = (r && Array.isArray(r.scannedDirs)) ? r.scannedDirs : null;
+    if (!dirs || !dirs.length) { $("up-row-scan").style.display = "none"; return; }
+    const exists = dirs.filter((d) => d.exists).length;
+    const lines = dirs.map((d) => `${d.exists ? "[有]" : "[无]"} ${d.dir}`);
+    $("up-scan-list").textContent =
+      `共 ${dirs.length} 个候选目录，其中 ${exists} 个真的存在：\n` + lines.join("\n");
+    $("up-row-scan").style.display = "";
+  }
+
   async function doCheck() {
     upStatus("正在查 GitHub 与本机…");
     $("btn-up-check").disabled = true;
@@ -143,6 +158,7 @@
       const r = await S.checkUpdate();
       lastCheck = r;
       renderLocal(r);
+      renderScan(r);
       if (!r || !r.ok) {
         // 线上查不到**不代表本机没有** —— 本地那一段照样显示
         upStatus(`检查失败：${(r && r.reason) || "未知原因"}`

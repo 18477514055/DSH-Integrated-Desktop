@@ -110,18 +110,91 @@ function findLocalInstaller(dirs, current) {
 }
 
 /**
+ * 算出「本机可能放着安装包」的目录清单。
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * ★★ 为什么要有这个函数（2026-09-24 用户报的真 bug）
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 用户原话：「为什么我点检查更新的时候找不到你打包的 0.2.10 呢？」
+ *
+ * 真因：目录清单**只**由 `app.getPath("temp")` + `settings.workspace\release` 组成，
+ * 而 `settings.workspace` 是**内核的工作目录**（cwd），默认是空串
+ * （用户现场实测 `settings.json` 里 `workspace=''`）。
+ * 于是 `npm run dist` 打出来的 0.2.10 躺在 `D:\deepseek-workspace\5.DSH集成桌面端\release\`，
+ * **一个候选目录都没扫到它** ⇒ 明明本机有新包，界面却报「已是最新」。
+ * 讽刺的是上面 `findLocalInstaller` 的注释写的正是为了这个场景，而它拿不到目录。
+ *
+ * ⇒ 所以清单改成**从"包实际会落在哪"推导**，而不是从"用户配了什么"推导：
+ *   ① 下载临时目录（更新流程自己下的）；
+ *   ② 设置里的工作目录 + `release`（保留旧行为）；
+ *   ③ ★ **外壳自己的项目目录 + `release`** —— 开发机 `npm run dist` 的产物就在这儿，
+ *      这正是用户现场那个 0.2.10 的所在；
+ *   ④ ★ **每个已注册工作区**：根本身 + **一层子目录** + `release`
+ *      （本机实况：工作区根是 `D:\deepseek-workspace`，项目在它的子目录 `5.DSH集成桌面端` 下）。
+ *
+ * 只**列目录、只 stat**，不写、不执行。目录不存在也无所谓（`findLocalInstaller` 会跳过），
+ * 但会原样列出来 ⇒ 界面上能看见"到底扫了哪些地方"，**"没找到"才是可解释的**。
+ *
+ * @param {{tempDir?:string, workspace?:string, appPath?:string, workspaceRoots?:string[]}} opts
+ * @returns {string[]} 去重后的绝对路径清单（不保证存在）
+ */
+function candidateInstallerDirs(opts = {}) {
+  const out = [];
+  const seen = new Set();
+  const push = (p) => {
+    if (typeof p !== "string" || !p.trim()) return;
+    const abs = path.resolve(p);
+    const key = abs.replace(/[\\/]+$/, "").toLowerCase();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(abs);
+  };
+
+  push(opts.tempDir);
+  if (opts.workspace) push(path.join(opts.workspace, "release"));
+  if (opts.appPath) push(path.join(opts.appPath, "release"));
+
+  const roots = Array.isArray(opts.workspaceRoots) ? opts.workspaceRoots : [];
+  for (const root of roots) {
+    if (typeof root !== "string" || !root.trim()) continue;
+    push(path.join(root, "release"));
+    let subs = [];
+    try { subs = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
+    for (const e of subs) {
+      // ★ 联接（Junction）对 Dirent.isDirectory() 返回 **false** ⇒ 必须跟随一次 statSync。
+      //   （项目 AGENTS.md §7 记过这个坑：联接形态的插件曾被整批静默跳过。）
+      let isDir = e.isDirectory();
+      if (!isDir && e.isSymbolicLink()) {
+        try { isDir = fs.statSync(path.join(root, e.name)).isDirectory(); } catch { isDir = false; }
+      }
+      if (isDir) push(path.join(root, e.name, "release"));
+    }
+  }
+  return out;
+}
+
+/**
  * 查最新 Release。**只读**，不写任何东西。
  *
  * @param {{localDirs?:string[]}} [opts] 顺带扫这几个本地目录里有没有更新的安装包
  * @returns {Promise<{ok:boolean, reason?:string, current:string, latest?:string,
  *                    hasUpdate?:boolean, asset?:object, notes?:string, page?:string,
- *                    localNewer:?{version:string,path:string,size:number,dir:string}}>}
+ *                    localNewer:?{version:string,path:string,size:number,dir:string},
+ *                    scannedDirs?:{dir:string,exists:boolean}[]}>}
  */
 async function check(opts = {}) {
   const current = app.getVersion();
   // ★ 先看**本机**有没有更新的安装包 —— 线上没有不等于本机没有
-  const localNewer = findLocalInstaller(opts.localDirs, current);
-  const withLocal = (o) => ({ ...o, current, localNewer });
+  const localDirs = Array.isArray(opts.localDirs) ? opts.localDirs : [];
+  const localNewer = findLocalInstaller(localDirs, current);
+  // ★ 把"扫了哪些目录、哪些真的存在"一起报出去 —— 否则「没找到」不可解释
+  //   （这正是本 bug 藏了这么久的原因：界面只报"已是最新"，没人知道它扫过哪里）
+  const scannedDirs = localDirs.map((dir) => {
+    let exists = false;
+    try { exists = fs.statSync(dir).isDirectory(); } catch { exists = false; }
+    return { dir, exists };
+  });
+  const withLocal = (o) => ({ ...o, current, localNewer, scannedDirs });
 
   let res;
   try {
@@ -256,5 +329,6 @@ function openReleasesPage() {
 module.exports = {
   check, download, launchInstaller, openReleasesPage,
   cmpVersion, pickInstaller, versionFromInstallerName, findLocalInstaller,
+  candidateInstallerDirs,
   RELEASES_PAGE, REPO,
 };

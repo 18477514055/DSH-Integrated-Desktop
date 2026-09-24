@@ -135,7 +135,75 @@ app.whenReady().then(async () => {
     out(`  （release\\ 里没有 v${pkgVersion} 的安装包，这一条不判）`);
   }
 
+  // ── ★★ 目录清单这把尺子（2026-09-24 用户报的 bug：打好的包扫不到）──
+  //    用户原话：「为什么我点检查更新的时候找不到你打包的 0.2.10 呢？」
+  //    真因：清单只由 `settings.workspace\release` 组成，而那是**内核工作目录**（默认空串）
+  //    ⇒ `npm run dist` 的产物在项目自己的 `release\` 里，一个候选目录都没覆盖到。
+  //    这里既验"推导规则"，也验"本机真实的那个 release\ 真的进了清单"。
+  out("");
+  out("=== 目录清单推导（candidateInstallerDirs）===");
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-upd-dirs-"));
+  const fakeRoot = path.join(tmpRoot, "假工作区");
+  const fakeProj = path.join(fakeRoot, "5.某项目");
+  fs.mkdirSync(path.join(fakeProj, "release"), { recursive: true });
+  fs.mkdirSync(path.join(fakeRoot, "release"), { recursive: true });
+  // 造一个**联接**形态的子目录 —— Dirent.isDirectory() 对它返回 false，必须跟随 stat
+  const linkDir = path.join(fakeRoot, "联接子目录");
+  try { fs.symlinkSync(fakeProj, linkDir, "junction"); } catch { /* 权限不够就跳过那条断言 */ }
+
+  const dirs = U.candidateInstallerDirs({
+    tempDir: path.join(tmpRoot, "临时目录"),
+    workspace: "",
+    appPath: fakeProj,
+    workspaceRoots: [fakeRoot],
+  });
+  const norm = (s) => path.resolve(s).replace(/[\\/]+$/, "").toLowerCase();
+  const has = (p) => dirs.some((d) => norm(d) === norm(p));
+
+  ck(has(path.join(tmpRoot, "临时目录")), "① 临时目录进了清单");
+  ck(has(path.join(fakeProj, "release")), "② ★ 外壳项目目录下的 release\\ 进了清单（0.2.10 就在这种位置）");
+  ck(has(path.join(fakeRoot, "release")), "③ ★ 已注册工作区**根**下的 release\\ 进了清单");
+  ck(has(path.join(fakeProj, "release")), "④ ★ 工作区**一层子目录**下的 release\\ 进了清单（本机是 D:\\deepseek-workspace\\5.DSH集成桌面端）");
+  if (fs.existsSync(linkDir)) {
+    ck(dirs.some((d) => norm(d).startsWith(norm(linkDir))), "⑤ ★ 联接（Junction）形态的子目录也被跟随（Dirent 会骗人）");
+  } else {
+    out("  （没能建联接，第 ⑤ 条不判）");
+  }
+  ck(!U.candidateInstallerDirs({ workspace: "", appPath: fakeProj, workspaceRoots: [fakeRoot] })
+    .some((d) => /temp/i.test(d) && !has(path.join(tmpRoot, "临时目录"))), "⑥ 没给临时目录时不会瞎编一个");
+  ck(U.candidateInstallerDirs({ tempDir: "X", workspace: "X", appPath: "X", workspaceRoots: ["X"] })
+    .filter((d) => norm(d) === norm(path.join("X", "release"))).length === 1, "⑦ 同一个目录只出现一次（去重）");
+
+  // ★★ 最要紧的一条：**本机真实的那个 release\** 必须能被扫到，且真的扫出 0.2.10
+  out("");
+  out("=== ★ 本机真实场景：0.2.10 到底能不能被扫到 ===");
+  const realDirs = U.candidateInstallerDirs({
+    tempDir: os.tmpdir(),
+    workspace: "",                                   // ← 用户现场就是空串
+    appPath: path.join(__dirname, ".."),             // ← 外壳自己的项目目录
+    workspaceRoots: [path.join(__dirname, "..", "..")],  // ← 本机工作区根 D:\deepseek-workspace
+  });
+  out(`  推导出 ${realDirs.length} 个候选目录：`);
+  for (const d of realDirs) {
+    let mark = "不存在";
+    try { if (fs.statSync(d).isDirectory()) mark = "存在"; } catch { mark = "不存在"; }
+    out(`    [${mark}] ${d}`);
+  }
+  const realFound = U.findLocalInstaller(realDirs, "0.2.9");
+  out(`  以 v0.2.9（用户当时装的那一版）为基准扫到的: ${realFound ? `v${realFound.version} ← ${realFound.path}` : "（没有更高的）"}`);
+  // ★ 注意用 realDirs 判，别用上面那个假清单的 has()（第一版就是拿错清单假 FAIL 的）
+  const hasReal = (p) => realDirs.some((d) => norm(d) === norm(p));
+  ck(hasReal(path.join(__dirname, "..", "release")), "★ 本仓库的 release\\ 真的进了候选清单（bug 的正解）");
+  const realExe = path.join(__dirname, "..", "release", `DSH-Integrated-${pkgVersion}-x64.exe`);
+  if (fs.existsSync(realExe)) {
+    ck(!!realFound && U.cmpVersion(realFound.version, "0.2.9") >= 0,
+      `★ 以 v0.2.9 为基准，能从本机 release\\ 扫到 v${pkgVersion}（用户现场扫不到的那个）`);
+  } else {
+    out(`  （release\\ 里没有 v${pkgVersion} 的安装包，这一条不判）`);
+  }
+
   // 版本比较不过 ⇒ 就算连上也判失败（尺子错了，结论不可信）
+  try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* 忽略 */ }
   const code = (!r.ok || bad) ? 1 : 0;
   out(code ? "结果：✗ 链路或尺子有问题" : "结果：✓ 链路通、尺子对、本地扫描对");
   app.exit(code);
