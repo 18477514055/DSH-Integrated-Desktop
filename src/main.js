@@ -2241,6 +2241,23 @@ function registerIpc() {
   });
 
   /**
+   * 打开**下载渠道说明**那一页（用户 2026-09-24：「让他们知道我们的每一个渠道」）。
+   *
+   * ★ URL **写死在主进程**（渲染进程连参数都不传）—— 与其它通道同一条纪律：
+   *   不接受渲染进程递来的 URL，否则这个通道就成了"从设置页打开任意网址"。
+   * ★ 文件名里带中文 ⇒ 必须 **percent-encode**（GitHub 的 blob 路由按字节配，
+   *   直接塞中文会被拒/跳错页）。这里用的是 `docs/下载与安装渠道.md` 的稳定名 ——
+   *   **刻意不带日期**：带日期的话下次发版一改名，所有引用它的链接就全断了。
+   */
+  ipcMain.handle("dsh:plugins:open-channels", (e) => {
+    assertShellSender(e);
+    // 用 U.REPO（= 本外壳自己的仓库，见 src/update.js 顶部）拼，别去猜字符串
+    const url = `https://github.com/${U.REPO}/blob/main/docs/` + encodeURIComponent("下载与安装渠道.md");
+    log(`打开下载渠道说明：${url}`);
+    return shell.openExternal(url);
+  });
+
+  /**
    * 打开某个插件在 **npm 官网**上的说明页（用户 2026-09-24 提的第 ③ 件事）。
    *
    * ★ 与其它插件通道同一条纪律：**渲染进程只递包名，URL 由主进程重新算**。

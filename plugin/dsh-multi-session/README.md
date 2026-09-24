@@ -32,6 +32,26 @@ dsh plugin --profile web add dsh-int-multi-session
 - 每行是「提示词 + 附件 + 模型」，不含权限预设 / Agent 预设 / Plan 模式。
 - 一次开太多会话会同时占资源 —— 数量你自己看着办。
 
+<!-- 下载渠道（自动插入，勿手改这段） -->
+
+---
+
+## 这是「集成版」插件 —— 本体客户端去哪拿
+
+这个包只是**插件**，它需要一个**本体客户端**（DSH 集成桌面端）才能跑。本体**不在 npm 上**，
+请从下面任一渠道拿：
+
+| # | 渠道 | 适合谁 |
+|---|---|---|
+| ① | [GitHub Releases](https://github.com/18477514055/DSH-Integrated-Desktop/releases) | 能上 GitHub（主渠道） |
+| ② | 国内网盘包 | 上不了 GitHub（含安装包 **+ 插件包**） |
+| ③ | 客户端里的「集成版插件」页 | 已经装了客户端 —— **插件在这里点着装最省事** |
+| ④ | 本页这条 npm 命令 | 只想单独装/更新这一个插件 |
+
+> 装之前先确认机器上有**内核**：`npm i -g @deepseek-ai/dsh`。
+> 完整的渠道说明（校验方法 / 常见问题 / 升级方式）见仓库里
+> [`docs/下载与安装渠道.md`](https://github.com/18477514055/DSH-Integrated-Desktop/blob/main/docs/%E4%B8%8B%E8%BD%BD%E4%B8%8E%E5%AE%89%E8%A3%85%E6%B8%A0%E9%81%93.md)。
+
 ## 许可
 
 MIT

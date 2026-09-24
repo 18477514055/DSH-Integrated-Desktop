@@ -712,6 +712,9 @@
   function wirePlugins() {
     $("btn-pl-check").addEventListener("click", () => loadPlugins(true));
     $("btn-pl-hub").addEventListener("click", () => S.openPluginHub().catch(() => { }));
+    // ★ 渠道自知（2026-09-24 用户要求「让他们知道我们的每一个渠道」）——
+    //   来插件页的人已经在用客户端了，但未必知道**别人**该从哪拿。
+    $("btn-pl-channels").addEventListener("click", () => S.openPluginChannels().catch(() => { }));
     // 安装包不带插件 ⇒ 新用户唯一的入口就是向导。这里给它一个随时能回去的按钮。
     $("btn-pl-wizard").addEventListener("click", () => {
       switchPane("welcome");

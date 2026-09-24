@@ -1426,6 +1426,33 @@ async function verifyPlugins(tmpDir) {
       console.log("  （索引里暂时没有旧名卡，旧名那半不判 —— 但 npmPageOf 的断言在 plugin-catalog-check 里钉着）");
     }
 
+    // ── ★★ 「别人怎么拿到」那一行（用户 2026-09-24：「让他们知道我们的每一个渠道」）──
+    //    这一行在**插件页**上，因为来这儿的人已经在用客户端了，
+    //    但未必知道**别人**该从哪拿、以及自己以后怎么升级。
+    const chRaw = await cdpEval(setT.webSocketDebuggerUrl, `(() => {
+      const b = document.getElementById('btn-pl-channels');
+      const row = b ? b.closest('.row') : null;
+      return JSON.stringify({
+        hasBtn: !!b,
+        label: b ? (b.textContent||'').trim() : '',
+        visible: row ? getComputedStyle(row).display !== 'none' : false,
+        text: row ? (row.textContent||'') : '',
+      });
+    })()`, 20000);
+    const ch = JSON.parse(chRaw);
+    console.log(`  「别人怎么拿到」那一行: hasBtn=${ch.hasBtn} label="${ch.label}"`);
+    check("★ 插件页有「打开下载渠道说明」按钮",
+      ch.hasBtn === true && /下载渠道/.test(ch.label), chRaw.slice(0, 200));
+    check("★ 那一行真的显示出来了（不是 hidden）", ch.visible === true, String(ch.visible));
+    check("★ 文案点了渠道（GitHub / 网盘 / npm 都要提到）",
+      /GitHub/.test(ch.text) && /网盘/.test(ch.text) && /npm/.test(ch.text), ch.text.slice(0, 220));
+    check("★★ 文案说清了**本体不在 npm 上**（最容易误解的一条）",
+      /不在\s*npm/.test(ch.text), ch.text.slice(0, 220));
+    check("★ 文案给了内核那句命令（新用户会卡在这儿）",
+      /npm i -g @deepseek-ai\/dsh/.test(ch.text), ch.text.slice(0, 240));
+    check("★ 文案说了「以后升级不用回来重下」",
+      /不用回来重下|检查更新/.test(ch.text), ch.text.slice(0, 240));
+
     // ④ 真点「检查插件更新」—— DOM 里有按钮不等于点了有用
     await cdpEval(ws, `(() => { document.getElementById('btn-pl-check').click(); return 'ok'; })()`, 20000);
     let after = st.status;

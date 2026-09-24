@@ -347,6 +347,23 @@
         这里管的是<b>插件</b>；外壳自己的新版本在「更新」那一栏。
       </p>
 
+      <!-- ★ 渠道自知（2026-09-24 用户要求「让他们知道我们的每一个渠道」）。
+           插件页是最该讲这件事的地方：来这儿的人已经在用客户端了，
+           但未必知道**别人**该从哪拿、以及自己以后怎么升级。 -->
+      <div class="row">
+        <div class="k">别人怎么拿到</div>
+        <div class="v" style="flex-direction:column;align-items:stretch;gap:6px">
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <button class="btn" id="btn-pl-channels">打开下载渠道说明</button>
+            <span class="note">四条渠道：GitHub Releases（主）/ 国内网盘包 / npm（只有插件）/ 客户端这里</span>
+          </div>
+          <span class="note">
+            本体客户端<b>不在 npm 上</b>；别人装之前要先有内核（<span class="mono">npm i -g @deepseek-ai/dsh</span>）。
+            以后升级<b>不用回来重下</b> —— 用上面「更新」那一栏的「检查更新」即可。
+          </span>
+        </div>
+      </div>
+
       <div class="row">
         <div class="k">本机已装</div>
         <div class="v">

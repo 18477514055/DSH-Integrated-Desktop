@@ -339,6 +339,25 @@ Get-Content SHA256SUMS.txt | ForEach-Object {
 https://github.com/18477514055/DSH-Integrated-Desktop
 
 生成时间：${new Date().toISOString()}
+
+## 我们一共有哪几条下载渠道（想更新时看这里）
+
+| # | 渠道 | 适合谁 | 说明 |
+|---|---|---|---|
+| ① | **GitHub Releases**（主渠道） | 能上 GitHub | https://github.com/18477514055/DSH-Integrated-Desktop/releases |
+| ② | **国内网盘包**（就是这一包） | 上不了 GitHub | 含安装包 **+ 插件包**，全程不需要境外站点 |
+| ③ | **插件走 npm** | 想单独装/更新插件 | \`dsh plugin --profile web add dsh-int-xxx\` |
+| ④ | **客户端里的插件页** | 已经装了客户端 | 外壳设置 → 集成版插件；**插件无需重装客户端** |
+
+★ **装了客户端之后，以后升级不用再回来下载**：客户端里
+**外壳设置 → 更新 → 检查更新** 就能升（它会同时看线上与本机）。
+
+★ **这一包里的是"某个时点的快照"**：插件版本按打包当时算，
+所以网盘包里的插件可能**比 npm 上的新**（npm 上的是发过一次就定住的）。
+想要最新插件就走 ①/③。
+
+> 完整说明（含校验方法、常见问题、给分享对象的注意事项）在仓库里：
+> **\`docs/下载与安装渠道.md\`**
 `;
 fs.writeFileSync(path.join(packRoot, "00-先看我.md"), readme, "utf8");
 say("\n④ 说明文件：00-先看我.md");
