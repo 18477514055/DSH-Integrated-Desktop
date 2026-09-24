@@ -149,10 +149,35 @@ function build() {
   }
 
   if (dirty.length) {
-    console.error("[bundle] ⚠️ 工作区有**已跟踪文件**的未提交改动 —— git archive 只会打包**已提交**的内容，");
-    console.error("[bundle]    也就是说源码包会和你眼前的源码不一致。请先 commit。");
-    console.error(dirty.map((l) => "           " + l).join("\n"));
-    process.exit(1);
+    // ★ 2026-09-24：已跟踪文件的改动分两种，判据要分开（旧版一律拦，于是被别人的
+    //   文档改动堵住 —— 本机长期有另一个会话在同一仓库里写 `docs\`）。
+    //   · `release-notes\<版本>.md`、`package.json` 这类**会进包**的文件改了 ⇒ 必须停。
+    //   · 别的文件（如 `docs\`）改了 ⇒ **不影响这个包的内容**：source.zip 出自
+    //     `git archive HEAD`（只含已提交内容），而 0.2.12 的说明是**先提交过**的。
+    //     ⇒ 只警告，不拦。
+    //   判据按"**这个文件到底进不进这个包**"来定，而不是按"工作区干不干净"来定。
+    const AFFECTS_BUNDLE = [
+      /^package\.json$/,
+      /^release-notes\//,
+      /^src\//,
+      /^assets\//,
+      /^LICENSE$/,
+      /^\.gitignore$/,
+    ];
+    const matters = dirty.filter((l) => {
+      const f = l.replace(/^\s*\S+\s+/, "").replace(/^"(.*)"$/, "$1").trim();
+      return AFFECTS_BUNDLE.some((re) => re.test(f));
+    });
+    if (matters.length) {
+      console.error("[bundle] ⚠️ 有**会进这个包**的文件被改过（源码包会与眼前源码不一致）：");
+      console.error(matters.map((l) => "           " + l).join("\n"));
+      console.error("[bundle]    这些文件的改动必须先 commit 再出包。");
+      console.error("[bundle]    （判据不是「工作区干不干净」，而是「这个文件进不进这个包」）");
+      process.exit(1);
+    }
+    console.log(`[bundle] 忽略 ${dirty.length} 个**已跟踪但不进这个包**的改动（不影响产物内容）：`);
+    for (const l of dirty) console.log(`           ${l}`);
+    console.log("[bundle]    依据：source.zip 出自 `git archive HEAD`，Release 说明也是已提交的那版。");
   }
 
   const head = (git(["rev-parse", "--short", "HEAD"]).stdout || "").trim();
