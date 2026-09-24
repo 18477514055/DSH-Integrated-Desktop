@@ -121,12 +121,37 @@ function build() {
   }
 
   // 工作区必须干净：否则 git archive 打出来的源码包**不等于**你眼前的源码
+  //
+  // ★ 2026-09-24：加了 `--allow-untracked`。
+  //   起因：本机**长期有另一个会话在同一个仓库里干活**，经常留下**未跟踪**的新目录
+  //   （别人的半成品）。那些东西 `git archive` **本来就不会打包**（它只打已跟踪文件），
+  //   所以它们**不会**让源码包失真 —— 但旧判据一律拦下，于是"发版"被无关的东西堵住。
+  //   新判据只放行**未跟踪**条目：**已跟踪文件的改动仍然一律拦**（那才会真的失真）。
   const st = git(["status", "--porcelain"]);
-  const dirty = (st.stdout || "").trim();
-  if (dirty) {
-    console.error("[bundle] ⚠️ 工作区有未提交改动 —— git archive 只会打包**已提交**的内容，");
+  const lines = (st.stdout || "").trim().split("\n").map((l) => l.trim()).filter(Boolean);
+  const dirty = lines.filter((l) => !l.startsWith("??"));
+  const untracked = lines.filter((l) => l.startsWith("??"));
+  const ALLOW_UNTRACKED = process.argv.includes("--allow-untracked");
+
+  if (untracked.length) {
+    const names = untracked.map((l) => l.replace(/^\?\?\s*/, ""));
+    if (ALLOW_UNTRACKED) {
+      console.log(`[bundle] 忽略 ${names.length} 个**未跟踪**条目（git archive 不会打包它们）：`);
+      for (const n of names) console.log(`           ${n}`);
+    } else {
+      console.error(`[bundle] ⚠️ 有 ${names.length} 个**未跟踪**条目：`);
+      for (const n of names) console.error(`           ${n}`);
+      console.error("[bundle]    它们**不会**进 source.zip（git archive 只打已跟踪文件），");
+      console.error("[bundle]    所以源码包不会失真。确认可以继续就加 --allow-untracked：");
+      console.error("[bundle]        node scripts/make-release-bundle.js --allow-untracked");
+      process.exit(1);
+    }
+  }
+
+  if (dirty.length) {
+    console.error("[bundle] ⚠️ 工作区有**已跟踪文件**的未提交改动 —— git archive 只会打包**已提交**的内容，");
     console.error("[bundle]    也就是说源码包会和你眼前的源码不一致。请先 commit。");
-    console.error(dirty.split("\n").map((l) => "           " + l).join("\n"));
+    console.error(dirty.map((l) => "           " + l).join("\n"));
     process.exit(1);
   }
 
