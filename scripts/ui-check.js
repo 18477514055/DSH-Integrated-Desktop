@@ -1402,6 +1402,30 @@ async function verifyPlugins(tmpDir) {
     check("它报的是**本地那一份**的版本 9.9.9（不是线上版本）",
       !!(msCard && /本机 v9\.9\.9/.test(msCard.meta)), msCard ? msCard.meta.slice(0, 120) : "无卡");
 
+    // ── ★★ 「在 npm 上看说明」那个按钮（用户 2026-09-24 提的第 ③ 件事）──
+    //    判据刻意是**两半**，因为这个按钮的难点全在"什么时候**不**该给"：
+    //      · dsh-int-* 的卡 ⇒ 必须有这个按钮（它真的在 npm 上）
+    //      · 索引里的旧名（dsh-plugin-uploader / dsh-multi-session）⇒ **必须没有**
+    //        （实测那两个在 npm 上是 404，给了就是把用户送去一个"包没了"的页面）
+    //    这两半合起来才锁得住"绝不瞎拼一个 404 地址"。
+    const npmBtn = (c) => c.ops.some((o) => o.act === "npm");
+    const ourCards = st.cards.filter((c) => /^dsh-int-/.test(c.name));
+    const oldCards = st.cards.filter((c) => /^dsh-(multi-session|plugin-uploader)$/.test(c.name));
+    console.log(`  带 npm 按钮的卡: ${st.cards.filter(npmBtn).map((c) => c.name).join(", ") || "(无)"}`);
+    console.log(`  刻意**没有** npm 按钮的旧名卡: ${oldCards.map((c) => c.name).join(", ") || "(索引里没有旧名卡)"}`);
+    if (ourCards.length) {
+      check("★ dsh-int-* 的卡都给了「在 npm 上看说明」按钮",
+        ourCards.every(npmBtn), JSON.stringify(ourCards.map((c) => [c.name, npmBtn(c)])));
+    } else {
+      console.log("  SKIP  清单里没有 dsh-int-* 的卡 —— 这一条没验到，**不算通过**");
+    }
+    if (oldCards.length) {
+      check("★★ 索引里的**旧名**卡**没有** npm 按钮（那两个在 npm 上实测 404，给了就是送用户去看 404）",
+        oldCards.every((c) => !npmBtn(c)), JSON.stringify(oldCards.map((c) => [c.name, npmBtn(c)])));
+    } else {
+      console.log("  （索引里暂时没有旧名卡，旧名那半不判 —— 但 npmPageOf 的断言在 plugin-catalog-check 里钉着）");
+    }
+
     // ④ 真点「检查插件更新」—— DOM 里有按钮不等于点了有用
     await cdpEval(ws, `(() => { document.getElementById('btn-pl-check').click(); return 'ok'; })()`, 20000);
     let after = st.status;

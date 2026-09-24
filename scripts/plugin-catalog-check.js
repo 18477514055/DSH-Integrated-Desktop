@@ -237,6 +237,76 @@ section("⑦ mergeInstalled —— 清单 × 本机已装（含「本地装的�
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+section("⑦b npmPageOf —— npm 说明页链接（**算不出就不给，绝不瞎拼 404**）");
+// ═════════════════════════════════════════════════════════════════════════
+// 用户 2026-09-24 原话：「在我们的集成版插件页面那里加一条 npm 官网的地址，
+// 如果别人想看说明的话，可以跳转到 npm 那里去查看。」
+//
+// ★★ 这一段的核心是**那条实测出来的坑**：GitHub hub 索引里当时还挂着两个**旧名**
+//    （dsh-plugin-uploader / dsh-multi-session），而那两个在 npm 上是 **404**
+//    （实测 curl registry.npmjs.org 返回 404），新名 dsh-int-* 才是 200。
+//    ⇒ 如果照索引名字硬拼，用户点开就是 404 页面，看起来像"我们的包没了"。
+{
+  const P = C.NPM_PAGE_BASE;
+  chk(P === "https://www.npmjs.com/package/", "npm 页面基址是写死的常量");
+
+  // ① 我们的新名（dsh-int-*）⇒ 给链接
+  chk(C.npmPageOf({ name: "dsh-int-mobile-remote" }) === P + "dsh-int-mobile-remote",
+    "★ dsh-int-* 给 npm 链接（我们自己的命名约定）");
+  chk(C.npmPageOf({ name: "dsh-int-plugin-uploader" }) === P + "dsh-int-plugin-uploader",
+    "★ dsh-int-plugin-uploader 给链接");
+
+  // ② ★★ 索引里的旧名 ⇒ **不给**（它们在 npm 上不存在，给了就是 404）
+  chk(C.npmPageOf({ name: "dsh-plugin-uploader" }) === "",
+    "★★ 旧名 dsh-plugin-uploader **不给**链接（npm 上实测 404）");
+  chk(C.npmPageOf({ name: "dsh-multi-session" }) === "",
+    "★★ 旧名 dsh-multi-session **不给**链接（npm 上实测 404）");
+  chk(C.npmPageOf({ name: "dsh-demo" }) === "",
+    "别的命名（不是我们的约定）也不给 —— 免得指向别人的同名包");
+
+  // ③ 索引自己声明时优先（生产端最清楚）
+  chk(C.npmPageOf({ name: "dsh-demo", raw: { npmUrl: "https://www.npmjs.com/package/whatever" } })
+    === "https://www.npmjs.com/package/whatever", "★ 索引自己声明 npmUrl ⇒ 用它（生产端说了算）");
+  chk(C.npmPageOf({ name: "dsh-demo", raw: { homepage: "https://www.npmjs.com/package/x" } })
+    === "https://www.npmjs.com/package/x", "homepage 也认");
+  // ★ 索引是外部数据 ⇒ 它不能把用户带去别的主机
+  chk(C.npmPageOf({ name: "dsh-demo", raw: { npmUrl: "https://evil.example.com/x" } }) === "",
+    "★★ 索引声明的地址**不是 npm 官网** ⇒ 拒绝（索引被改坏也带不走用户）");
+  chk(C.npmPageOf({ name: "dsh-demo", raw: { npmUrl: "javascript:alert(1)" } }) === "",
+    "★★ javascript: 一律拒绝");
+  chk(C.npmPageOf({ name: "dsh-demo", raw: { npmUrl: "http://www.npmjs.com/package/x" } }) === "",
+    "★★ 非 https 拒绝");
+
+  // ④ 下载地址已经是 npm registry ⇒ 包名必然存在，给链接
+  chk(C.npmPageOf({
+    name: "whatever-name",
+    downloadUrl: "https://registry.npmjs.org/whatever-name/-/whatever-name-1.0.0.tgz",
+  }) === P + "whatever-name", "★ 下载地址就是 npm registry 的 tarball ⇒ 给链接（包必然存在）");
+
+  // ⑤ 乱七八糟的输入不许炸，也不许拼出东西
+  chk(C.npmPageOf(null) === "", "null ⇒ 空串");
+  chk(C.npmPageOf({}) === "", "空对象 ⇒ 空串");
+  chk(C.npmPageOf({ name: "../../etc/passwd" }) === "", "★ 路径穿越形态的包名 ⇒ 空串");
+  chk(C.npmPageOf({ name: "x?y=z#frag" }) === "", "★ 带查询串/锚点的包名 ⇒ 空串");
+  chk(C.npmPageOf({ name: "  " }) === "", "纯空白 ⇒ 空串");
+
+  // ⑥ normalizeEntry 要把 npmUrl 带出来（界面读的就是它）
+  const ne = C.normalizeEntry({
+    name: "dsh-int-demo", version: "1.0.0",
+    downloadUrl: "https://github.com/o/r/releases/download/t/a.tgz",
+    sha256: "a".repeat(64), bytes: 100,
+  });
+  chk(!!ne.entry && ne.entry.npmUrl === P + "dsh-int-demo", "★ normalizeEntry 产出的条目带 npmUrl",
+    ne.entry ? String(ne.entry.npmUrl) : "entry 是 null");
+  const neOld = C.normalizeEntry({
+    name: "dsh-demo", version: "1.0.0",
+    downloadUrl: "https://github.com/o/r/releases/download/t/a.tgz",
+    sha256: "a".repeat(64), bytes: 100,
+  });
+  chk(!!neOld.entry && neOld.entry.npmUrl === "", "非我们的命名 ⇒ npmUrl 是空串（界面据此不画按钮）");
+}
+
+// ═════════════════════════════════════════════════════════════════════════
 section("⑧ 拿线上真实索引跑一遍（连不上就 SKIP，不当成通过）");
 // ═════════════════════════════════════════════════════════════════════════
 (async () => {

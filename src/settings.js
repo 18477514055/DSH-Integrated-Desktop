@@ -455,6 +455,12 @@
     if (r.canInstall) {
       ops.push(`<button class="btn" data-pl-act="install" data-pl-name="${e(r.name)}">安装</button>`);
     }
+    // ★ npm 官网说明页（用户 2026-09-24 第 ③ 件事）。
+    //   只在 latest.npmUrl 有值时才画 —— 主进程的 npmPageOf() 算不出就不给，
+    //   免得点开一个 404 页面（索引里还挂着改名前的旧名，那些在 npm 上不存在）。
+    if (latest.npmUrl) {
+      ops.push(`<button class="btn" data-pl-act="npm" data-pl-name="${e(r.name)}">在 npm 上看说明</button>`);
+    }
     // ★ 本地已经装着的：**不**给"安装"，给"改用仓库版"并且界面会先问一句 ——
     //   否则一个看起来无害的「安装」会把用户的 dev link 悄悄换掉。
     if (r.canReplace) {
@@ -713,7 +719,7 @@
     });
 
     // 事件委托：卡片是 innerHTML 画出来的，逐张挂监听会在重画后丢掉
-    $("pl-list").addEventListener("click", (ev) => {
+    $("pl-list").addEventListener("click", async (ev) => {
       const btn = ev.target && ev.target.closest ? ev.target.closest("button[data-pl-act]") : null;
       if (!btn) return;
       const act = btn.dataset.plAct;
@@ -732,6 +738,18 @@
         doInstallPlugin(name, btn);
       } else if (act === "uninstall") {
         doUninstallPlugin(name, btn);
+      } else if (act === "npm") {
+        // ★ 打开 npm 官网说明页。URL 由**主进程**从它自己那份清单里算
+        //   （渲染进程只递包名，见 main.js 的 dsh:plugins:open-npm）。
+        btn.disabled = true;
+        try {
+          const r = await S.openPluginNpm(name);
+          if (!r || !r.ok) plProg(`打不开 npm 页面：${(r && r.reason) || "未知原因"}`);
+        } catch (err) {
+          plProg(`打不开 npm 页面：${(err && err.message) || err}`);
+        } finally {
+          btn.disabled = false;
+        }
       }
     });
 

@@ -2240,6 +2240,36 @@ function registerIpc() {
     return shell.openExternal(`https://github.com/${PC.HUB_REPO}`);
   });
 
+  /**
+   * 打开某个插件在 **npm 官网**上的说明页（用户 2026-09-24 提的第 ③ 件事）。
+   *
+   * ★ 与其它插件通道同一条纪律：**渲染进程只递包名，URL 由主进程重新算**。
+   *   为什么不收渲染进程递来的 URL：那会把这个通道变成"从设置页打开任意网址"。
+   *   主进程自己按 `PC.npmPageOf` 的判据算，算不出就拒。
+   */
+  ipcMain.handle("dsh:plugins:open-npm", async (e, name) => {
+    assertShellSender(e);
+    const want = typeof name === "string" ? name.trim() : "";
+    if (!want) return { ok: false, reason: "没给包名" };
+    // 从**主进程自己那份清单**里找这条（找不到就没有可信的 npm 地址可开）
+    try {
+      const st = await pluginState({});
+      const hit = (st.rows || []).find((r) => r.name === want);
+      const url = hit && hit.latest ? hit.latest.npmUrl : "";
+      if (!url) {
+        log(`打开 npm 页被拒：${want} 这一条没有可信的 npm 地址（索引里是旧名 / 没声明）`);
+        return { ok: false, reason: "这个插件在 npm 上没有可确认的页面" };
+      }
+      log(`打开 npm 页：${want} → ${url}`);
+      await shell.openExternal(url);
+      return { ok: true, url };
+    } catch (err) {
+      const reason = (err && err.message) || String(err);
+      log(`打开 npm 页出错：${reason}`);
+      return { ok: false, reason };
+    }
+  });
+
   // ── 本地插件包（断网可用；见 src/plugin-pack.js）────────────────────
   //
   // ★ 这三条**都不接受渲染进程递来的路径**：

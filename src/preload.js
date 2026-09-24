@@ -166,6 +166,11 @@ contextBridge.exposeInMainWorld("dshShell", {
   uninstallPlugin: (name) => ipcRenderer.invoke("dsh:plugins:uninstall", String(name)),
   /** 用系统浏览器打开插件仓库主页。 */
   openPluginHub: () => ipcRenderer.invoke("dsh:plugins:open-page"),
+  /**
+   * 用系统浏览器打开某个插件在 **npm 官网**上的说明页。
+   * ★ 只递**包名**：URL 由主进程从它自己那份清单里算（见 main.js 的 dsh:plugins:open-npm）。
+   */
+  openPluginNpm: (name) => ipcRenderer.invoke("dsh:plugins:open-npm", String(name)),
   /** 插件下载/安装进度：{ kind:"start"|"progress"|"end", name, version?, got?, total?, percent?, ok? } */
   onPluginProgress: (cb) => subscribe("dsh:plugins:progress", cb),
 

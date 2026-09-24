@@ -63,6 +63,77 @@ const ALLOWED_HOSTS = [
   "codeload.github.com",
 ];
 
+// ── npm 上的说明页（用户 2026-09-24 提的第 ③ 件事）────────────────────
+
+/** npm 官网。**这是给人看的页面**，不是下载源 —— 下载仍然只走 ALLOWED_HOSTS。 */
+const NPM_PAGE_BASE = "https://www.npmjs.com/package/";
+
+/**
+ * 一条清单条目该链到哪个 npm 页面 —— 算不出就返回空串（**绝不瞎拼**）。
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 为什么要有这个函数，而不是在界面里拼字符串
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 用户原话：「在我们的集成版插件页面那里加一条 npm 官网的地址，如果别人想看说明的话，
+ * 可以跳转到 npm 那里去查看。」
+ *
+ * ★★ 安全前提（2026-09-24 实测）：**索引里的名字不一定在 npm 上存在**。
+ *   实测 GitHub hub 索引当时还挂着两个**旧名**：
+ *     `dsh-plugin-uploader` → npm 上 **404**（改名前的名字，从没发过或已消失）
+ *     `dsh-multi-session`   → npm 上 **404**
+ *   而新名 `dsh-int-plugin-uploader` / `dsh-int-multi-session` → 200，维护者都是 `zjh18477514055`。
+ *   ⇒ 如果照着索引名字硬拼 `https://www.npmjs.com/package/<name>`，用户点开就是 **404 页面**，
+ *     看起来像"我们的包没了"。所以**只在能证明这个包确实在 npm 上时才给链接**。
+ *
+ * 判据（按可靠性排序，**任一条成立即可**）：
+ *   ① 索引条目**自己声明了** npm 页地址（`npmUrl` / `homepage`）—— 生产端最清楚；
+ *   ② 下载地址就是 **registry.npmjs.org** 的 tarball ⇒ 包名必然存在；
+ *   ③ 包名带 `dsh-int-` 前缀 —— 这是我们自己的命名约定（2026-09-23 第二次改名后的
+ *      **唯一**形态），而旧名一律不带 ⇒ 天然把索引里那些陈旧条目挡在外面。
+ *
+ * ⚠️ 这里**只做静态判断**，不联网。界面点开时若真 404，那是索引陈旧，
+ *    不该让"渲染清单"这一步去承担联网校验的代价（清单是离线可用的）。
+ *
+ * @param {{name?:string, raw?:object}} entry 清单条目（normalizeEntry 的产物）
+ * @returns {string} npm 页面地址；算不出就是空串
+ */
+function npmPageOf(entry) {
+  if (!entry || typeof entry !== "object") return "";
+  const raw = (entry.raw && typeof entry.raw === "object") ? entry.raw : {};
+
+  // ① 索引自己声明的（最可靠 —— 生产端可以指向任何它想指的地方）
+  const declared = str(raw.npmUrl) || str(raw.npm) || str(raw.homepage);
+  if (declared) {
+    // 仍然只放行 npm 官网，避免索引把用户带去别处
+    try {
+      const u = new URL(declared);
+      if (u.protocol === "https:" && (u.hostname === "www.npmjs.com" || u.hostname === "npmjs.com")) {
+        return declared;
+      }
+    } catch { /* 不是合法 URL ⇒ 继续走下面的判据 */ }
+  }
+
+  const name = str(entry.name);
+  if (!name) return "";
+  if (!/^(@[a-z0-9._-]+\/)?[a-z0-9][a-z0-9._-]*$/i.test(name)) return "";
+
+  // ② 下载地址就是 npm registry 的 tarball
+  const dl = str(entry.downloadUrl);
+  if (dl) {
+    try {
+      const u = new URL(dl);
+      if (u.protocol === "https:" && u.hostname === "registry.npmjs.org") {
+        return NPM_PAGE_BASE + name;
+      }
+    } catch { /* 忽略 */ }
+  }
+
+  // ③ 我们自己的命名约定（旧名一律不带这个前缀 ⇒ 挡住索引里的陈旧条目）
+  if (name.startsWith("dsh-int-")) return NPM_PAGE_BASE + name;
+
+  return "";
+}
+
 /**
  * 开发工具类插件：**仍然列出来，但默认不勾选**，并打上「开发者工具」标签。
  *
@@ -187,6 +258,9 @@ function normalizeEntry(raw) {
       compatible,
       keywords,
       repo: repoOf(downloadUrl) || HUB_REPO,
+      // ★ npm 说明页（用户 2026-09-24 第 ③ 件事）；算不出就是空串，界面据此决定
+      //   显不显示那个链接 —— **绝不瞎拼一个会 404 的地址**（见 npmPageOf 的注释）
+      npmUrl: npmPageOf({ name, downloadUrl, raw }),
       raw,                                  // 未知字段原样留着，将来加字段不用改外壳
     },
     errors,
@@ -494,9 +568,10 @@ function cleanupArchive(file) {
 module.exports = {
   // 常量
   HUB_REPO, HUB_BRANCH, INDEX_FILE, KNOWN_SCHEMA, ALLOWED_HOSTS, DEV_ONLY_FALLBACK,
+  NPM_PAGE_BASE,
   // 纯函数（可在普通 node 里单测）
   indexUrl, repoOf, isAllowedDownloadUrl, normalizeEntry, normalizeIndex,
-  groupByName, mergeInstalled, isDevOnly,
+  groupByName, mergeInstalled, isDevOnly, npmPageOf,
   // 需要 Electron 的
   fetchIndex, downloadArchive, cleanupArchive,
   readCache, writeCache, cacheFile,
