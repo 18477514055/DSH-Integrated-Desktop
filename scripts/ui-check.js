@@ -378,6 +378,43 @@ async function verifyLoading(tmpDir) {
     check("加载页：底部有「设置」按钮", p.hasSettingsBtn);
     check("加载页：抽屉容器存在", p.hasSheet);
 
+    // ★ 2026-09-25：全新机器（一个内核都没有）时，主进程会在失败快照里带
+    //   `openDiag:true`，加载页据此**自动拉开抽屉** —— 因为「下载并安装内核」
+    //   那个按钮就藏在抽屉里，而那是新用户此刻唯一能做的事。
+    //   ★ 这里**不靠"恰好没有内核"**造这个场景（本机全局 npm 装着内核，造不出来）：
+    //     直接把那份快照喂给页面自己的渲染函数 `__dshRender`，验的是
+    //     **页面真的读了 openDiag 并拉开了抽屉**（真 DOM、真 class）。
+    //     动作清单那一半（没内核才出现 install-kernel）由 kernel-provision-check ⑩ 验。
+    {
+      const r = await cdpEval(target.webSocketDebuggerUrl, `(async () => {
+        const before = document.getElementById("sheet").classList.contains("open");
+        window.__dshRender({
+          seq: 999999, failed: true, openDiag: true, settled: true, percent: 100,
+          percentLabel: "失败",
+          title: "这台电脑上还没有 dsh 内核",
+          stage: "点下面的「下载并安装内核」",
+          stages: [], detail: "找不到 dsh 内核。",
+        });
+        await new Promise(r => setTimeout(r, 250));
+        const after = document.getElementById("sheet").classList.contains("open");
+        const title = (document.getElementById("title")||{}).textContent || "";
+        // 用户手动关掉之后，**不该**被下一次快照又弹开（只自动拉一次）
+        document.getElementById("btn-close").click();
+        await new Promise(r => setTimeout(r, 200));
+        const closed = !document.getElementById("sheet").classList.contains("open");
+        window.__dshRender({ seq: 999999, failed: true, openDiag: true, settled: true, percent: 100 });
+        await new Promise(r => setTimeout(r, 250));
+        const stayedClosed = !document.getElementById("sheet").classList.contains("open");
+        return JSON.stringify({ before, after, title, closed, stayedClosed });
+      })()`);
+      const d = JSON.parse(r);
+      check("加载页：没有内核时抽屉**自动拉开**（新用户一眼看见「下载并安装内核」）",
+        d.before === false && d.after === true, JSON.stringify(d));
+      check("加载页：主标题换成人话「还没有 dsh 内核」", /还没有 dsh 内核/.test(d.title), d.title);
+      check("★ 抽屉只自动拉一次：用户关掉后不会被下一次快照又弹开",
+        d.closed === true && d.stayedClosed === true, JSON.stringify(d));
+    }
+
     // 动作清单 —— 同时证明 preload → IPC → 来源校验 → 白名单 整条链路
     check("动作清单已从主进程取回并渲染", p.actions.length >= 7,
       `共 ${p.actions.length} 条: ${p.actions.map((a) => a.id).join(", ")}`);
@@ -385,10 +422,18 @@ async function verifyLoading(tmpDir) {
     // ★ browser-open 是**按内核状态裁剪**的：内核还没就绪时它必须不在清单里
     //   （点了也没有地址可开）。所以不能断言"永远 8 条"。
     //   （第一版断言写的就是"永远 8 条"，在内核还没起来时误报 FAIL —— 是断言错，不是程序错。）
+    // ★ 2026-09-25：这里量的东西改名了。清单现在按**两个不同的概念**裁剪：
+    //   `hasServer`（内核此刻在跑 ⇒ 决定 browser-open）与
+    //   `hasKernel`（这台机器上装着内核 ⇒ 决定 install-kernel）。
+    //   原来这个变量叫 hasKernel 但装的是 `!!serverUrl` —— 名字骗人，一起改掉。
     const filterRaw = await cdpEval(target.webSocketDebuggerUrl, `(async () => {
       const env = await window.dshShell.getEnv();
       const list = await window.dshShell.listActions();
-      return JSON.stringify({ hasKernel: !!env.serverUrl, ids: list.map(a => a.id) });
+      return JSON.stringify({
+        hasServer: !!env.serverUrl,
+        hasKernel: !!env.kernelVersion,
+        ids: list.map(a => a.id),
+      });
     })()`);
     const fl = JSON.parse(filterRaw);
     const alwaysIds = ["restart-kernel", "clean-start", "health-check",
@@ -396,8 +441,14 @@ async function verifyLoading(tmpDir) {
     const missing = alwaysIds.filter((id) => !fl.ids.includes(id));
     check("7 条常驻动作全部在清单里", missing.length === 0, missing.length ? `缺 ${missing.join(", ")}` : "7/7");
     const hasBrowser = fl.ids.includes("browser-open");
-    check("「浏览器启动」按内核状态正确显隐", hasBrowser === fl.hasKernel,
-      `清单里 ${hasBrowser ? "有" : "没有"}，而 serverUrl ${fl.hasKernel ? "有" : "没有"}（共 ${fl.ids.length} 条）`);
+    check("「浏览器启动」按**内核在不在跑**正确显隐", hasBrowser === fl.hasServer,
+      `清单里 ${hasBrowser ? "有" : "没有"}，而 serverUrl ${fl.hasServer ? "有" : "没有"}（共 ${fl.ids.length} 条）`);
+    // ★ 这台机器上有内核（全局 npm 那份）⇒「下载并安装内核」**必须不在清单里**。
+    //   它要是出现了，就会诱导用户白下 214 MB。反向场景（真的没有内核）
+    //   在 kernel-provision-check ⑩ 里用假状态验。
+    check("★★ 本机有内核 ⇒ 清单里**没有**「下载并安装内核」（不诱导白下 214 MB）",
+      fl.hasKernel === true && !fl.ids.includes("install-kernel"),
+      `hasKernel=${fl.hasKernel} ids=${fl.ids.join(",")}`);
 
     // ★ 真的跑一次「环境体检」：只读、不弹窗，把 spawn→流式输出→页面 整条链路走通
     console.log("  正在真跑「环境体检」（只读）…");
@@ -1700,6 +1751,7 @@ const FR_PROBE = `(() => {
     navHasWizard: !!document.querySelector('nav button[data-pane="welcome"]'),
     repo: (document.getElementById('fr-repo') || {}).textContent || '',
     status: (document.getElementById('fr-status') || {}).textContent || '',
+    kernel: (document.getElementById('fr-kernel') || {}).textContent || '',
     items,
     btnLabel: btn ? (btn.textContent || '').trim() : '',
     btnDisabled: !!(btn && btn.disabled),
@@ -1777,6 +1829,18 @@ async function verifyFirstRun(tmpDir) {
     check("仓库名回填了（主进程把 repo 报回来了）", /DSH-Plugin-Hub/.test(fr.repo), fr.repo);
     check("状态行给了结论（清单更新于… / 显示的是缓存… / 取清单失败）",
       /清单更新于|显示的是缓存|取清单失败/.test(fr.status), fr.status);
+
+    // ★ 2026-09-25：内核那一行。用户原话是「如果用户自己有的话就不用勾，
+    //   或者就算勾了，扫描到电脑里已经有了，也不会下载」——
+    //   走到这一屏时内核**必然已经在了**（这一屏排在 ensureServer() 成功之后），
+    //   所以这里该出现的正是"扫到了、不会重复下载"那句。
+    //   ★ 断言的是**真的渲染出了那句结论**，不是"DOM 里有个 span"——
+    //     这个项目里"元素在、监听器也在、点了一点反应没有"已经出过好几次。
+    console.log(`  内核那一行: ${fr.kernel}`);
+    check("★★ 向导里报出了内核状态，且明说「不会重复下载」（用户要的就是这句）",
+      /已经有内核了/.test(fr.kernel) && /不会重复下载/.test(fr.kernel), fr.kernel);
+    check("★ 内核那一行不是停在「正在体检…」（说明那次 IPC 真的回来了）",
+      !/正在体检/.test(fr.kernel), fr.kernel);
 
     // 默认值：能装的默认勾上、开发者工具默认不勾、已装/不兼容的画成灰的且不可点
     const checkable = fr.items.filter((x) => !x.disabled);

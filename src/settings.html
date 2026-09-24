@@ -226,6 +226,49 @@
         </div>
       </div>
 
+      <!-- ── ★ 运行环境（2026-09-25 加）────────────────────────────────
+           用户原话：「我们这个纯粹的外壳下载之后还得麻烦用户自己去跑命令行下载
+             前面这两个东西才能用，这里就不比社区版简便了。」
+             ★ 那两个"东西"里，**Node.js 其实一直不需要**（外壳用 Electron 自带的
+               Node 跑内核）；真正缺的只有 dsh 内核。
+             ★ 与下面「内核」那一节的区别：
+               · 这里 = **新装**（装进 <userData>\kernel\<版本>\，独立目录，外壳能代劳）
+               · 下面 = **升级**（换全局 npm 目录里的代码，只给命令、由用户自己执行） -->
+      <h3 style="margin:26px 0 6px;font-size:14px">运行环境</h3>
+      <p class="hint">
+        第一次用需要有一个 <span class="mono">dsh</span> 内核。
+        <b>如果这台电脑上已经有了，这里会认出来、不会重复下载</b>；
+        没有的话勾上它，外壳会自己装 —— <b>不需要你装 Node.js</b>，也不需要敲命令行。
+      </p>
+
+      <div class="row">
+        <div class="k">dsh 内核</div>
+        <div class="v" style="flex-direction:column;align-items:flex-start;gap:6px;flex:1">
+          <label class="sw"><input type="checkbox" id="env-kernel-want"> 帮我准备好内核</label>
+          <span class="note" id="env-kernel-state">正在体检…</span>
+          <span class="mono" id="env-kernel-dir"
+                style="font-size:11.5px;color:var(--fg-faint);word-break:break-all"></span>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button class="btn" id="btn-env-install">开始安装</button>
+            <button class="btn" id="btn-env-refresh">重新体检</button>
+            <span class="note" id="env-prog"></span>
+          </div>
+          <div id="env-bar" style="display:none;height:8px;background:var(--line-soft);border-radius:6px;overflow:hidden;width:100%">
+            <i id="env-fill" style="display:block;height:100%;width:0;background:var(--accent);transition:width .15s"></i>
+          </div>
+          <details id="env-log-box" style="display:none;width:100%">
+            <summary class="note" style="cursor:pointer">安装日志</summary>
+            <pre id="env-log" class="mono"
+                 style="max-height:200px;overflow:auto;font-size:11px;background:var(--bg-soft);padding:8px;border-radius:6px;white-space:pre-wrap"></pre>
+          </details>
+        </div>
+      </div>
+
+      <div class="row" id="env-row-installed" style="display:none">
+        <div class="k">外壳装过的</div>
+        <div class="v" style="flex-direction:column;align-items:flex-start;gap:4px" id="env-installed-list"></div>
+      </div>
+
       <!-- ── 内核（另一回事，单独一节）───────────────────────────────
            用户原话：「加一个检查按钮，可以检测内核更新，要从官方渠道下载。」
            ★ 与上面「外壳更新」刻意分开：升外壳是换我们自己那个 exe；
@@ -307,6 +350,25 @@
         <div class="v">
           <span class="mono" id="fr-repo">—</span>
           <span class="note" id="fr-status">正在读清单…</span>
+        </div>
+      </div>
+
+      <!-- ★ 2026-09-25：内核体检（**只报状态，不放按钮**）。
+           用户原话是「让官方内核也和插件一样在安装界面勾选，如果用户自己有的话就不用勾，
+           或者就算勾了，扫描到电脑里已经有了，也不会下载」。
+           ★ 为什么这里只有一行字、没有勾选框和安装按钮 —— **结构上做不到**，不是偷懒：
+             这一屏排在 `ensureServer()` **成功之后**（勾选装插件要写 profile 的三处契约，
+             而 profile 是内核第一次跑起来才建的）。所以走到这一屏时，
+             内核**必然已经在了**，勾选框永远是"已扫到 ⇒ 不下载"那一个分支。
+           ⇒ 真正需要"勾选安装内核"的人（机器上一个内核都没有的），
+             根本到不了这一屏 —— 他停在**加载页的失败态**，那里有
+             「诊断与修复」抽屉里的「下载并安装内核」（自动拉开），
+             以及「设置 → 运行环境」那一栏。两处都在，且都是**可点的**。
+           这里这一行只做一件事：把"我们扫过了、你已经有、不会重复下载"如实说出来。 -->
+      <div class="row">
+        <div class="k">dsh 内核</div>
+        <div class="v">
+          <span class="note" id="fr-kernel">正在体检…</span>
         </div>
       </div>
       <div class="row" id="fr-row-prog" style="display:none">

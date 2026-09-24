@@ -49,6 +49,21 @@ let current = null;   // 正在跑的子进程（用于 cancel）
  */
 const ACTIONS = [
   {
+    // ★ 2026-09-25 新增：**新用户唯一的路**。
+    //   全新机器上 `ensureServer()` 会抛「找不到 dsh 内核」⇒ 用户停在**加载页的失败态**，
+    //   而那时他还没进过设置页（更别说知道「运行环境」那一栏在哪）。
+    //   所以这个动作必须挂在**加载页那个抽屉**里 —— 那是他此刻唯一看得见的界面。
+    //   只在"本机一个内核都没有"时出现（见下面 list() 的裁剪）。
+    id: "install-kernel",
+    label: "下载并安装内核",
+    desc: "这台电脑上没有 dsh 内核，客户端起不来。点它会用外壳自带的 npm 从官方渠道"
+      + "（registry.npmjs.org）装一份到用户数据目录（约 214 MB，只下一次），"
+      + "装完自动重启内核。不需要你装 Node.js，也不会动你已有的任何东西。",
+    danger: true,
+    confirm: "这会从官方渠道下载约 214 MB 的内核，装到本客户端的用户数据目录，"
+      + "然后自动重启一次内核。确定继续？",
+  },
+  {
     id: "restart-kernel",
     label: "重启内核",
     desc: "杀掉当前内核并重新拉起。改过插件/配置后想让它们生效时用这条。会中断正在生成的回答。",
@@ -110,7 +125,16 @@ const ACTIONS = [
 
 /**
  * 列出动作（按当前状态裁剪）。
- * @param {{profile?: string, hasKernel?: boolean}} state
+ *
+ * ★ 两个"有没有内核"是**两件事**，别混（2026-09-25 分开的）：
+ *   · `hasServer` = 内核**此刻在跑**（有地址可开）⇒ 决定「浏览器启动」；
+ *   · `hasKernel` = 这台机器上**装着**内核（不一定在跑）⇒ 决定「下载并安装内核」。
+ *   混用会出两种错，都真实发生过：
+ *     - 拿 hasServer 当 hasKernel ⇒ 内核装了但这次没起来时，劝用户**再下一份 214 MB**；
+ *     - 拿 hasKernel 当 hasServer ⇒ 内核装着但没跑时，「浏览器启动」摆在那儿，
+ *       点下去只会得到"内核还没就绪，没有可打开的地址"（实测被 `ui-check loading` 抓到）。
+ *
+ * @param {{profile?: string, hasKernel?: boolean, hasServer?: boolean}} state
  */
 function list(state = {}) {
   const inClean = state.profile === CLEAN_PROFILE_DIRNAME;
@@ -118,7 +142,13 @@ function list(state = {}) {
     .filter((a) => {
       if (a.id === "clean-start") return !inClean;
       if (a.id === "exit-clean") return inClean;
-      if (a.id === "browser-open") return state.hasKernel !== false;
+      // ★ 用 `!== false` 反向判：状态未知（老调用方没传）时**照旧显示**，
+      //   保持这一条的历史行为不变（它本来就只在"确定没地址"时隐藏）。
+      if (a.id === "browser-open") return state.hasServer !== false;
+      // ★ 装内核反过来：状态未知时**不显示** ——
+      //   宁可少一个按钮，也不能在一个已经有内核的机器上把它摆出来
+      //   （那会诱导用户白下 214 MB）。
+      if (a.id === "install-kernel") return state.hasKernel === false;
       return true;
     })
     .map(({ id, label, desc, danger, confirm }) => ({ id, label, desc, danger: !!danger, confirm: confirm || null }));
@@ -227,6 +257,64 @@ async function run(id, ctx) {
   if (!m) return { ok: false, code: -1, message: `未知动作: ${id}` };
 
   switch (id) {
+    // ── ★ 下载并安装内核（新用户唯一的路，2026-09-25 加）──────────
+    //
+    // 这一段**只做编排**：真正的下载/落位在 `src/kernel-provision.js`
+    // （由 main.js 以 `ctx.provisionKernel` 注入），重启内核走
+    // `ctx.restartKernel` —— 与「重启内核」那条**同一个实现**，
+    // 不另写一套（那套的失败回退是 2026-09-19 事故后专门补的）。
+    case "install-kernel": {
+      ctx.emit("sys", "开始安装 dsh 内核（官方渠道 registry.npmjs.org）…\n");
+      ctx.emit("sys", "落点：本客户端的用户数据目录，**不碰**你的全局 npm 与任何已有内核。\n\n");
+
+      let r;
+      // 进度别刷屏：npm 的进度条一秒能吐十几行。只在百分比跨过 10% 的台阶时报一次。
+      let lastPct = -10;
+      try {
+        r = await ctx.provisionKernel({
+          onLine: (s) => ctx.emit("sys", s + "\n"),
+          onProgress: (p) => {
+            if (!p || typeof p.percent !== "number") return;
+            const step = Math.floor(p.percent / 10) * 10;
+            if (step > lastPct) { lastPct = step; ctx.emit("sys", `…进度 ${p.percent}%\n`); }
+          },
+        });
+      } catch (e) {
+        return { ok: false, code: 1, message: `安装内核出错: ${(e && e.message) || e}` };
+      }
+
+      if (!r || !r.ok) {
+        ctx.emit("err", `\n安装失败：${(r && r.reason) || "未知原因"}\n`);
+        return { ok: false, code: 1, message: `安装内核失败：${(r && r.reason) || "未知原因"}` };
+      }
+
+      // ★ 判据不只看 provision 的返回（它只说"文件落位了"）——
+      //   必须让**发现链自己**再找一次，那才是"外壳现在真能认到它"。
+      if (!r.discovered) {
+        ctx.emit("err", "\n装完了，但外壳**仍然找不到**它 —— 请到「设置 → 运行环境」看日志。\n");
+        return {
+          ok: false, code: 2,
+          message: `内核 v${r.version} 装好了，但发现链没认到它（见日志）`,
+        };
+      }
+
+      ctx.emit("sys", `\n✓ 内核 v${r.discovered.version} 已就位（${r.discovered.source}）\n`);
+      ctx.emit("sys", "现在重启内核让它生效…\n");
+
+      try {
+        await ctx.restartKernel({ profile: ctx.state().profile });
+        ctx.emit("sys", `\n完成。内核: ${ctx.state().serverUrl || "?"}\n`);
+        return { ok: true, code: 0, message: `内核 v${r.discovered.version} 已装好并已重启生效` };
+      } catch (e) {
+        // ★ 装是装成了，只是没起来 —— **分开报**，别让用户以为白下了 214 MB。
+        ctx.emit("err", `\n内核已装好，但重启失败：${(e && e.message) || e}\n`);
+        return {
+          ok: false, code: 3,
+          message: `内核 v${r.discovered.version} 已装好，但重启内核失败（再点一次「重启内核」试试）`,
+        };
+      }
+    }
+
     // ── 重启内核 ────────────────────────────────────────────────
     case "restart-kernel": {
       ctx.emit("sys", `重启内核（档案 ${ctx.state().profile}）…\n`);

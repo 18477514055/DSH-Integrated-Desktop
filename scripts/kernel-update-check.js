@@ -179,8 +179,39 @@ async function main() {
   check("① 安装包只打外壳自己的 src/** 与 assets/**，**不含内核**",
     files.includes("src/**/*") && !files.some((f) => /vendor/i.test(f)),
     JSON.stringify(files));
-  check("① 也没有随包插件（0.2.6 起 extraResources 已删）",
-    !pkg.build || !pkg.build.extraResources, "extraResources=" + JSON.stringify(pkg.build && pkg.build.extraResources));
+  // 0.2.13 起 extraResources 又有了，但装的是**我们自带的 npm**（给"外壳代装内核"用），
+  // 不是随包插件。所以这里断言的落点从"没有 extraResources"改成"没有任何随包插件"。
+  const extraRes = (pkg.build && pkg.build.extraResources) || [];
+  const resTo = extraRes.map((e) => String((e && e.to) || e || ""));
+  const pluginRes = resTo.filter((t) => /plugin/i.test(t));
+  check("① 也没有随包插件（0.2.6 起不再随包发插件）",
+    !files.some((f) => /plugin/i.test(f)) && pluginRes.length === 0,
+    "files=" + JSON.stringify(files) + " extraResources.to=" + JSON.stringify(resTo));
+  check("①.1 extraResources 里只允许放 npm 运行时（0.2.13 起）",
+    resTo.length === 0 || resTo.every((t) => t === "npm" || t === "npm/node_modules"),
+    "extraResources.to=" + JSON.stringify(resTo));
+  // ★★ 0.2.14：随包 npm 的**两条** extraResources 必须成对存在。
+  //
+  //   为什么单列这一条（2026-09-25 实测抓到的真 bug）：
+  //     electron-builder 的 `app-builder-lib/out/util/filter.js:43-45` 里
+  //     **硬编码**了一行 `if (relative === "node_modules") return false;`
+  //     ⇒ 一条 `from: runtime/npm` 的 extraResources **永远拷不进 node_modules**：
+  //       实测 1944 个文件只剩 418 个 / 3.2 MB，产物里那个 npm 是个跑不起来的空壳。
+  //     ⇒ 修法是把里层拆成第二条（`from: runtime/npm/node_modules` → `to: npm/node_modules`），
+  //       那样它的相对路径不再是 "node_modules"，就能过。
+  //   ⇒ 这两条**必须同时存在**，少一条就等于发一个装不了内核的包。
+  //     （判据的"真跑"版本在 scripts/packaged-npm-check.js —— 它会回读产物。）
+  {
+    const froms = extraRes.map((e) => String((e && e.from) || e || ""));
+    const hasOuter = froms.includes("runtime/npm");
+    const hasInner = froms.includes("runtime/npm/node_modules");
+    check("①.2 ★★ 随包 npm 的两条 extraResources 成对存在（少一条 = 发个装不了内核的包）",
+      !extraRes.length || (hasOuter && hasInner),
+      "from=" + JSON.stringify(froms)
+      + (extraRes.length && !hasInner
+        ? "  ← 缺 runtime/npm/node_modules：electron-builder 会**静默丢掉** node_modules"
+          + "（filter.js:43 硬编码 relative==='node_modules' 就拒绝），产物里的 npm 跑不起来" : ""));
+  }
   const src = fs.readFileSync(path.join(ROOT, "src", "kernel.js"), "utf8");
   check("② 外壳把内核当**外部程序**（spawn 它的 bin.js），不引用内核内部模块",
     /spawn\(process\.execPath/.test(src) && !/require\(["']@deepseek-ai\/dsh/.test(src),

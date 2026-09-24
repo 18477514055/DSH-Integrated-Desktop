@@ -146,6 +146,25 @@ contextBridge.exposeInMainWorld("dshShell", {
   /** 内核包下载进度：{ kind, got, total, percent } */
   onKernelProgress: (cb) => subscribe("dsh:kernel:progress", cb),
 
+  // ── ★ 运行环境：替用户装内核（实现全在 src/kernel-provision.js）──────────
+  //
+  // 用户 2026-09-25 原话：「我们这个纯粹的外壳下载之后还得麻烦用户自己去跑命令行
+  //   下载前面这两个东西才能用……让官方内核也和插件一样在安装界面勾选，
+  //   如果用户自己有的话就不用勾……扫描到电脑里已经有了，也不会下载。」
+  //
+  // ★ 与上面「检查内核更新」那一组的区别（**别以为重复了**）：
+  //   · 上面是**升级**：往外壳此刻正在运行的全局 npm 目录里换代码 ⇒ 只给命令；
+  //   · 这里是**新装**：装进独立的 `<userData>\kernel\<版本>\` ⇒ 外壳可以代劳，
+  //     因为最坏结果只是那个目录里多个半成品，**不影响任何已能跑的东西**。
+  /** 只读体检：本机有没有内核、随包 npm 在不在、外壳装过哪些版本。 */
+  kernelEnv: () => ipcRenderer.invoke("dsh:kernel:env"),
+  /** 真装（用随包 npm + Electron 自带的 Node）。进度走 onKernelProgress。 */
+  provisionKernel: (version) => ipcRenderer.invoke(
+    "dsh:kernel:provision", version ? String(version) : ""),
+  /** 删掉外壳装过的某个版本（只删 <userData>\kernel\ 里的）。 */
+  removeKernel: (version) => ipcRenderer.invoke(
+    "dsh:kernel:remove", version ? String(version) : ""),
+
   // ── 集成版插件（清单 src/plugin-catalog.js；装/卸 src/plugin-install.js）──
   //
   // ⚠️ 这一组会**往 DSH 家里装东西、并改 profile** ⇒ 主进程只放行**外壳自有页面**。

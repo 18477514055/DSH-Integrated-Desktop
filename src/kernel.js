@@ -50,6 +50,40 @@ function findKernelCandidates(opts = {}) {
     list.push({ path: bundled, source: "应用自带" });
   }
 
+  // ②.5 ★ 外壳**替用户装**的内核（2026-09-25 加）
+  //
+  //   为什么需要这一级：新用户机器上没有全局 npm 的 dsh，而"让用户自己敲
+  //   `npm i -g @deepseek-ai/dsh`"正是用户报的那个问题
+  //   （「纯粹的外壳下载之后还得麻烦用户自己去跑命令行」）。
+  //   `src/kernel-provision.js` 用随包的 npm 把它装到
+  //   `<userData>\kernel\<版本>\`，这一级就是让外壳**找得到自己装的那份**。
+  //
+  //   ★ 为什么排在这里（应用自带之后、全局 npm 之前）：
+  //     · 显式指定 / DSH_KERNEL_PATH 是用户意志，永远最优先；
+  //     · 应用自带是"这一包特意配的"，也该压过我们自动装的；
+  //     · 但**要压过全局 npm** —— 否则用户点了"给我装内核"，外壳却仍去用
+  //       一个更旧/更坏的全局版本，界面上看就是"装了没生效"。
+  //   ★ 多个版本时取**版本号最大的**（自己装的目录名就是版本号）。
+  //     不按 mtime 排 —— 拷来拷去 mtime 必变，这条教训项目里记过。
+  if (opts.userDataDir) {
+    const root = path.join(String(opts.userDataDir), "kernel");
+    let best = null;
+    try {
+      for (const e of fs.readdirSync(root, { withFileTypes: true })) {
+        if (!e.isDirectory()) continue;
+        const p = path.join(root, e.name);
+        if (!fs.existsSync(path.join(p, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"))) continue;
+        if (!best || e.name > best.name) best = { name: e.name, path: p };
+      }
+    } catch { /* 目录不存在 = 外壳没装过 */ }
+    if (best) {
+      list.push({
+        path: path.join(best.path, "node_modules", "@deepseek-ai", "dsh"),
+        source: `外壳安装（${best.name}）`,
+      });
+    }
+  }
+
   // ③ 全局 npm 安装（%APPDATA%\npm\node_modules\@deepseek-ai\dsh）
   const globalNpm = path.join(
     process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"),

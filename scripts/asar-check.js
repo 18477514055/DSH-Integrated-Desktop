@@ -67,6 +67,9 @@ const CHECKS = [
       "dsh:first-run:state", "dsh:first-run:done", "firstRunDue", "maybeAutoOpenFirstRun",
       // ★ 0.2.10：退出要能退干净 —— 认领复用的内核、退出时一起关（见 docs/退出退不干净-2026-09-23.md）
       "claimAdoptedKernel", "adoptedKernelPid", "shutdownKernels", "quitApp", "armQuitOnFileHook",
+      // ★ 0.2.14：运行环境那三条 IPC + 缺内核时的标记（加载页据此自动拉开抽屉）
+      "dsh:kernel:env", "dsh:kernel:provision", "dsh:kernel:remove",
+      "DSH_KERNEL_MISSING", "openDiag",
     ],
   },
   {
@@ -97,6 +100,17 @@ const CHECKS = [
     file: "src/kernel.js",
     // ★ 0.2.10：判"这个内核是不是本应用拉起来的"要用的三个原语
     marks: ["dsh-home", "ourKernelProcess", "portOwner", "waitPortFree"],
+  },
+  {
+    // ★ 0.2.14：**外壳替用户装内核**那一整套（用户 2026-09-25 报的"还得自己跑命令行"）。
+    //   这个文件必须真的进产物 —— 少了它，"新用户开箱即用"这条承诺整个不成立，
+    //   而且症状是"点了按钮报 is not a function"（只有在全新机器上才暴露）。
+    file: "src/kernel-provision.js",
+    marks: ["npm-cli.js", "bundledNpmDir", "--ignore-scripts", "kernelDirFor", "provision"],
+  },
+  {
+    file: "src/diagnostics.js",
+    marks: ["install-kernel", "provisionKernel", "hasServer", "hasKernel"],
   },
 ];
 
@@ -290,9 +304,78 @@ function main() {
     }
   }
 
+  // ── ★★ 0.2.14：随包的 npm 必须真的落在 `resources\npm\` ──────────────
+  //
+  // 为什么这条是**结论性判据**（比上面所有标记都硬）：
+  //   「外壳替用户装内核」整条链的入口是 `kernel-provision.js` 的 `bundledNpmDir()`，
+  //   打包版它读的是 `process.resourcesPath\npm`（= `resources\npm\`）。
+  //   而**开发机上永远读得到** `<repo>\runtime\npm` ⇒ `kernel-provision-check`
+  //   在开发机上跑一万遍都是绿的，**哪怕 electron-builder 根本没拷这个目录**。
+  //   ⇒ 必须回读**产物**。少了它，用户拿到 exe 后点「下载并安装内核」会得到
+  //     "随包的 npm 不在（打包时漏了 runtime/npm？）"，而我们在开发机上什么都看不见。
+  //   （这正是本项目那条铁律：**仓库里改了 ≠ 产物里就是那个版本**。）
+  {
+    const resDir = path.dirname(asar);
+    const npmDir = path.join(resDir, "npm");
+    const npmCli = path.join(npmDir, "bin", "npm-cli.js");
+    const npmNm = path.join(npmDir, "node_modules");
+
+    let npmFiles = 0;
+    let npmBytes = 0;
+    if (fs.existsSync(npmDir)) {
+      (function w(d) {
+        let es = [];
+        try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+        for (const en of es) {
+          const p = path.join(d, en.name);
+          let isDir = false;
+          try { isDir = fs.statSync(p).isDirectory(); } catch { continue; }
+          if (isDir) w(p);
+          else { npmFiles += 1; try { npmBytes += fs.statSync(p).size; } catch { /* 忽略 */ } }
+        }
+      })(npmDir);
+    }
+
+    console.log("");
+    console.log(`  resources/npm 存在: ${fs.existsSync(npmDir)}`
+      + (fs.existsSync(npmDir) ? `（${npmFiles} 个文件 / ${(npmBytes / 1024 / 1024).toFixed(1)} MB）` : ""));
+    console.log(`  resources/npm/bin/npm-cli.js 存在: ${fs.existsSync(npmCli)}`);
+
+    if (!fs.existsSync(npmCli)) {
+      structBad += 1;
+      console.log("  FAIL  ★★ 随包的 npm 不在产物里 —— 「外壳替用户装内核」整条链会当场断掉。"
+        + "\n        用户点「下载并安装内核」只会得到「随包的 npm 不在（打包时漏了 runtime/npm？）」。"
+        + "\n        修法：先跑 `node scripts/fetch-npm.js` 把 runtime/npm 备好，再确认"
+        + "\n        package.json 的 build.extraResources 里有 { from: \"runtime/npm\", to: \"npm\" }。");
+    } else if (!fs.existsSync(npmNm)) {
+      structBad += 1;
+      console.log("  FAIL  ★★ npm-cli.js 在，但 node_modules 不在 —— 那是个跑不起来的 npm 壳子"
+        + "（npm 的依赖没解出来，`npm install` 会 MODULE_NOT_FOUND）。");
+    } else if (npmFiles < 500) {
+      structBad += 1;
+      console.log(`  FAIL  ★★ 随包的 npm 只有 ${npmFiles} 个文件 —— 明显不完整（实测应约 1900 个）。`);
+    } else {
+      // ★ 与开发机上那一份对一对：产物里的必须就是备好的那一份
+      const srcDir = path.join(ROOT, "runtime", "npm");
+      const srcCli = path.join(srcDir, "bin", "npm-cli.js");
+      if (fs.existsSync(srcCli)) {
+        const a = crypto.createHash("sha256").update(fs.readFileSync(npmCli)).digest("hex");
+        const b = crypto.createHash("sha256").update(fs.readFileSync(srcCli)).digest("hex");
+        if (a === b) {
+          console.log("  OK    ★★ 随包 npm 完整，且 npm-cli.js 与 runtime/npm 逐字节相同");
+        } else {
+          structBad += 1;
+          console.log("  FAIL  产物里的 npm-cli.js 与 runtime/npm 那一份**不是同一个文件**");
+        }
+      } else {
+        console.log("  （参考）本机没有 runtime/npm，无法逐字节对照（--check 会报它缺失）");
+      }
+    }
+  }
+
   console.log("");
   if (bad === 0 && structBad === 0) {
-    console.log(`结论：${filesOk} 个文件、${totalMarks} 个功能标记全部命中；结构性检查全过（干净包）`);
+    console.log(`结论：${filesOk} 个文件、${totalMarks} 个功能标记全部命中；结构性检查全过（干净包 + 随包 npm 就位）`);
     process.exit(0);
   }
   if (bad) console.log(`结论：${bad} 个标记缺失 —— **产物里的代码不是你现在看到的这一份**`);

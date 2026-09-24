@@ -108,11 +108,14 @@ function cmpVersion(a, b) {
 /**
  * 本机内核现状。**只读**。
  *
- * 用 `kernel.js` 的发现链（显式指定 → 应用自带 → 全局 npm），
+ * 用 `kernel.js` 的发现链（显式指定 → 应用自带 → **外壳安装的** → 全局 npm），
  * 所以报出来的就是外壳**真会去启动**的那一个 —— 不是另猜一个。
+ *
+ * ★ 2026-09-25：把 userDataDir 传下去，否则"外壳替用户装的那一份"会被漏掉，
+ *   界面就会在明明装好的情况下报"没找到内核"。
  */
 function installed() {
-  const k = K.discoverKernel({});
+  const k = K.discoverKernel({ userDataDir: app.getPath("userData") });
   if (!k) return { found: false, version: "", dir: "", source: "", bin: "" };
   return { found: true, version: k.version, dir: k.dir, source: k.source, bin: k.bin };
 }

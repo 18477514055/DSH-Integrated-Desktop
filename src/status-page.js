@@ -34,6 +34,8 @@
   output.init(outClear);
 
   let seenSeq = -1;
+  /** 抽屉是否已经被**自动**拉开过 —— 只自动拉一次，之后用户关了就是关了。 */
+  let autoOpened = false;
 
   function render(st) {
     if (!st) return;
@@ -72,6 +74,16 @@
         elVerdict.className = "verdict show bad";
         elVerdict.textContent = "启动没成功。可以先点下面的「诊断与修复」。";
       }
+    }
+
+    // ★ 2026-09-25：**本机一个内核都没有**时，把抽屉**自动拉开**。
+    //   理由：那是全新用户第一次打开客户端的唯一界面，而他要做的事
+    //   （点「下载并安装内核」）就藏在这个抽屉里 —— 让他自己去发现
+    //   「诊断与修复」这四个字，等于把最容易卡住的一步交给运气。
+    //   只在主进程明确标了 `openDiag` 时才做（别的失败不打扰用户）。
+    if (st.openDiag === true && !autoOpened) {
+      autoOpened = true;
+      openSheet();
     }
   }
 

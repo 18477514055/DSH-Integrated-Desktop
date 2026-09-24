@@ -378,12 +378,174 @@
 
     S.onKernelProgress((p) => {
       if (!p) return;
+      // ★ 2026-09-25：这一条通道现在同时承载「运行环境」那一段的进度
+      //   （见下面 wireKernelEnv）。按 kind 分流，别让两边互相覆盖。
+      if (p.kind === "provision-progress") {
+        const pct = Math.max(0, Math.min(100, p.percent || 0));
+        $("env-fill").style.width = `${pct}%`;
+        if (p.phase === "check") envProg("正在查官方最新版本…");
+        else if (p.phase === "install") envProg(`正在安装…（${pct}%）`);
+        else if (p.phase === "done") envProg("完成");
+        return;
+      }
+      if (p.kind === "provision-line") {
+        const box = $("env-log");
+        if (box) {
+          box.textContent += (box.textContent ? "\n" : "") + String(p.line || "");
+          box.scrollTop = box.scrollHeight;
+          $("env-log-box").style.display = "";
+        }
+        return;
+      }
       const pct = Math.max(0, Math.min(100, p.percent || 0));
       $("kn-fill").style.width = `${pct}%`;
       knProg.textContent = p.total
         ? `${fmtBytes(p.got)} / ${fmtBytes(p.total)}（${pct}%）`
         : fmtBytes(p.got);
     });
+  }
+
+  // ── ★ 运行环境：替用户准备内核（2026-09-25 加）────────────────────────
+  //
+  // 用户原话：「让官方内核也和插件一样在安装界面勾选，如果用户自己有的话就不用勾，
+  //   或者就算勾了，扫描到电脑里已经有了，也不会下载，如果没有的话就勾上给他加一句
+  //   说明就可以了。」
+  //
+  // ★ 这一段的判据全在主进程（`dsh:kernel:env` 只读体检）——
+  //   页面**不自己判断"有没有内核"**，否则界面说"已装"、外壳却找不到，用户会被误导。
+  //
+  // ★ 与上面「检查内核更新」的分工（**别以为是重复功能**）：
+  //   · 这里 = **新装**到 <userData>\kernel\<版本>\（独立目录，外壳能代劳）
+  //   · 上面 = **升级**全局 npm 里的那份（只给命令、由用户自己执行）
+  let envState = null;
+
+  const envProg = (t) => { const el = $("env-prog"); if (el) el.textContent = t; };
+
+  /** 渲染体检结果。**三种状态文案分明**：已找到 / 没找到 / 随包 npm 缺失。 */
+  function renderKernelEnv(st) {
+    envState = st;
+    const state = $("env-kernel-state");
+    const dir = $("env-kernel-dir");
+    const want = $("env-kernel-want");
+    const btn = $("btn-env-install");
+    if (!state) return;
+
+    if (st.found) {
+      // ★ 用户要的就是这一条："扫到电脑里已经有了，就不会下载"
+      state.textContent = `✓ 这台电脑上已经有内核了：v${st.version}（来自：${st.source}）—— 不会重复下载`;
+      dir.textContent = st.dir || "";
+      want.checked = false;
+      want.disabled = true;
+      btn.disabled = true;
+      btn.textContent = "已经有内核了";
+    } else {
+      want.disabled = false;
+      if (!st.bundledNpm) {
+        // 随包 npm 不在 = 没法代劳，如实说，别给一个点了会失败的按钮
+        state.textContent = "✗ 没找到内核，而且随包的 npm 不在（这一包打包时漏了 runtime/npm）—— "
+          + "只能自己装：npm i -g @deepseek-ai/dsh";
+        dir.textContent = "";
+        want.checked = false;
+        want.disabled = true;
+        btn.disabled = true;
+        btn.textContent = "无法代装";
+      } else {
+        // ★ 用户要的那句说明："如果没有的话就勾上给他加一句说明就可以了"
+        state.textContent = "没有找到内核 ⇒ 建议勾上。外壳会自己下载安装"
+          + "（约 214 MB，只这一次），**不需要你装 Node.js**，也不需要敲命令行。";
+        dir.textContent = "";
+        want.checked = true;
+        btn.disabled = false;
+        btn.textContent = "开始安装";
+      }
+    }
+
+    // 外壳装过的那些（后悔药：可以删）
+    const row = $("env-row-installed");
+    const list = $("env-installed-list");
+    if (!row || !list) return;
+    if (st.installed && st.installed.length) {
+      row.style.display = "";
+      list.textContent = "";
+      for (const it of st.installed) {
+        const line = document.createElement("div");
+        line.style.cssText = "display:flex;gap:8px;align-items:center";
+        const t = document.createElement("span");
+        t.className = "mono";
+        t.textContent = `v${it.version}`;
+        const b = document.createElement("button");
+        b.className = "btn";
+        b.textContent = "删除";
+        b.addEventListener("click", async () => {
+          b.disabled = true;
+          const r = await S.removeKernel(it.version).catch((e) => ({ ok: false, reason: String(e) }));
+          if (r && r.ok) { await loadKernelEnv(); }
+          else { b.disabled = false; envProg(`删除失败：${(r && r.reason) || "未知"}`); }
+        });
+        line.appendChild(t);
+        line.appendChild(b);
+        list.appendChild(line);
+      }
+    } else {
+      row.style.display = "none";
+    }
+  }
+
+  async function loadKernelEnv() {
+    const state = $("env-kernel-state");
+    if (state) state.textContent = "正在体检…";
+    try {
+      const st = await S.kernelEnv();
+      renderKernelEnv(st);
+    } catch (e) {
+      if (state) state.textContent = `体检失败：${(e && e.message) || e}`;
+    }
+  }
+
+  async function doKernelProvision() {
+    const btn = $("btn-env-install");
+    btn.disabled = true;
+    $("env-bar").style.display = "";
+    $("env-fill").style.width = "0%";
+    $("env-log").textContent = "";
+    $("env-log-box").style.display = "none";
+    envProg("正在准备…");
+    try {
+      const r = await S.provisionKernel("");
+      if (!r || !r.ok) {
+        envProg(`安装失败：${(r && r.reason) || "未知"}`);
+        btn.disabled = false;
+        $("env-log-box").style.display = "";
+        return;
+      }
+      // ★ 判据不只看 provision 的返回 —— 它只说"文件落位了"。
+      //   主进程会**回读发现链**（r.discovered），那才是"外壳现在真能认到它"。
+      if (r.discovered) {
+        envProg(`✓ 装好了 v${r.discovered.version}（${r.discovered.source}）—— 点「重启内核」即可生效`);
+      } else {
+        envProg("⚠ 装完了但外壳**仍然找不到**它 —— 请看日志，或到「诊断与修复」里反馈");
+      }
+      await loadKernelEnv();
+    } catch (e) {
+      envProg(`出错：${(e && e.message) || e}`);
+      btn.disabled = false;
+    }
+  }
+
+  function wireKernelEnv() {
+    const want = $("env-kernel-want");
+    const btn = $("btn-env-install");
+    const refresh = $("btn-env-refresh");
+    if (!want || !btn) return;
+
+    // ★ 勾选框只是"表达意愿"，**真正的动作必须点「开始安装」** ——
+    //   绝不因为勾了一下就自动开始下 214 MB（那是个大事，要用户明确点）。
+    want.addEventListener("change", () => {
+      envProg(want.checked ? "已勾选 —— 点右边「开始安装」开始" : "已取消勾选");
+    });
+    btn.addEventListener("click", doKernelProvision);
+    if (refresh) refresh.addEventListener("click", loadKernelEnv);
+    loadKernelEnv();
   }
 
   // ── 集成版插件（清单在主进程 src/plugin-catalog.js；装/卸在 src/plugin-install.js）──
@@ -947,10 +1109,39 @@
     $("fr-list").innerHTML = "";
     $("btn-fr-install").disabled = true;
     frStatus("正在读清单…");
+    // ★ 内核那一行**单独去读**，且不 await 到 renderWizard 前面 ——
+    //   它是只读体检（不联网），但也不该拖慢清单的渲染。
+    //   失败了就写一句实话，绝不静默留个"正在体检…"。
+    loadWizardKernel();
     try {
       renderWizard(await S.plugins());
     } catch (e) {
       frStatus(`出错：${(e && e.message) || e}`);
+    }
+  }
+
+  /**
+   * 首启向导里那一行内核状态（见 settings.html 里的长注释：**只报状态，不放按钮**）。
+   *
+   * ★ 走到这一屏时内核**必然已经在了** —— 这一屏排在 `ensureServer()` 成功之后。
+   *   所以这里的措辞就照用户要的那句来：「扫到电脑里已经有了，就不会重复下载」。
+   *   万一真的读不到（不该发生），也**如实说**，不假装没这回事。
+   */
+  async function loadWizardKernel() {
+    const el = $("fr-kernel");
+    if (!el) return;
+    try {
+      const st = await S.kernelEnv();
+      if (st && st.found) {
+        el.textContent = `✓ 这台电脑上已经有内核了：v${st.version}（来自：${st.source}）—— 不会重复下载`;
+      } else if (st && st.bundledNpm) {
+        // 能到这里说明内核没找到却能开出设置页（复用别人的内核等）—— 给可点的出路
+        el.textContent = "没有扫到内核 —— 到「更新」那一栏的「运行环境」里可以点安装（不需要 Node.js）";
+      } else {
+        el.textContent = "没扫到内核，而且随包的 npm 不在（这一包打包时漏了 runtime/npm）—— 只能自己装：npm i -g @deepseek-ai/dsh";
+      }
+    } catch (e) {
+      el.textContent = `内核体检失败：${(e && e.message) || e}`;
     }
   }
 
@@ -1131,6 +1322,7 @@
     wire();
     wireUpdate();
     wireKernelUpdate();
+    wireKernelEnv();
     wirePlugins();
     wireWizard();
     wirePack();

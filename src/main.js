@@ -42,6 +42,7 @@ const os = require("node:os");
 
 const K = require("./kernel");
 const KU = require("./kernel-update");
+const KP = require("./kernel-provision");
 const diagnostics = require("./diagnostics");
 const P = require("./plugins");
 const SITES = require("./sites");
@@ -917,15 +918,27 @@ async function ensureServer(opts = {}) {
 
   // ② 找内核
   pushStatus({ stage: "正在查找内核…", stageKey: "kernel" });
-  const kernel = K.discoverKernel({});
+  // ★ 2026-09-25：把 userDataDir 传进去，让发现链能认到
+  //   「外壳替用户装的那一份」（<userData>\kernel\<版本>\，见 src/kernel-provision.js）。
+  //   不传的话，用户点了"帮我装内核"、装完了外壳却仍去用全局 npm 的旧版 ——
+  //   界面上看就是"装了没生效"。
+  const kernel = K.discoverKernel({ userDataDir: app.getPath("userData") });
   if (!kernel) {
-    throw new Error(
+    // ★ 打上标记：这不是"起不来"，而是"**这台机器上一个内核都没有**"。
+    //   `bootstrap()` 的失败分支据此把加载页的抽屉**自动拉开**，
+    //   因为此刻用户唯一能做的事（点「下载并安装内核」）就藏在那里。
+    //   用 `code` 而不是匹配文案 —— 文案随时会改，匹配字符串是个会悄悄失效的尺子。
+    const err = new Error(
       "找不到 dsh 内核。\n\n" +
-      "已尝试：DSH_KERNEL_PATH 环境变量 / 应用自带 vendor/dsh / 全局 npm。\n" +
+      "已尝试：DSH_KERNEL_PATH 环境变量 / 应用自带 vendor/dsh / 外壳安装的 / 全局 npm。\n" +
       "安装方式（任选）：\n" +
-      "  npm i -g @deepseek-ai/dsh\n" +
-      "或把内核放到应用的 vendor/dsh 目录。",
+      "  · 点下面「诊断与修复」→「下载并安装内核」（外壳会自己下，不需要 Node.js）\n" +
+      "  · 打开设置 → 运行环境 → 勾选「dsh 内核」并点安装\n" +
+      "  · 或自己装：npm i -g @deepseek-ai/dsh\n" +
+      "  · 或把内核放到应用的 vendor/dsh 目录。",
     );
+    err.code = "DSH_KERNEL_MISSING";
+    throw err;
   }
   kernelInfo = { version: kernel.version, dir: kernel.dir, source: kernel.source };
   log(`使用内核: ${kernel.version}（来源 ${kernel.source}）`);
@@ -1883,6 +1896,26 @@ function buildDiagCtx() {
       settings: { ...settings },
     }),
     restartKernel,
+    /**
+     * ★ 2026-09-25：交给 `diagnostics.js` 的 `install-kernel` 动作用。
+     *   这里**只做注入**，实现仍在 `src/kernel-provision.js`（单一出处）。
+     *   返回前**回读一次发现链** —— 与 `dsh:kernel:provision` 那条通道完全一致，
+     *   因为"文件落位了"和"外壳真能认到它"是两件事（判据见 kernel-provision-check.js）。
+     */
+    provisionKernel: async (hooks = {}) => {
+      const userDataDir = app.getPath("userData");
+      const r = await KP.provision({
+        userDataDir,
+        onLine: hooks.onLine,
+        onProgress: hooks.onProgress,
+      });
+      let seen = null;
+      try {
+        const k2 = K.discoverKernel({ userDataDir });
+        seen = k2 ? { version: k2.version, source: k2.source, dir: k2.dir } : null;
+      } catch { /* 如实报 null */ }
+      return { ...r, discovered: seen };
+    },
     openPath: (p) => shell.openPath(p),
     openExternal: (u) => shell.openExternal(u),
     clipboardWrite: (t) => clipboard.writeText(t),
@@ -1893,7 +1926,14 @@ function registerIpc() {
   ipcMain.handle("dsh:diag:list", (e) => {
     assertShellSender(e);
     const st = buildDiagCtx().state();
-    return diagnostics.list({ profile: st.profile, hasKernel: !!st.serverUrl });
+    // ★ 两个"有没有内核"是**两件事**（见 diagnostics.js 的 list() 注释）：
+    //   · hasServer = 内核**此刻在跑**（有地址可开）⇒ 决定「浏览器启动」；
+    //   · hasKernel = 这台机器上**装着**内核（不一定在跑）⇒ 决定「下载并安装内核」。
+    //   前者看 `serverUrl`；后者看 `kernelVersion` —— 它来自 `kernelInfo`，
+    //   只有 `discoverKernel()` 成功过才有值，也就是"磁盘上真的有"。
+    const hasServer = !!st.serverUrl;
+    const hasKernel = !!(st.kernelVersion || hasServer);
+    return diagnostics.list({ profile: st.profile, hasKernel, hasServer });
   });
 
   ipcMain.handle("dsh:diag:run", async (e, id) => {
@@ -2151,6 +2191,69 @@ function registerIpc() {
   ipcMain.handle("dsh:kernel:open-page", (e) => {
     assertShellSender(e);
     return KU.openOfficialPage();
+  });
+
+  // ── ★ 运行环境：**替用户装内核**（2026-09-25 加，见 src/kernel-provision.js）──
+  //
+  // 用户原话：「我们这个纯粹的外壳下载之后还得麻烦用户自己去跑命令行下载前面这两个
+  //   东西才能用，这里就不比社区版简便了。……让官方内核也和插件一样在安装界面勾选，
+  //   如果用户自己有的话就不用勾……扫描到电脑里已经有了，也不会下载。」
+  //
+  // ★ 为什么这里**可以**有"安装"，而上面 `dsh:kernel:*` 那一组刻意没有：
+  //   上面那组是**升级内核**（往外壳此刻正在运行的**全局 npm 目录**里换代码 ——
+  //   2026-09-19 事故的根源，所以只给命令、由用户自己执行）。
+  //   而这里是**新装到一个独立目录** `<userData>\kernel\<版本>\`：
+  //     · 不碰全局 npm 目录、不碰安装目录、不碰用户已有的任何内核；
+  //     · 失败了最坏结果 = 那个目录里多个半成品，删掉即可，**不影响任何已能跑的东西**；
+  //     · 成功之后 `kernel.js` 的发现链会认到它（②.5 级）。
+  //   ⇒ 这两件事的**风险等级差一个量级**，所以处置方式不同，不是自相矛盾。
+  //
+  // ★ 三条闸门：
+  //   ① 只有**外壳自有页面**能调（assertShellSender）；
+  //   ② **绝不自动触发** —— 必须界面显式调用（没有任何"启动时偷偷装"的路径）；
+  //   ③ 落点由主进程算，**渲染进程递不进任何路径**。
+  ipcMain.handle("dsh:kernel:env", (e) => {
+    assertShellSender(e);
+    const userDataDir = app.getPath("userData");
+    const k = K.discoverKernel({ userDataDir });
+    const st = KP.status({ userDataDir, kernel: k });
+    log(`运行环境体检：找到内核=${st.found}（${st.source || "-"} ${st.version || "-"}）`
+      + ` 随包 npm=${st.bundledNpm} 外壳装过的=${st.installed.length} 个`);
+    return st;
+  });
+
+  ipcMain.handle("dsh:kernel:provision", async (e, version) => {
+    assertShellSender(e);
+    const userDataDir = app.getPath("userData");
+    const want = typeof version === "string" ? version.trim() : "";
+    log(`开始替用户安装内核${want ? `（指定 ${want}）` : "（官方最新版）"}…`);
+    const r = await KP.provision({
+      userDataDir,
+      version: want,
+      onLine: (s) => kernelUpdateEmit({ kind: "provision-line", line: s }),
+      onProgress: (p) => kernelUpdateEmit({ kind: "provision-progress", ...p }),
+    });
+    log(`替用户安装内核：ok=${r.ok} ${r.ok ? `${r.version} → ${r.dir}` : r.reason}`);
+    // ★ 装完立刻回读一次发现链：证明"外壳现在真的能认到它"，
+    //   而不是只看 provision 自己的返回（它只说"文件落位了"）。
+    let seen = null;
+    try {
+      const k2 = K.discoverKernel({ userDataDir });
+      seen = k2 ? { version: k2.version, source: k2.source, dir: k2.dir } : null;
+    } catch { /* 下面如实报 null */ }
+    log(`装完回读发现链：${seen ? `${seen.version}（${seen.source}）` : "**仍然找不到**"}`);
+    return { ...r, discovered: seen };
+  });
+
+  /** 删掉外壳装过的某个内核版本（后悔药）。**只删 <userData>\kernel\ 里的**。 */
+  ipcMain.handle("dsh:kernel:remove", (e, version) => {
+    assertShellSender(e);
+    const userDataDir = app.getPath("userData");
+    const v = typeof version === "string" ? version.trim() : "";
+    if (!v) return { ok: false, reason: "没给版本号" };
+    const r = KP.remove(userDataDir, v);
+    log(`删除外壳安装的内核 ${v}：ok=${r.ok} ${r.reason || ""}`);
+    return r;
   });
 
   // ── 集成版插件（清单 src/plugin-catalog.js；装/卸 src/plugin-install.js）──
@@ -2460,14 +2563,24 @@ async function bootstrap() {
     const msg = (e && e.message) || String(e);
     log("启动失败:", msg);
     if (SMOKE) { finishSmoke(1, msg); return; }
+    // ★ 全新机器（一个内核都没有）⇒ 把加载页的抽屉自动拉开，
+    //   并把主标题说成人话。判据是 `ensureServer()` 打的那个 `code`，不是文案匹配。
+    const noKernel = e && e.code === "DSH_KERNEL_MISSING";
+    if (noKernel) log("[首启] 本机没有内核 ⇒ 加载页自动打开「诊断与修复」（里面有「下载并安装内核」）");
     showStatus({
-      title: "内核启动失败",
-      stage: "可以点下面的「诊断与修复」；内核也会自动重试",
+      title: noKernel ? "这台电脑上还没有 dsh 内核" : "内核启动失败",
+      stage: noKernel
+        ? "点下面的「下载并安装内核」，外壳会自己从官方渠道装一份（不需要你装 Node.js）"
+        : "可以点下面的「诊断与修复」；内核也会自动重试",
       stageKey: "ready", failKey: "ready",
       detail: msg, failed: true, settled: true, percent: 100, percentLabel: "失败",
+      openDiag: !!noKernel,
     });
-    // 与 handleServerDown 相同的自动重试：起不来不等于永远起不来
-    if (!retryTimer) {
+    // 与 handleServerDown 相同的自动重试：起不来不等于永远起不来。
+    // ★ 但"一个内核都没有"时**不重试** —— 那种失败不会自己好（除非用户去装），
+    //   每 20 秒白跑一次只会在日志里刷 5 行噪音。装好之后是
+    //   `install-kernel` 那条动作自己重启，不靠这个定时器。
+    if (!noKernel && !retryTimer) {
       retryCount = 0;
       retryTimer = setInterval(async () => {
         if (quitting || retryCount >= 5) { clearInterval(retryTimer); retryTimer = null; return; }
