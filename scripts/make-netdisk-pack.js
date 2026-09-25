@@ -449,5 +449,15 @@ if (problems.length) {
   process.exit(2);
 }
 say("\n✅ 完成。");
-say("提醒：网盘上传要**你自己点** —— 我没有网盘凭据。");
+// ★ 2026-09-25 订正：这里原先写的是「网盘上传要**你自己点** —— 我没有网盘凭据」。
+//   **那是错的**：夸克网盘有 CLI（`quark-drive.cjs`），AI 可以直接传，
+//   用户当时明确纠正过这一点。现在改成正确的下一步。
+say("下一步（网盘渠道）：用夸克网盘 CLI 传上去 ——");
+say("   node \"%LOCALAPPDATA%\\Programs\\quarkclouddrive\\scripts\\quark-drive.cjs\" upload \\");
+say("        --parent-fid <目标文件夹 fid> --session-input \"<用户这句话>\" --session-id <本次会话 id> \\");
+say("        \"" + (zipPath || packRoot) + "\"");
+say("   ⚠️ `--parent-fid` **必须给**（省掉会报 `upload dir blank`）。");
+say("   ⚠️ 传完**必须回读核对**：文件名逐码点比、云端字节数 == 本地字节数，");
+say("      不能只看接口那句成功（GitHub Release 那边踩过「中文名被静默剥掉」的坑）。");
+say("      回读脚本：scripts/verify-quark-upload.cjs（详见 docs/下载与安装渠道.md 渠道②）。");
 if (zipPath) say(`要传的文件就是：${zipPath}`);
