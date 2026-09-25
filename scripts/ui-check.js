@@ -2029,10 +2029,16 @@ async function verifyPlugins(tmpDir) {
       !!real && path.resolve(real).toLowerCase() === path.resolve(dest).toLowerCase(),
       `${real} vs ${dest}`);
 
+    // ★ 通过联接**真的读到内容**（不是"目录在那儿"）。
+    //   ⚠️ 以前这里假设插件里有 `lib/` —— 本仓库的插件结构并不统一
+    //     （手机遥控是 `desktop/** + phone/**`，只有归档管理器那类才有 `lib/**`）
+    //     ⇒ 挑中的插件一换，这条就假 FAIL。改成**结构无关**的判据：
+    //     通过联接读它自己的 package.json，并核对 name 就是它。
     let through = null;
-    try { through = fs.readdirSync(path.join(linkPath, "lib")); } catch { /* 下面会报 */ }
+    try { through = JSON.parse(fs.readFileSync(path.join(linkPath, "package.json"), "utf8")); } catch { /* 下面会报 */ }
     check("★ 通过联接真的读得到插件文件（不是「文件在那儿」）",
-      !!(through && through.length), JSON.stringify(through));
+      !!(through && through.name === pick.name),
+      through ? `name=${through.name} ver=${through.version}` : "联接里读不到 package.json");
     }   // ← netFail 那个 else 到此为止（网络失败时这几条明确 SKIP，不算通过）
 
     let raw = Buffer.alloc(0);
