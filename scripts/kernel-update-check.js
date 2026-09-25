@@ -48,7 +48,8 @@ function check(name, ok, detail) {
 /**
  * ★ 本脚本自己也会撒谎，所以要显式读 package.json 的版本再判一次。
  *   （用 `electron 脚本.js` 跑时，`app.getVersion()` 拿到的是 **Electron 的**版本，
- *     本机实测是 37.10.3 —— `update-check.js` 第一版就因此印出过误导人的结论。）
+ *     不是外壳的 —— 2026-09-25 那天实测是 37.10.3，`update-check.js` 第一版
+ *     就因此印出过误导人的结论。所以这里连 Electron 的版本也一并打印出来对照。）
  */
 function shellVersion() {
   try { return JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version; }
@@ -189,11 +190,12 @@ async function main() {
     !!fxNext && fxNext.version === "0.1.7-rc.2", fxNext ? `next=${fxNext.version}` : "★ next 不见了");
   check("★★ 它被标成「比默认渠道新」（界面靠这一条把 0.1.7 指出来）",
     !!(fxNext && fxNext.newerThanDefault === true), String(fxNext && fxNext.newerThanDefault));
-  // ★★ 光"看得见"还不够 —— 0.1.7-rc.2 在外壳上**起不来**（下面 ②.6 有完整证据）。
-  //   只报"比默认渠道更新"而不报"起不来"，等于换个姿势误导用户。
-  check("★★ 同时被标成「起不来」（2026-09-25 隔离真跑的结论，不是推断）",
-    !!(fxNext && fxNext.compat && fxNext.compat.usable === false
-      && fxNext.compat.level === "verified-bad"),
+  // ★★ 光"看得见"还不够 —— 还要说清它**能不能跑**。
+  //   2026-09-25 两轮真跑：同一版 0.1.7-rc.2 在 Electron 37.10.3 上 `Unsupported/no-context`，
+  //   把外壳升到 **44.0.0** 之后起来了。这条断言把"升级有没有真的解开口子"钉住。
+  check("★★ 同时被标成「实测能跑」（把 Electron 升到 44.0.0 之后真跑验过）",
+    !!(fxNext && fxNext.compat && fxNext.compat.usable === true
+      && fxNext.compat.level === "verified-ok"),
     fxNext && fxNext.compat ? `${fxNext.compat.label} —— ${fxNext.compat.note}` : "next 不见了");
   check("★★ 默认渠道**仍然是** latest=0.1.5-rc.3（不替用户把预览渠道当默认）",
     fx.channel === "latest"
@@ -243,19 +245,26 @@ async function main() {
 
   // ── ②.6 兼容性：**「有更新」不等于「能跑」** ─────────────────────
   //
-  // ★★ 这一段才是用户那个问题的**真答案**。查清"0.1.7 发在 next 上"之后浮出来的
-  //   更要紧的一件事：**0.1.7 在外壳上根本起不来**。
-  //   真跑（`scripts/kernel-compat-check.js`，每条都是一次真启动）：
+  // ★★ 这一段才是用户那个问题的**完整答案**，而且是**两轮**真跑查出来的：
+  //
+  //   第一轮（外壳当时是 Electron **37.10.3**）：
   //     0.1.5-rc.3（latest）✅ 就绪        0.1.7-rc.2（next）❌ Unsupported/no-context
   //     0.1.7-alpha.2（alpha）❌ 同上      0.1.7-rc.2 用**系统 node 24** 跑 ✅ 就绪
-  //   ⇒ 卡的是 **Electron**：外壳带 37，而 0.1.6 起的内核（新增了运行时拦截）
-  //     要 Electron 43/44/45。
+  //   ⇒ 卡的是 **Electron**：0.1.6 起内核新增了运行时拦截，要 hook V8 内部，
+  //     而加载器只认 **精确的** V8 指纹（43.0.0 / 44.0.0 / 45.0.0-alpha.6）。
+  //
+  //   第二轮（把外壳升到 Electron **44.0.0**）：
+  //     **四个版本全部 ✅ 就绪** ⇒ 这一版外壳顺带把 0.1.6+ 内核解开了。
+  //     ⚠️ 中途试过 44.4.5（当时的最新）—— **照样起不来**。所以 electron 是**精确钉版**。
   console.log("");
   console.log("── ②.6 兼容性：「有更新」不等于「能跑」──");
   const ev = KU.shellElectron();
-  console.log(`  外壳的 Electron: ${ev}   本机系统 node: ${process.version}`);
+  // ★ 标签要写准：这个脚本是 **run-electron.js 用 Electron 跑的**，所以 `process.version`
+  //   是 **Electron 自带的那份 Node**，不是用户机器上的系统 node。
+  //   （本项目为"把 Electron 的版本当成外壳的版本"已经栽过一次，见 update-check.js 开头。）
+  console.log(`  外壳的 Electron: ${ev}   跑这个脚本的 Node: ${process.version}`);
   console.log(`  分水岭: 内核 v${KU.KERNEL_INTERCEPTION_FROM} 起要 Electron `
-    + `${KU.LOADER_SUPPORTED_ELECTRON.join(" / ")}`);
+    + `${KU.LOADER_SUPPORTED_ELECTRON.join(" / ")}（**精确指纹**，不是区间）`);
   console.log(`  ${(r.channels || []).map((c) => `${c.tag}=${c.version}`
     + `（${c.compat ? c.compat.label : "-"}）`).join("  ")}`);
 
@@ -271,35 +280,59 @@ async function main() {
       : `全部 ${KU.COMPAT_EVIDENCE.length} 条记录都是 Electron ${ev}`);
   // 尺子自检：分水岭两边各判一次 + 真跑过的那一版
   const c155 = KU.compatOf("0.1.5-rc.9", ev);       // 0.1.5 世代、**没逐版验过**
-  const c160 = KU.compatOf("0.1.6", ev);           // 新增拦截的那一代
+  const c160 = KU.compatOf("0.1.6", ev);           // 新增拦截的那一代、**没逐版验过**
   const c170 = KU.compatOf("0.1.7-rc.2", ev);      // **真跑验过**
   check("★ 分水岭：0.1.5 世代的版本判「能跑」", c155.usable === true,
     `${c155.label} —— ${c155.note}`);
-  check("★ 分水岭：0.1.6（新增运行时拦截的那一代）判「起不来」", c160.usable === false,
+  check("★ 分水岭：0.1.6 那一代在**当前 Electron**上判「能跑（预计）」", c160.usable === true,
     `${c160.label} —— ${c160.note}`);
-  check("★★ 真跑验过的 0.1.7-rc.2 判「起不来」，且证据等级是「实测」",
-    c170.usable === false && c170.level === "verified-bad", `${c170.label} —— ${c170.note}`);
-  check("★ 没逐版验过的版本**不许**写成「实测」（只给世代结论）",
-    c155.level === "gen-ok" && c160.level === "gen-bad", `${c155.level} / ${c160.level}`);
-  check("★ 换了不在加载器白名单里的 Electron ⇒ 只按白名单判，不靠猜",
-    KU.LOADER_SUPPORTED_ELECTRON.length >= 1, `白名单 = ${KU.LOADER_SUPPORTED_ELECTRON.join(" / ")}`);
-  // ★ 反例：把 Electron 换成加载器白名单里那一版 ⇒ 同一版内核应改判「预计能跑」。
-  //   （这一条保证"外壳哪天换了 Electron"时规则会跟着走，而不是永远说 0.1.7 起不来。）
-  const c160New = KU.compatOf("0.1.6", KU.LOADER_SUPPORTED_ELECTRON[0]);
-  check("★ 反例：换成白名单里的 Electron ⇒ 0.1.6 那一代改判「预计能跑」",
-    c160New.usable === true && c160New.level === "gen-ok",
-    `${KU.LOADER_SUPPORTED_ELECTRON[0]} 上：${c160New.label}`);
-  check("★ 兼容性表里的版本号结构完整（不是随手写的字符串）",
-    KU.COMPAT_EVIDENCE.every((e) => /^\d+\.\d+\.\d+/.test(e.version) && /^\d+\.\d+\.\d+$/.test(e.electron)),
-    KU.COMPAT_EVIDENCE.map((e) => `${e.version}@${e.electron}=${e.ok ? "ok" : "bad"}`).join(" "));
+  check("★★ 真跑验过的 0.1.7-rc.2 判「能跑」，且证据等级是「实测」",
+    c170.usable === true && c170.level === "verified-ok", `${c170.label} —— ${c170.note}`);
+  check("★ 没逐版验过的版本**不许**写成「实测」（只给世代/预计结论）",
+    c155.level === "gen-ok" && c160.level === "gen-ok", `${c155.level} / ${c160.level}`);
+  // ★★ 这一条是"为什么把 electron 钉成精确版本"的机械判据。
+  //   那个校验比的是 **V8 精确指纹**（不是版本区间）⇒「升到最新」是错的：
+  //   实测 Electron 44.4.5 与 37.10.3 都起不来，只有 43.0.0 / 44.0.0 / 45.0.0-alpha.6 可以。
+  check("★★ 外壳的 Electron 在**加载器的支持列表**里（不在的话 0.1.6+ 内核起不来）",
+    KU.LOADER_SUPPORTED_ELECTRON.includes(ev),
+    `${ev} vs 支持列表 ${KU.LOADER_SUPPORTED_ELECTRON.join(" / ")}`
+      + `（package.json 里 electron 因此是**精确版本**，别加 ^，也别"顺手升到最新"）`);
+  const cOnBad = KU.compatOf("0.1.6", "44.4.5");     // 已知跑不了的 Electron（真跑过）
+  check("★★ 已知跑不了的 Electron（44.4.5）⇒ 0.1.6 那一代判「起不来」，不是「不知道」",
+    cOnBad.usable === false && cOnBad.level === "known-bad-electron",
+    `${cOnBad.label} —— ${cOnBad.note}`);
+  const cOnUnknown = KU.compatOf("0.1.6", "99.0.0"); // 完全没见过的 Electron
+  check("★ 没见过的 Electron ⇒ 判「未验」（usable=null），**不许**猜成能跑",
+    cOnUnknown.usable === null && cOnUnknown.level === "unknown",
+    `${cOnUnknown.label} —— ${cOnUnknown.note}`);
+  check("★ 兼容性表里两边记的都是**真跑过的** Electron（不是随手写的字符串）",
+    KU.COMPAT_EVIDENCE.every((e) => e.electron === ev)
+      && KU.COMPAT_KNOWN_BAD_ELECTRON.every((e) => /^\d+\.\d+\.\d+/.test(e.electron)),
+    `本次证据=${KU.COMPAT_EVIDENCE.map((e) => `${e.version}@${e.electron}=${e.ok ? "ok" : "bad"}`).join(" ")}`
+      + ` | 已知不行=${KU.COMPAT_KNOWN_BAD_ELECTRON.map((e) => e.electron).join(" ")}`);
   if (r.ok) {
     const defCh = (r.channels || []).find((c) => c.isDefault);
     check("★★ 默认渠道（`latest`）那一版在**这台机器的 Electron 上实测能跑**"
       + "（否则界面就是在劝人装一个起不来的东西）",
       !!(defCh && defCh.compat && defCh.compat.usable === true),
       defCh ? `${defCh.version} → ${defCh.compat.label}` : "没有默认渠道");
+    // ★★ 这一条是"把 Electron 升到 44.0.0"这个决定的**兑现判据**：
+    //   升级的全部意义就是让 `next` / `alpha` 上那些更新的内核**真的能跑**。
+    //   ★ 它只在官方源上确实有比默认渠道更新的标签时才判（上游哪天提升 latest 就不适用了）。
+    const newer = (r.channels || []).filter((c) => c.newerThanDefault);
+    const badNewer = newer.filter((c) => c.compat && c.compat.usable === false);
+    check("★★ 比默认渠道更新的那些渠道**没有一个是「起不来」**（这就是升 Electron 的意义）",
+      newer.length === 0 || badNewer.length === 0,
+      newer.length
+        ? newer.map((c) => `${c.tag}=${c.version}:${c.compat && c.compat.label}`).join(" ")
+        : "此刻官方源上没有比默认渠道更新的标签（这一条不判）");
+    check("★★ 每个渠道要么「能跑」要么「说不出」（**不许**在没证据时断言能跑）",
+      (r.channels || []).every((c) => !c.compat || c.compat.usable !== true
+        || ["verified-ok", "gen-ok"].includes(c.compat.level)),
+      (r.channels || []).map((c) => `${c.tag}:${c.compat && c.compat.level}`).join(" "));
     check("★ 每个渠道都带了 compat 判定（界面不自己猜「能不能跑」）",
-      (r.channels || []).every((c) => c.compat && typeof c.compat.usable === "boolean" && c.compat.label),
+      (r.channels || []).every((c) => c.compat && (typeof c.compat.usable === "boolean" || c.compat.usable === null)
+        && c.compat.label),
       (r.channels || []).map((c) => `${c.tag}:${c.compat && c.compat.label}`).join(" "));
   }
 

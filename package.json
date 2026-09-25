@@ -16,6 +16,7 @@
   "license": "MIT",
   "private": true,
   "//extraResources": "★ 2026-09-25：随包分发 npm 本体（纯 JS，11.8 MB，零平台二进制）。用户因此不需要安装 Node.js —— 外壳用 Electron 自带的 Node 跑这个 npm，去替用户装 dsh 内核。见 scripts/fetch-npm.js 与 src/kernel-provision.js。**注意**：这不是插件（resources/plugins 仍然必须不存在，见 scripts/asar-check.js）。⚠️ 这条说明**必须放在这里，不能放进 build.extraResources 的对象里**：electron-builder 26 的 schema 是严格的，多一个 `_comment` 键会让 `npm run pack` 直接 exit 1（报 configuration.extraResources.0 should be one of these: string）—— 实测踩过。",
+  "//electron": "★★ 版本**精确钉死，不许加 `^`，也不许「顺手升到最新」**（2026-09-25 实测）。原因：内核 0.1.6 起新增了运行时拦截，要 hook V8 内部去 require 内置模块，而它依赖的 node-addon-native-custom-loader 校验的是 **V8 运行时的精确指纹**，不是版本区间。实测只有 **43.0.0 / 44.0.0 / 45.0.0-alpha.6** 能跑 0.1.7 那一代内核；**Electron 44.4.5（当时的最新）与 37.10.3 都是 Unsupported/no-context**。所以升 Electron 之前先跑 node scripts/kernel-compat-check.js --version=<内核版本> --electron=<新 Electron 目录> 真启动一次。判据与证据：src/kernel-update.js 的 compatOf() / COMPAT_EVIDENCE / COMPAT_KNOWN_BAD_ELECTRON；护栏断言在 scripts/kernel-update-check.js 的 ②.6 段。",
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
@@ -49,7 +50,7 @@
     "postinstall": "node scripts/check-kernel.js"
   },
   "devDependencies": {
-    "electron": "^37.2.0",
+    "electron": "44.0.0",
     "electron-builder": "^26.0.12"
   },
   "build": {

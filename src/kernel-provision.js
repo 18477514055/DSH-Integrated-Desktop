@@ -143,6 +143,40 @@ function status(opts = {}) {
 
 // ── 真装 ──────────────────────────────────────────────────────────────
 
+/** 装一份内核实测约 214 MB（解压后），加上 npm 的临时开销，留到 300 MB 才算稳。 */
+const NEED_BYTES = 300 * 1024 * 1024;
+
+/**
+ * 目标盘还剩多少字节。量不到就返回 `null`（**不编**，也不因此阻断安装）。
+ * ★ 用 `fs.statfsSync`（Node 18.15+ 就有，Electron 24 的 Node 当然也有），零依赖。
+ */
+function freeBytes(dir) {
+  try {
+    const s = fs.statfsSync(dir);
+    const n = Number(s.bavail) * Number(s.bsize);
+    return Number.isFinite(n) ? n : null;
+  } catch { return null; }
+}
+
+/**
+ * 「空间够不够」判成一句人话。**纯函数**（可离线断言）。
+ * 量不到（`null`）时返回 `null` —— 不知道就不说话，绝不假装知道。
+ */
+function spaceVerdict(free, need = NEED_BYTES) {
+  if (free === null || !Number.isFinite(free)) return null;
+  if (free >= need) return null;
+  return `磁盘空间不够：装内核需要约 ${Math.ceil(need / 1048576)} MB 空闲，`
+    + `而目标盘只剩 ${Math.floor(free / 1048576)} MB。先腾出空间再试。`;
+}
+
+/**
+ * npm 的输出里有没有"空间不够"的迹象。
+ * ★ npm 把它包成**退出码 1**，真正的原因只在自己那句 `ENOSPC: no space left on device` 里。
+ */
+function looksLikeNoSpace(lines) {
+  return (Array.isArray(lines) ? lines : []).some((l) => /ENOSPC|no space left on device/i.test(String(l)));
+}
+
 /**
  * 用**随包的 npm + Electron 自带的 Node** 把内核装进 `<userData>\kernel\<版本>\`。
  *
@@ -227,6 +261,24 @@ function provision(opts = {}) {
         return finish({ ok: true, version, dir: pkgDir, root: dest, bin, reused: true });
       }
 
+      // ── ②.5 动手前先看一眼磁盘 ──
+      //
+      // ★★ 2026-09-25 实测踩到：磁盘满了的时候，npm **只给一个"退出码 1"**，
+      //   真正的原因（`ENOSPC: no space left on device`）埋在它自己那份日志里 ——
+      //   界面和 shell.log 上看到的就是「npm 退出码 1」，完全看不出该怎么办。
+      //   （我自己的验收脚本就是这么被卡住的：一度以为是 Electron 升级弄坏了安装。）
+      //   ⇒ 先量一下，量得到就说人话；量不到（free=null）**不阻断**，照常试。
+      //   ★ 量的是 **prefix 所在那个盘**（内核实实在在落在那儿），不是安装目录的盘。
+      const free0 = freeBytes(fs.existsSync(userDataDir) ? userDataDir : dest);
+      const spaceBad = spaceVerdict(free0);
+      if (spaceBad) {
+        say(`✗ ${spaceBad}`);
+        return finish({ ok: false, reason: spaceBad, noSpace: true });
+      }
+      if (free0 !== null) {
+        say(`目标盘空闲 ${Math.floor(free0 / 1048576)} MB（装内核要约 214 MB，判定阈值 ${NEED_BYTES / 1048576} MB）`);
+      }
+
       fs.mkdirSync(dest, { recursive: true });
       say(`落点：${dest}`);
       say(`用的 npm：${npmCli}`);
@@ -299,7 +351,21 @@ function provision(opts = {}) {
         clearTimeout(timer);
         if (code !== 0) {
           say(`✗ npm 退出码 ${code}`);
-          return finish({ ok: false, reason: `npm 退出码 ${code}` });
+          // ★★ 2026-09-25 实测踩到：磁盘满了的时候，npm 只会给一个**退出码 1**，
+          //   真正的原因（`ENOSPC: no space left on device`）埋在它自己的日志里，
+          //   界面/日志里看到的是"npm 退出码 1"——完全看不出该怎么办。
+          //   （我自己的验收脚本就是这么被卡住的：以为是 Electron 升级弄坏了安装。）
+          const noSpace = looksLikeNoSpace(log);
+          if (noSpace) {
+            say("  ⚠ 输出里有 ENOSPC：这次是**磁盘空间不够**，不是安装本身坏了");
+          }
+          return finish({
+            ok: false,
+            reason: noSpace
+              ? `磁盘空间不够：npm 报 ENOSPC（装内核要约 ${Math.ceil(NEED_BYTES / 1048576)} MB 空闲）。腾出空间后重试。`
+              : `npm 退出码 ${code}`,
+            noSpace,
+          });
         }
         // ── ④ 收口：**去磁盘上找证据**，不信 npm 自己的输出（铁律：真跑才算）
         if (!fs.existsSync(bin)) {
@@ -340,7 +406,8 @@ function remove(userDataDir, version) {
 }
 
 module.exports = {
-  PKG, REGISTRY,
+  PKG, REGISTRY, NEED_BYTES,
   kernelRoot, kernelDirFor, pkgDirIn, bundledNpmDir,
   status, provision, remove,
+  freeBytes, spaceVerdict, looksLikeNoSpace,
 };

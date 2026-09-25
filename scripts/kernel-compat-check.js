@@ -15,7 +15,9 @@
  * 「验证'某东西能否工作'，**必须真让它工作**；'文件存在 / 模块可解析 / 版本号对'
  *   一律不构成证据」。
  *
- * ── 真跑查到的结论（2026-09-25，Electron 37.10.3）───────────────────
+ * ── 真跑查到的结论（2026-09-25，**两轮**）───────────────────────────
+ *
+ * 第一轮，外壳当时是 Electron **37.10.3**：
  *
  *   | 内核版本      | 渠道      | 结果 |
  *   |---------------|-----------|------|
@@ -24,6 +26,14 @@
  *   | 0.1.7-rc.2    | `next`    | ❌ `Unsupported/no-context` |
  *   | 0.1.7-alpha.2 | `alpha`   | ❌ `Unsupported/no-context` |
  *   | 0.1.7-rc.2    | （用**系统 node 24** 跑）| ✅ 就绪 ⇒ 卡的是 **Electron**，不是内核本身 |
+ *
+ * 第二轮，把外壳升到 Electron **44.0.0**（`--electron=<目录>` 那次试验）：
+ * **四个版本全部 ✅ 就绪** —— 这一版外壳因此顺带解开了 0.1.6+ 内核。
+ * ⚠️ 中途试过 **44.4.5（当时的最新）——照样起不来**：
+ *   unsupported Electron runtime fingerprint: Node 24.21.0, V8 15.2.124.28-electron.0
+ *   (supported Electron versions: 43.0.0, 44.0.0, 45.0.0-alpha.6)
+ * ⇒ 「升到最新」在这里**是错的**：校验比的是 **V8 运行时的精确指纹**，不是版本区间。
+ *   所以 `package.json` 把 electron 钉成**精确的 `44.0.0`**（不带 `^`）。
  *
  * 失败原文（内核自己打的）：
  *
@@ -36,11 +46,12 @@
  *   · `0.1.5-rc.3` 的 `dsh-app-boot/lib/index.js` 里 `installRuntimeInterception` 出现 **0 次**；
  *   · `0.1.7-rc.2` 的同一文件里出现 **3 次**（`requireBuiltin` 相关 5 处）。
  *   ⇒ 0.1.6/0.1.7 世代**新增了运行时拦截**：要 hook V8 内部去 `require` 内置模块，
- *     而它依赖的 `node-addon-native-custom-loader@0.1.6` 只认 **Electron 43/44/45**
- *     的运行时指纹（两个内核带的是**同一个** 0.1.6 版加载器 ⇒ 差别在调用方）。
- *   ⇒ 外壳带的是 **Electron 37** ⇒ 那一代内核**连启动都过不去**，
- *     表现是加载页永远停在「正在等待内核就绪…」，日志里只有那一行 fatal。
- *
+ *     而它依赖的 `node-addon-native-custom-loader@0.1.6` 只认上面那三个**精确**指纹
+ *     （两个内核带的是**同一个** 0.1.6 版加载器 ⇒ 差别在调用方）。
+ *   ★ 那个加载器在 npm 上的**最新版就是 0.1.6**（2026-09-14 发布）
+ *     ⇒ 没有"换个新加载器就能支持更多 Electron"这条路。
+ *   ⇒ 结论：**外壳用哪个 Electron，是一个被内核硬约束的版本**，不是随便升的实现细节。
+ */
  * ══════════════════════════════════════════════════════════════════
  * 用法
  * ══════════════════════════════════════════════════════════════════
@@ -73,12 +84,15 @@ const versions = argv.filter((a) => a.startsWith("--version="))
   .map((a) => a.slice("--version=".length).trim()).filter(Boolean);
 const runtimeArg = (argv.find((a) => a.startsWith("--runtime=")) || "").slice("--runtime=".length).trim();
 const runtimes = runtimeArg === "both" ? ["electron", "node"] : [runtimeArg || "electron"];
+const ELECTRON_SPEC = (argv.find((a) => a.startsWith("--electron=")) || "")
+  .slice("--electron=".length).trim();
 const KEEP = argv.includes("--keep");
 const PORT_BASE = Number(process.env.DSH_COMPAT_PORT || 3190);
 
 if (!versions.length) {
   console.error("用法: node scripts/kernel-compat-check.js --version=<版本> [--version=<版本>…]");
-  console.error("     可选: --runtime=electron|node|both   --keep");
+  console.error("     可选: --runtime=electron|node|both   --electron=<路径>   --keep");
+  console.error("     --electron 可以是 electron.exe 本身，也可以是**装着 electron 的目录**");
   process.exit(4);
 }
 for (const r of runtimes) {
@@ -90,20 +104,33 @@ for (const r of runtimes) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** 外壳这一版的 Electron。★ 从 `process.versions.electron` 读 —— 只有**真的在 Electron 里**
- *  跑才拿得到；这个脚本是普通 node 跑的，所以改读磁盘上的 Electron 包版本（下面 electorExe 旁）。 */
-function electronVersion() {
-  try {
-    return JSON.parse(fs.readFileSync(
-      path.join(ROOT, "node_modules", "electron", "package.json"), "utf8")).version;
-  } catch { return "(读不到)"; }
+/**
+ * 解析要用哪个 Electron。
+ * ★ `--electron=<新版本目录>` 就是"**换一版 Electron 行不行**"那次试验的入口 ——
+ *   内核 0.1.6+ 的兼容性完全由它决定（见文件开头那张真跑表）。
+ */
+function resolveElectronExe(spec) {
+  const exe = process.platform === "win32" ? "electron.exe" : "electron";
+  const cands = spec
+    ? [path.resolve(spec),
+      path.join(path.resolve(spec), exe),
+      path.join(path.resolve(spec), "dist", exe),
+      path.join(path.resolve(spec), "node_modules", "electron", "dist", exe)]
+    : [path.join(ROOT, "node_modules", "electron", "dist", exe)];
+  for (const c of cands) {
+    try { if (fs.statSync(c).isFile()) return c; } catch { /* 继续找 */ }
+  }
+  return null;
 }
 
-function electronExe() {
-  const p = path.join(ROOT, "node_modules", "electron", "dist",
-    process.platform === "win32" ? "electron.exe" : "electron");
-  if (!fs.existsSync(p)) throw new Error(`找不到 Electron：${p}（先 npm install）`);
-  return p;
+/** 去问 **Electron 本体**它是几版（`process.execPath` 是这个脚本的 node，不是它）。 */
+function electronVersion(exe) {
+  try {
+    const env = { ...process.env };
+    delete env.ELECTRON_RUN_AS_NODE;      // 带着它 Electron 会退化成纯 Node，打印的是 node 的版本
+    const r = spawnSync(exe, ["--version"], { env, encoding: "utf8", windowsHide: true, timeout: 30000 });
+    return String((r.stdout || "")).trim().replace(/^v/i, "") || "(读不到)";
+  } catch { return "(读不到)"; }
 }
 
 /** 上面那段 fatal 里最关键的一行（内核自己打出来的），拿不到就退回首行错误。 */
@@ -157,12 +184,17 @@ async function launch(kernelBin, dshHome, port, runtime, electron) {
 (async () => {
   const root = path.join(os.tmpdir(), "dsh-kernel-compat");
   fs.mkdirSync(root, { recursive: true });
-  const electron = electronExe();
-  const ev = electronVersion();
+  const electron = resolveElectronExe(ELECTRON_SPEC);
+  if (!electron) {
+    throw new Error(`找不到 Electron：${ELECTRON_SPEC || path.join(ROOT, "node_modules", "electron", "dist")}`
+      + "（先 npm install，或用 --electron=<装着 electron 的目录>）");
+  }
+  const ev = electronVersion(electron);
 
   console.log("=== 内核 × 外壳运行时 兼容性（真跑）===");
   console.log(`  外壳项目: ${ROOT}`);
-  console.log(`  外壳的 Electron: ${ev}    系统 node: ${process.version}`);
+  console.log(`  Electron: ${ev}   ${electron}`);
+  console.log(`  系统 node: ${process.version}`);
   console.log(`  临时根目录: ${root}`);
   console.log("  （不碰用户正在用的内核 / 全局 npm / B / A）");
   console.log("");

@@ -43,6 +43,36 @@ const MODE = process.argv[2] || "loading";
 const FREE_PORT = 3177;        // loading 模式自建内核用的空闲端口
 const REUSE_PORT = 3105;       // inject 模式复用用户正在跑的内核
 
+/**
+ * 用哪个 Electron 跑。
+ *
+ * 默认是仓库里 `node_modules/electron` 那一个；`--electron=<路径>` 可以换成别的，
+ * 路径可以是 **electron.exe 本身**，也可以是**装着 electron 的目录**
+ * （会自动去找 `<dir>\node_modules\electron\dist\electron.exe`）。
+ *
+ * ★ 为什么需要这个开关（2026-09-25）：内核 `0.1.6` 起新增了运行时拦截，要 hook V8 内部，
+ *   而加载器只认 Electron 43/44/45 —— 外壳带的是 37 ⇒ 那一代内核**起不来**。
+ *   于是"把外壳升到 Electron 44 行不行"成了一个必须**真跑**回答的问题
+ *   （不是"改个版本号再打包试试"）。这个开关就是用来做那次隔离试验的：
+ *   拿临时装的 Electron 44 跑**同样的**验收，全部过了才谈升级。
+ */
+function resolveElectronExe(spec) {
+  const exe = process.platform === "win32" ? "electron.exe" : "electron";
+  const cands = spec
+    ? [path.resolve(spec),
+      path.join(path.resolve(spec), exe),
+      path.join(path.resolve(spec), "dist", exe),
+      path.join(path.resolve(spec), "node_modules", "electron", "dist", exe)]
+    : [path.join(ROOT, "node_modules", "electron", "dist", exe)];
+  for (const c of cands) {
+    try { if (fs.statSync(c).isFile()) return c; } catch { /* 继续找 */ }
+  }
+  return cands[cands.length - 1];      // 找不到也把预期路径还回去，让后面报错时看得见
+}
+const ELECTRON_SPEC = (process.argv.find((a) => a.startsWith("--electron=")) || "")
+  .slice("--electron=".length).trim();
+const ELECTRON_EXE = resolveElectronExe(ELECTRON_SPEC);
+
 const failures = [];
 function check(name, ok, detail) {
   console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}${detail ? "  — " + detail : ""}`);
@@ -288,8 +318,7 @@ function launch(_mode, tmpDir, port, opts = {}) {
     console.log(`  已造一个自足的工作区夹具: ${filesRoot}（1 个子目录 + 3 个文件 + 1 个真会话）`);
   }
 
-  const electronExe = path.join(ROOT, "node_modules", "electron", "dist",
-    process.platform === "win32" ? "electron.exe" : "electron");
+  const electronExe = ELECTRON_EXE;
   if (!fs.existsSync(electronExe)) throw new Error(`找不到 Electron: ${electronExe}`);
 
   // ★ 必须清掉 ELECTRON_RUN_AS_NODE：被设上时 Electron 退化成纯 Node，
@@ -356,15 +385,14 @@ async function stopApp(child) {
  */
 async function provisionKernelInto(tmpDir, version) {
   const KP = require("../src/kernel-provision");
-  const electronExe = path.join(ROOT, "node_modules", "electron", "dist",
-    process.platform === "win32" ? "electron.exe" : "electron");
   console.log(`  预装内核 ${version} → ${path.join(tmpDir, "kernel", version)}`);
   console.log("  （用**随包的 npm + Electron 自带的 Node**，与外壳「下载并安装内核」同一条代码路径）");
+  console.log(`  用的 Electron：${ELECTRON_EXE}`);
   const t0 = Date.now();
   const r = await KP.provision({
     userDataDir: tmpDir,
     version,
-    electronPath: electronExe,
+    electronPath: ELECTRON_EXE,
     onLine: (s) => console.log(`    [npm] ${s}`),
   });
   if (!r.ok) throw new Error(`预装内核 ${version} 失败：${r.reason}`);

@@ -43,7 +43,7 @@ const CHECKS = [
       'data-pane="welcome"', "up-current", "pl-list", "btn-pl-check", "up-row-local", "btn-up-local",
       "btn-pl-wizard", "fr-list", "btn-fr-install", "fr-done",
       // ★ 2026-09-25：内核那一段从"一行官方最新"改成**渠道清单**（见下）
-      "kn-channels", "kn-channel-hint", "kn-row-dl"],
+      "kn-channels", "kn-channel-hint", "kn-row-dl", "kn-warn"],
   },
   {
     file: "src/settings.js",
@@ -114,7 +114,9 @@ const CHECKS = [
     //   这个文件必须真的进产物 —— 少了它，"新用户开箱即用"这条承诺整个不成立，
     //   而且症状是"点了按钮报 is not a function"（只有在全新机器上才暴露）。
     file: "src/kernel-provision.js",
-    marks: ["npm-cli.js", "bundledNpmDir", "--ignore-scripts", "kernelDirFor", "provision"],
+    marks: ["npm-cli.js", "bundledNpmDir", "--ignore-scripts", "kernelDirFor", "provision",
+      // ★ 2026-09-25：磁盘满了要说人话（npm 只会给一个退出码 1，原因埋在它自己的日志里）
+      "spaceVerdict", "ENOSPC"],
   },
   {
     // ★ 2026-09-25：检查内核更新从"只查 /latest"改成读**全部 dist-tags**。

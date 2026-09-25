@@ -23,7 +23,7 @@ app.whenReady().then(async () => {
 
   out("=== 检查更新链路探针（只读）===");
   // ★ 用 `electron 脚本.js` 直接跑时，`app.getVersion()` 拿到的是 **Electron 自己的版本**
-  //   （实测 37.10.3），不是我们的。所以这里显式从 package.json 读外壳版本，
+  //   （2026-09-25 那天实测 37.10.3），不是我们的。所以这里显式从 package.json 读外壳版本，
   //   并按**真实外壳**的算法比一遍 —— 否则这个探针会印出一个误导人的"有更新=false"。
   const pkgVersion = (() => {
     try { return require("../package.json").version; } catch { return app.getVersion(); }
@@ -113,7 +113,7 @@ app.whenReady().then(async () => {
   out("=== 顺带：真的扫一下本仓库 release\\ ===");
   const relDir = path.join(__dirname, "..", "release");
   // ★★ 这里**不能**用 `U.check({ localDirs })` 来验：
-  //    用 `electron 脚本.js` 跑时 `app.getVersion()` 是 **Electron 的版本**（37.10.3），
+  //    用 `electron 脚本.js` 跑时 `app.getVersion()` 是 **Electron 的版本**（37.10.3 那天），
   //    于是一个真实的 0.2.5 会被判成"比当前旧"、根本扫不出来。
   //    （本文件开头那条"探针自己也会撒谎"的坑，这是**第二处**咬人 —— 第一版就是这么假 FAIL 的。）
   //    所以直接调 findLocalInstaller 并**显式**传真实外壳版本。

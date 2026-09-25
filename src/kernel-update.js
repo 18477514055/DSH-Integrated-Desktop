@@ -97,12 +97,12 @@ function channelInfo(tag) {
   return { label: (k && k.label) || tag, note: (k && k.note) || "" };
 }
 
-// ── ★★ 兼容性：新版内核**能不能在外壳上跑**（2026-09-25 真跑查明的）──────────
+// ── ★★ 兼容性：新版内核**能不能在外壳上跑**（2026-09-25 两轮真跑查明的）────────
 //
 // 这一节回答的问题比"哪个版本更新"更要紧，而且**答案跟渠道无关**：
-// `0.1.5` 世代的预览版能跑，`0.1.7` 世代的正式版照样跑不起来。
+// `0.1.5` 世代的预览版能跑，`0.1.7` 世代在外壳原来那版 Electron 上**连启动都过不去**。
 //
-// 真跑记录（`scripts/kernel-compat-check.js`，每条都是一次真启动）：
+// ── 第一轮：外壳当时带 Electron **37.10.3** ──────────────────────────
 //
 //   | 内核版本      | 渠道      | 结果 |
 //   |---------------|-----------|------|
@@ -110,18 +110,29 @@ function channelInfo(tag) {
 //   | 0.1.5-rc.3    | `latest`  | ✅ 就绪 |
 //   | 0.1.7-rc.2    | `next`    | ❌ `Unsupported/no-context` |
 //   | 0.1.7-alpha.2 | `alpha`   | ❌ `Unsupported/no-context` |
-//   | 0.1.7-rc.2    | 系统 node 24（对照） | ✅ 就绪 ⇒ **卡的是 Electron，不是内核本身** |
+//   | 0.1.7-rc.2    | 系统 node 24（对照） | ✅ ⇒ 卡的是 Electron，不是内核本身 |
 //
-// 机制（逐文件数出来的，不是猜的）：`0.1.6` 起 `dsh-app-boot` 新增
-// `installRuntimeInterception`（0.1.5-rc.3 里 **0 处**、0.1.7-rc.2 里 **3 处**），
-// 它要 hook V8 内部去 `require` 内置模块，而依赖的
-// `node-addon-native-custom-loader@0.1.6` 只认 **Electron 43/44/45** 的运行时指纹
-// （两个内核带的是**同一个** 0.1.6 版加载器 ⇒ 差别在调用方）。
-// 外壳带的是 **Electron 37** ⇒ 那一代内核**连启动都过不去**。
+// ── 第二轮：把外壳升到 Electron **44.0.0**（同一天）──────────────────
+//
+//   四个版本**全部 ✅ 就绪**（含 0.1.7-rc.2 / 0.1.7-alpha.2）⇒ 这一版外壳顺带解开了
+//   0.1.6+ 内核。为此 `package.json` 把 electron 钉成**精确的 `44.0.0`**（不加 `^`）。
+//
+//   ⚠️⚠️ **为什么必须是精确版本**：那个校验比的是 **V8 运行时的精确指纹**，
+//   不是版本区间。实测 **Electron 44.4.5 照样起不来**：
+//     unsupported Electron runtime fingerprint: Node 24.21.0, V8 15.2.124.28-electron.0
+//     (supported Electron versions: 43.0.0, 44.0.0, 45.0.0-alpha.6)
+//   ⇒ 「升到最新」在这里**是错的**。同理 37.10.3 也不行。
+//
+//   机制（逐文件数出来的，不是猜的）：`0.1.6` 起 `dsh-app-boot` 新增
+//   `installRuntimeInterception`（0.1.5-rc.3 里 **0 处**、0.1.7-rc.2 里 **3 处**），
+//   它要 hook V8 内部去 `require` 内置模块，而依赖的
+//   `node-addon-native-custom-loader@0.1.6` 只认上面那三个**精确**指纹
+//   （两个内核带的是**同一个** 0.1.6 版加载器 ⇒ 差别在调用方）。
+//   ★ 该加载器在 npm 上的最新版**就是 0.1.6**（2026-09-14 发布）⇒ 没有"换个新加载器就好了"这条路。
 
 /** 内核世代的**分水岭**：这个版本起新增了运行时拦截。 */
 const KERNEL_INTERCEPTION_FROM = "0.1.6";
-/** 加载器那句错误原文里自报的"支持的 Electron 版本"（照抄，不改写）。 */
+/** 加载器那句错误原文里自报的"支持的 Electron 版本"（照抄，不改写；**是精确指纹，不是区间**）。 */
 const LOADER_SUPPORTED_ELECTRON = ["43.0.0", "44.0.0", "45.0.0-alpha.6"];
 
 /** 外壳这一版用的 Electron。★ 取 `process.versions.electron` —— 只有真在 Electron 里才准。 */
@@ -130,25 +141,44 @@ function shellElectron() {
 }
 
 /**
- * **真跑验过**的兼容性记录。★ 这是"证据"，不是"规则"：
- *   没验过的版本**不许**写成"实测"（本项目记过两次"拿代理证据当通过凭据"的教训）。
+ * **真跑验过**的兼容性记录（**当前这一版 Electron 上的**）。
+ *
+ * ★ 这是"证据"，不是"规则"：没验过的版本**不许**写成"实测"
+ *   （本项目记过两次"拿代理证据当通过凭据"的教训）。
  * ★ 换了 Electron 之后这些记录**全部作废** —— `scripts/kernel-update-check.js`
- *   里有一条断言盯着这件事（它会在 Electron 与记录不符时 FAIL，逼你重新真跑）。
+ *   里有一条断言盯着这件事（记录与本机 Electron 不符就 FAIL，逼你重新真跑）。
+ *   上一轮（Electron 37.10.3）的结果记在文件顶部那段注释里。
  */
 const COMPAT_EVIDENCE = [
-  { version: "0.1.5-rc.2", electron: "37.10.3", ok: true, note: "外壳日常在用的那一版" },
-  { version: "0.1.5-rc.3", electron: "37.10.3", ok: true, note: "隔离真跑：拿到了本机地址" },
-  { version: "0.1.7-rc.2", electron: "37.10.3", ok: false, note: "隔离真跑：Unsupported/no-context" },
-  { version: "0.1.7-alpha.2", electron: "37.10.3", ok: false, note: "隔离真跑：Unsupported/no-context" },
+  { version: "0.1.5-rc.2", electron: "44.0.0", ok: true, note: "隔离真跑：拿到了本机地址" },
+  { version: "0.1.5-rc.3", electron: "44.0.0", ok: true, note: "隔离真跑：拿到了本机地址" },
+  { version: "0.1.7-rc.2", electron: "44.0.0", ok: true,
+    note: "隔离真跑：拿到了本机地址（同一版内核在 Electron 37.10.3 上起不来）" },
+  { version: "0.1.7-alpha.2", electron: "44.0.0", ok: true, note: "隔离真跑：拿到了本机地址" },
+];
+
+/**
+ * **已知跑不了**的 Electron（也全是真跑结论，不是推断）。
+ *
+ * ★ 为什么单独列出来：那个校验比的是 **V8 精确指纹**，所以"更新的 Electron"**不一定**
+ *   在支持列表里。没有这一张表的话，`compatOf` 只能对不在列表里的 Electron 说"不知道" ——
+ *   而这两个我们是**真跑过、明确知道起不来**的，说"不知道"是浪费已知证据。
+ */
+const COMPAT_KNOWN_BAD_ELECTRON = [
+  { electron: "37.10.3", note: "0.1.7-rc.2 与 0.1.7-alpha.2 实测都是 Unsupported/no-context" },
+  { electron: "44.4.5",
+    note: "实测同样 Unsupported/no-context（Node 24.21.0 / V8 15.2.124.28）—— "
+      + "「升到最新」在这个校验面前是错的，必须精确匹配加载器那张表" },
 ];
 
 /**
  * 判"外壳这一版的 Electron 能不能跑这一版内核"。
  *
- * 四档，**证据等级写在脸上**（不许把"同世代"说成"实测"）：
- *   · `verified-ok` / `verified-bad` —— 这一版**真跑过**；
- *   · `gen-ok` / `gen-bad`           —— 没逐版跑过，只给**世代**结论，并注明是推断；
- *   · 换了 Electron 就退回世代判断（新的 Electron 可能在白名单里）。
+ * 五档，**证据等级写在脸上**（不许把"同世代"或"预计"说成"实测"）：
+ *   · `verified-ok` / `verified-bad` —— 这一版**真跑过**（当前 Electron 上）；
+ *   · `known-bad-electron`          —— 这一版没跑过，但外壳这个 Electron **真跑过跑不了**；
+ *   · `gen-ok`                      —— Electron 在加载器支持列表里 ⇒ 这一代内核**预计**能跑；
+ *   · `unknown`                     —— 都不沾边，**说不出能不能跑**（`usable: null`）。
  *
  * @param {string} version 内核版本
  * @param {string} [electron] 外壳的 Electron 版本；不给就用 `shellElectron()`
@@ -156,8 +186,8 @@ const COMPAT_EVIDENCE = [
  */
 function compatOf(version, electron) {
   const ev = String(electron || shellElectron() || "").trim();
-  const exact = COMPAT_EVIDENCE.find((e) => e.version === version && e.electron === ev);
   const need = LOADER_SUPPORTED_ELECTRON.join(" / ");
+  const exact = COMPAT_EVIDENCE.find((e) => e.version === version && e.electron === ev);
   if (exact) {
     return exact.ok
       ? { level: "verified-ok", usable: true, label: "实测能跑",
@@ -165,17 +195,22 @@ function compatOf(version, electron) {
       : { level: "verified-bad", usable: false, label: "实测起不来",
         note: `真跑验过（Electron ${ev}）：${exact.note}。它要 Electron ${need}。` };
   }
-  const evMajor = parseInt(ev.split(".")[0], 10);
-  const loaderOk = LOADER_SUPPORTED_ELECTRON.includes(ev) || (Number.isFinite(evMajor) && evMajor >= 43);
   if (cmpVersion(version, KERNEL_INTERCEPTION_FROM) >= 0) {
-    return loaderOk
-      ? { level: "gen-ok", usable: true, label: "预计能跑（新 Electron）",
-        note: `外壳的 Electron ${ev} 在加载器支持列表（${need}）里 ⇒ 这一代内核应该能跑，`
-          + "但**这一版没逐版真跑验过**。" }
-      : { level: "gen-bad", usable: false, label: "同世代起不来",
-        note: `${KERNEL_INTERCEPTION_FROM} 起内核新增了运行时拦截，要 Electron ${need}，`
-          + `而外壳带的是 Electron ${ev || "?"}。同世代的 0.1.7-rc.2 与 0.1.7-alpha.2 都真跑验过起不来；`
-          + "**这一版本身没逐版验过**。" };
+    const badEv = COMPAT_KNOWN_BAD_ELECTRON.find((e) => e.electron === ev);
+    if (badEv) {
+      return { level: "known-bad-electron", usable: false, label: "这个 Electron 上起不来",
+        note: `${KERNEL_INTERCEPTION_FROM} 起内核新增了运行时拦截，要 Electron ${need}`
+          + `（**精确指纹**，不是版本区间）。而外壳这个 Electron ${ev}：${badEv.note}。` };
+    }
+    if (LOADER_SUPPORTED_ELECTRON.includes(ev)) {
+      return { level: "gen-ok", usable: true, label: "预计能跑",
+        note: `外壳的 Electron ${ev} 在加载器支持列表（${need}）里 ⇒ 这一代内核应该能跑；`
+          + "但**这一版本身没逐版真跑验过**。" };
+    }
+    return { level: "unknown", usable: null, label: "未验（Electron 不在支持列表）",
+      note: `${KERNEL_INTERCEPTION_FROM} 起内核要 Electron ${need} 之一（**精确指纹**），`
+        + `而外壳带的是 ${ev || "?"} —— 不在列表里，所以**说不出能不能跑**。`
+        + `真要装，先用 kernel-compat-check.js --version=${version} 真跑一次。` };
   }
   return { level: "gen-ok", usable: true, label: "同世代能跑",
     note: `0.1.5 世代的 0.1.5-rc.3 真跑验过能跑（Electron ${ev || "?"}）；`
@@ -581,4 +616,5 @@ module.exports = {
   channelsFromMeta, compatOf, shellElectron,
   PKG, REGISTRY, OFFICIAL_PAGE, META_ACCEPT, CHANNELS,
   KERNEL_INTERCEPTION_FROM, LOADER_SUPPORTED_ELECTRON, COMPAT_EVIDENCE,
+  COMPAT_KNOWN_BAD_ELECTRON,
 };

@@ -332,6 +332,34 @@ app.whenReady().then(async () => {
     chk(/st\.openDiag === true/.test(spSrc), "★ 加载页真的读了它并自动拉开抽屉");
   }
 
+  // ═════════════════════════════════════════════════════════════════════
+  section("⑫ 磁盘空间：满了要说人话（**2026-09-25 实测踩到的坑**）");
+  // ═════════════════════════════════════════════════════════════════════
+  //
+  // ★★ 来历：那天 C 盘被我自己的临时内核安装塞满了，`npm install` 报的是
+  //   `npm 退出码 1`，而真正的原因（`ENOSPC: no space left on device`）埋在 npm 自己的
+  //   日志里 —— 界面和 shell.log 上完全看不出该怎么办。我一度以为**是 Electron 升级
+  //   弄坏了安装**，差点写进发布说明。所以这里把它钉成机械判据：
+  {
+    const KP = require(path.join(REPO, "src", "kernel-provision.js"));
+    const f = KP.freeBytes(REPO);
+    chk(typeof f === "number" && f > 0,
+      "★ 量得到目标盘的空闲字节（fs.statfsSync，零依赖）",
+      `freeBytes(REPO) = ${f}`);
+    chk(KP.spaceVerdict(f) === null,
+      "★ 空间够 ⇒ **不说话**（不要每次都弹一句没用的提示）", `空闲 ${Math.floor(f / 1048576)} MB`);
+    chk(/磁盘空间不够/.test(KP.spaceVerdict(10 * 1048576) || ""),
+      "★★ 空间不够 ⇒ 说清「要多少 / 剩多少 / 怎么办」，而不是让 npm 报个退出码 1",
+      KP.spaceVerdict(10 * 1048576));
+    chk(KP.spaceVerdict(null) === null && KP.spaceVerdict(undefined) === null,
+      "★ 量不到空间 ⇒ 返回 null（**不编**，也不因此阻断安装）");
+    chk(KP.looksLikeNoSpace(["npm error code ENOSPC", "no space left on device"])
+      && !KP.looksLikeNoSpace(["npm error code EACCES"]),
+      "★★ 认得出 npm 输出里的 ENOSPC（它自己只给一个退出码，看不出原因）");
+    chk(KP.NEED_BYTES >= 214 * 1048576,
+      "★ 判定阈值不低于内核实际体积（214 MB）", `NEED_BYTES = ${KP.NEED_BYTES / 1048576} MB`);
+  }
+
   return finish();
 
   function finish() {
