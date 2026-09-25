@@ -1662,35 +1662,68 @@ async function verifyPlugins(tmpDir) {
     const pkgFile = path.join(dshHome, "profiles", "web", "package.json");
     check("（前置）临时家里内核已经把 profile 建出来了", fs.existsSync(pkgFile), pkgFile);
 
-    // ★ 种一个「本地装的」插件进去（模拟开发机那种 dev 联接），专门验
-    //   **"已装 ≠ 从我们仓库装的"** 这条。
-    //   第一版就是在这儿瞎的：真机 B 家里装着 11 个插件、界面报「已装 0」，
-    //   并且给已经装着的插件显示「安装」按钮 —— 一点就会覆盖用户的 dev link。
-    const localSrc = path.join(tmpDir, "local-dev-plugin", "dsh-multi-session");
-    fs.mkdirSync(path.join(localSrc, "lib"), { recursive: true });
-    fs.writeFileSync(path.join(localSrc, "package.json"), JSON.stringify({
-      name: "dsh-multi-session", version: "9.9.9", main: "lib/index.js",
+    // ★★ 2026-09-26 重写夹具（用户报的"界面是静态的吗，装了那么多还是 4 个"）：
+    //   以前这里只种一个 `dsh-multi-session` 的 dev 联接，用来验"已装 ≠ 从仓库装的"。
+    //   现在**必须种两个**，因为它们验的是**两件不同的事**：
+    //     ① `dsh-fixture-offindex` —— **仓库清单里没有**的本机插件。
+    //        这正是用户报的那一类：清单之外、本机确实装着，以前**一行都不出现**
+    //        （`mergeInstalled` 只遍历远端清单）。名字带 fixture，永远不可能撞上清单。
+    //     ② 一个**用清单自己报的名字**种的 dev 联接（名字在下面渲染出清单后才知道，
+    //        因为清单名现在可能来自 npm 的 `dsh-int-*`，不再固定是索引里的 `dsh-*`）
+    //        —— 它验的是"清单里的条目、本机装的是本地来源"。
+    //   ⚠️ 以前把 ① 的名字写死成 `dsh-multi-session`：清单改成 npm 名之后，
+    //      它就被**正确地**判成了"清单之外"，于是那两条断言开始 FAIL ——
+    //      **夹具赶不上现实**，不是产品坏了。所以改成"先渲染、再按清单报的名字种"。
+    const offName = "dsh-fixture-offindex";
+    const offSrc = path.join(tmpDir, "local-dev-plugin", offName);
+    fs.mkdirSync(path.join(offSrc, "lib"), { recursive: true });
+    fs.writeFileSync(path.join(offSrc, "package.json"), JSON.stringify({
+      name: offName, version: "1.2.3", main: "lib/index.js",
+      description: "夹具：只在你这台机器上装着的插件（仓库清单里没有它）",
       dsh: { bundle: { patch: "./cordis.patch.yml" }, client: { platform: "web" } },
     }, null, 2) + "\n", "utf8");
-    fs.writeFileSync(path.join(localSrc, "cordis.patch.yml"), "- insert: []\n", "utf8");
-    fs.writeFileSync(path.join(localSrc, "lib", "index.js"), "module.exports = {};\n", "utf8");
-    {
+    fs.writeFileSync(path.join(offSrc, "cordis.patch.yml"), "- insert: []\n", "utf8");
+    fs.writeFileSync(path.join(offSrc, "lib", "index.js"), "module.exports = {};\n", "utf8");
+
+    /** 把某个名字种成本地 dev 联接（指向仓库外的临时目录）。@returns 是否成功 */
+    function seedDevLink(name, version, description) {
+      const src = path.join(tmpDir, "local-dev-plugin", name);
+      fs.mkdirSync(path.join(src, "lib"), { recursive: true });
+      fs.writeFileSync(path.join(src, "package.json"), JSON.stringify({
+        name, version, main: "lib/index.js",
+        ...(description ? { description } : {}),
+        dsh: { bundle: { patch: "./cordis.patch.yml" }, client: { platform: "web" } },
+      }, null, 2) + "\n", "utf8");
+      fs.writeFileSync(path.join(src, "cordis.patch.yml"), "- insert: []\n", "utf8");
+      fs.writeFileSync(path.join(src, "lib", "index.js"), "module.exports = {};\n", "utf8");
+
       const pj = JSON.parse(fs.readFileSync(pkgFile, "utf8").replace(/^\uFEFF/, ""));
       pj.dependencies = pj.dependencies || {};
-      pj.dependencies["dsh-multi-session"] = "link:" + localSrc;
+      pj.dependencies[name] = "link:" + src;
       pj.dsh = pj.dsh || { profile: {} };
       pj.dsh.profile = pj.dsh.profile || {};
       pj.dsh.profile.bundles = pj.dsh.profile.bundles || [];
-      if (!pj.dsh.profile.bundles.includes("dsh-multi-session")) pj.dsh.profile.bundles.push("dsh-multi-session");
+      if (!pj.dsh.profile.bundles.includes(name)) pj.dsh.profile.bundles.push(name);
       fs.writeFileSync(pkgFile, JSON.stringify(pj, null, 2) + "\n", "utf8");
 
       const nm = path.join(dshHome, "profiles", "web", "node_modules");
       fs.mkdirSync(nm, { recursive: true });
-      const link = path.join(nm, "dsh-multi-session");
+      const link = path.join(nm, name);
       try { fs.rmSync(link, { recursive: true, force: true }); } catch { /* 没有就算了 */ }
-      let linked = false;
-      try { fs.symlinkSync(localSrc, link, "junction"); linked = true; } catch { linked = false; }
-      check("（夹具）已把 dsh-multi-session 种成本地 dev 联接（指向仓库外的目录）", linked, link);
+      try { fs.symlinkSync(src, link, "junction"); return true; } catch { return false; }
+    }
+
+    {
+      // 只种 ①（清单之外那个）；② 等渲染出清单、知道清单用什么名字之后再种
+      //   ★ 说明文字必须一起写进去：这一条断言正是"卡片读的是本机 package.json"
+      const offDesc = "夹具：只在你这台机器上装着的插件（仓库清单里没有它）";
+      fs.writeFileSync(path.join(offSrc, "package.json"), JSON.stringify({
+        name: offName, version: "1.2.3", main: "lib/index.js", description: offDesc,
+        dsh: { bundle: { patch: "./cordis.patch.yml" }, client: { platform: "web" } },
+      }, null, 2) + "\n", "utf8");
+      const linked = seedDevLink(offName, "1.2.3", offDesc);
+      check(`（夹具）已把 ${offName} 种成"清单之外、本机装着"的插件`, linked,
+        path.join(dshHome, "profiles", "web", "node_modules", offName));
     }
 
     // ① 从主界面用受限通道打开外壳设置窗口 —— 与用户在把手里点「外壳设置…」同一条路
@@ -1737,6 +1770,7 @@ async function verifyPlugins(tmpDir) {
         upd: (document.getElementById('pl-upd')||{}).textContent||'',
         cards: cards.map(c => ({
           name: (c.querySelector('.nm')||{}).textContent||'',
+          inRepo: c.dataset.inRepo === '0' ? false : true,
           tags: Array.from(c.querySelectorAll('.tag')).map(t=>t.textContent),
           desc: (c.querySelector('.ds')||{}).textContent||'',
           meta: (c.querySelector('.meta')||{}).textContent||'',
@@ -1762,33 +1796,105 @@ async function verifyPlugins(tmpDir) {
 
     check("清单真的渲染出了卡片", st.cards.length > 0, `cards=${st.cards.length} status=${st.status}`);
     check("仓库名回填了（主进程把 repo 报回来了）", /DSH-Plugin-Hub/.test(st.repo), st.repo);
-    check("计数文案是「已装 N / 清单 M」", /已装 \d+ \/ 清单 \d+/.test(st.count), st.count);
+    check("计数文案是「已装 N / 仓库清单 M」", /已装 \d+ \/ 仓库清单 \d+/.test(st.count), st.count);
     check("状态行给了结论（清单更新于… / 显示的是缓存…）",
       /清单更新于|显示的是缓存|取清单失败/.test(st.status), st.status);
     check("★ 每张卡都有名字、说明位与操作按钮",
       st.cards.every((c) => c.name && c.desc && c.ops.length >= 1),
       JSON.stringify(st.cards.slice(0, 2)));
-    check("★ 每张卡都写了 sha256（或明说没给）",
-      st.cards.every((c) => /sha256/.test(c.meta)),
-      JSON.stringify(st.cards.map((c) => c.meta.slice(0, 70))));
-    check("每张卡都标了「来自 <owner/repo>」（插件可以住在别的仓库）",
-      st.cards.every((c) => /来自 \S+\/\S+/.test(c.meta)),
-      JSON.stringify(st.cards.map((c) => c.meta.slice(0, 70))));
+    // ★ 下面两条只对**仓库清单里**的卡片成立：清单之外那些没有线上版本、没有 sha256、
+    //   也不该被编出一个"来自 owner/repo"（它们跟仓库没关系）。
+    //   ★ 而"清单这次没取到"是**合法状态**（断网且无缓存）⇒ 样本不足时**跳过**，
+    //     不拿它当 FAIL（否则一条网络抖动就会让人不再相信 FAIL）。
+    const repoCards = st.cards.filter((c) => c.inRepo);
+    if (repoCards.length) {
+      check("★ 每张**仓库清单里**的卡都写了 sha256（或明说没给）",
+        repoCards.every((c) => /sha256/.test(c.meta)),
+        JSON.stringify(repoCards.map((c) => c.meta.slice(0, 70))));
+      check("每张**仓库清单里**的卡都标了来路（「来自 <owner/repo>」或「来自 npm」）",
+        repoCards.every((c) => /来自 (\S+\/\S+|npm)/.test(c.meta)),
+        JSON.stringify(repoCards.map((c) => c.meta.slice(0, 70))));
+    } else {
+      console.log("  （清单这次没取到 ⇒ 跳过「仓库卡片有 sha256 / 来自 owner-repo」那两条）");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // ★★ 2026-09-26（用户报的"界面是静态的吗，装了那么多还是 4 个"）：
+    //    **仓库清单之外、本机确实装着的**那些，以前一行都不出现
+    //    （`mergeInstalled` 只遍历远端清单）。这一段就是它的永久闸门。
+    // ══════════════════════════════════════════════════════════════════
+    const offCard = st.cards.find((c) => c.name === offName);
+    check("★★ 清单之外、本机装着的插件**也有卡片**（以前它一行都不出现）",
+      !!offCard, offCard ? JSON.stringify(offCard.tags) : `卡片里没有 ${offName}（cards=${st.cards.length}）`);
+    if (offCard) {
+      check("★ 它被标成「本机装的」", offCard.tags.includes("本机装的"), JSON.stringify(offCard.tags));
+      check("★ 它**不编造**线上版本（不出现「线上 v」、也不出现 undefined）",
+        !/线上 v/.test(offCard.meta) && !/undefined/.test(offCard.meta), offCard.meta.slice(0, 140));
+      check("它写清「仓库清单里没有它」，并报**本机那一份**的版本 1.2.3",
+        /仓库清单里没有它/.test(offCard.meta) && /本机 v1\.2\.3/.test(offCard.meta), offCard.meta.slice(0, 160));
+      check("它的说明读的是本机 package.json（不是「发布者未填说明」）",
+        /夹具：只在你这台机器上装着/.test(offCard.desc), offCard.desc.slice(0, 80));
+      check("它**没有**「安装 / 更新 / 改用仓库版」这些按钮（仓库里根本没有它）",
+        !offCard.ops.some((o) => o.act === "install"), JSON.stringify(offCard.ops));
+    }
+    // 计数文案：清单取到时要求写清"有几个不在清单里"；取不到时也不能假装本机什么都没有
+    if (/仓库清单/.test(st.count)) {
+      const m = /已装 (\d+) \//.exec(st.count);
+      check("★ 计数里把「不在清单里」的个数写出来了", /本机另有 \d+ 个不在清单里/.test(st.count), st.count);
+      check("★ 「已装 N」把清单之外的那个也数进去了（第一趟渲染时 ≥1）",
+        !!m && Number(m[1]) >= 1, st.count);
+    } else {
+      check("（清单这次没取到）本机装着的照样列出来，且卡片数 ≥ 2",
+        st.cards.length >= 2, `cards=${st.cards.length} count=${st.count}`);
+    }
 
     // ── ★ 「本地装的」必须被认出来（真机实测出来的缺陷，这一段专防它复发）──
+    //   ★ 夹具的名字**用清单自己报的**：清单名现在可能来自 npm 的 `dsh-int-*`，
+    //     不再固定是索引里的 `dsh-*`（以前这里把名字写死成 dsh-multi-session，
+    //     清单改 npm 名之后它就被**正确地**判成"清单之外"，于是这两条开始假 FAIL）。
     check("★ 已装数把本地装的也算上了（不是「已装 0」）", !/已装 0 \//.test(st.count), st.count);
-    const msCard = st.cards.find((c) => c.name === "dsh-multi-session");
-    check("★ 本地 dev 联接的那个插件被认成「已装（本地装的）」",
-      !!(msCard && msCard.tags.includes("已装（本地装的）")),
-      msCard ? JSON.stringify(msCard.tags) : "清单里没有 dsh-multi-session 这张卡");
-    check("★ 它那张卡**不给**普通「安装」，只给「改用仓库版」",
-      !!(msCard && msCard.ops.some((o) => o.act === "install" && o.replace)
-        && !msCard.ops.some((o) => o.act === "install" && !o.replace)),
-      msCard ? JSON.stringify(msCard.ops) : "无卡");
-    check("它标出了来路（本地目录联接 / 本地包文件 / npm）",
-      !!(msCard && /装在：/.test(msCard.meta)), msCard ? msCard.meta.slice(0, 120) : "无卡");
-    check("它报的是**本地那一份**的版本 9.9.9（不是线上版本）",
-      !!(msCard && /本机 v9\.9\.9/.test(msCard.meta)), msCard ? msCard.meta.slice(0, 120) : "无卡");
+    const linkName = (repoCards[0] || {}).name || "";
+    if (!linkName) {
+      console.log("  SKIP  清单这次没渲染出条目 ⇒ 验不了「清单里的条目、本机装的是本地来源」");
+    } else {
+      const seeded = seedDevLink(linkName, "9.9.9");
+      check(`（夹具）按清单报的名字 ${linkName} 种了一个 dev 联接（指向仓库外的目录）`, seeded, linkName);
+      // ★ 让界面重新算一遍：**点第二次导航不会重算**（页面在第一趟已经切到这一栏），
+      //   所以这里走"重载设置窗口 → 再进这一栏"这条路。
+      await cdpEval(ws, `location.reload()`).catch(() => null);
+      await sleep(2500);
+      await cdpEval(ws, `(() => {
+        const b = document.querySelector('nav button[data-pane="plugins"]');
+        if (b) b.click();
+        return !!b;
+      })()`, 20000).catch(() => null);
+      let st2 = null;
+      const dl2 = Date.now() + 30000;
+      while (Date.now() < dl2) {
+        await sleep(800);
+        st2 = JSON.parse(await cdpEval(ws, probe, 20000));
+        const c = st2.cards.find((x) => x.name === linkName);
+        if (c && c.tags.includes("已装（本地装的）")) break;
+      }
+      const msCard = (st2 && st2.cards.find((x) => x.name === linkName)) || null;
+      check("★ 清单里的条目、本机装的是**本地来源** ⇒ 认成「已装（本地装的）」",
+        !!(msCard && msCard.tags.includes("已装（本地装的）")),
+        msCard ? JSON.stringify(msCard.tags) : `没找到 ${linkName} 那张卡（cards=${st2 ? st2.cards.length : "?"}）`);
+      check("★ 它那张卡**不给**普通「安装」，只给「改用仓库版」",
+        !!(msCard && msCard.ops.some((o) => o.act === "install" && o.replace)
+          && !msCard.ops.some((o) => o.act === "install" && !o.replace)),
+        msCard ? JSON.stringify(msCard.ops) : "无卡");
+      check("它标出了来路（本地目录联接 / 本地包文件 / npm）",
+        !!(msCard && /装在：/.test(msCard.meta)), msCard ? msCard.meta.slice(0, 120) : "无卡");
+      check("它报的是**本地那一份**的版本 9.9.9（不是线上版本）",
+        !!(msCard && /本机 v9\.9\.9/.test(msCard.meta)), msCard ? msCard.meta.slice(0, 120) : "无卡");
+      if (st2) {
+        console.log(`  重算一次后: ${st2.count}`);
+        const m2 = /已装 (\d+) \//.exec(st2.count);
+        check("★ 种上 dev 联接后「已装 N」跟着涨（不是写死的）",
+          !!m2 && Number(m2[1]) >= 2, st2.count);
+      }
+    }
 
     // ── ★★ 「在 npm 上看说明」那个按钮（用户 2026-09-24 提的第 ③ 件事）──
     //    判据刻意是**两半**，因为这个按钮的难点全在"什么时候**不**该给"：
@@ -1856,7 +1962,10 @@ async function verifyPlugins(tmpDir) {
 
     // ⑤ ★ 真装一个：挑「可装 + 不是开发者工具」的那张卡，点它的安装按钮
     //    ★ 必须是**普通安装**（不是"改用仓库版"）—— 否则会去覆盖上面那个种进去的本地插件
-    const pick = st.cards.find((c) => c.ops.some((o) => o.act === "install" && !o.replace)
+    //    ★ 还要避开 `linkName`：那个名字现在已经被上面种成 dev 联接了，
+    //      它的卡上只剩「改用仓库版」，挑它就会点不到「安装」。
+    const pick = st.cards.find((c) => c.name !== linkName
+      && c.ops.some((o) => o.act === "install" && !o.replace)
       && !c.tags.includes("开发者工具"));
     if (!pick) {
       console.log("  SKIP  清单里没有可装的非开发工具插件 —— 安装这一段没验到，**不算通过**");
@@ -1885,6 +1994,16 @@ async function verifyPlugins(tmpDir) {
     console.log(`  安装结果文案: ${prog}`);
     check("★ 真点「安装」后拿到了结论（不是停在下载中）",
       /重启一次客户端才生效|失败|出错/.test(prog), prog);
+
+    // ★★ 网络失败要**明说 SKIP**，不能让它变成 8 条假 FAIL（本项目的老规矩：
+    //    "连不上明确标 SKIP，不当成通过"）。判据是**下载那一步的错误码**，
+    //    不是"有没有失败"—— 别的失败（sha256 不符、写 profile 失败）必须照旧 FAIL。
+    const netFail = /下载失败|ERR_CONNECTION|ECONNRESET|ETIMEDOUT|TIMED_OUT|ENOTFOUND|EPROTO|socket hang up/i.test(prog);
+    if (netFail) {
+      console.log("  SKIP  这一趟是**网络失败**（" + prog.replace(/\s+/g, " ").slice(0, 90) + "）");
+      console.log("        ⇒ 安装路径那 8 条（写 profile / 落点 / 联接里真读得到）没验到，**不算通过**");
+      console.log("        （本机网络或代理抖动，与本外壳代码无关；重跑一次通常就好）");
+    } else {
     check("★ 安装成功（文案说要重启才生效）", /重启一次客户端才生效/.test(prog), prog);
 
     // ⑥ 去磁盘上找证据 —— **不看界面自述**
@@ -1914,6 +2033,7 @@ async function verifyPlugins(tmpDir) {
     try { through = fs.readdirSync(path.join(linkPath, "lib")); } catch { /* 下面会报 */ }
     check("★ 通过联接真的读得到插件文件（不是「文件在那儿」）",
       !!(through && through.length), JSON.stringify(through));
+    }   // ← netFail 那个 else 到此为止（网络失败时这几条明确 SKIP，不算通过）
 
     let raw = Buffer.alloc(0);
     try { raw = fs.readFileSync(pkgFile); } catch { /* 上面已报 */ }
@@ -1939,8 +2059,14 @@ async function verifyPlugins(tmpDir) {
       if (card2 && card2.tags.includes("已装")) break;
       await sleep(500);
     }
-    check("★ 卡片状态跟着变成「已装」",
-      !!(card2 && card2.tags.includes("已装")), card2 ? JSON.stringify(card2.tags) : "卡片不见了");
+    if (netFail) {
+      // 上面那趟安装是网络失败 ⇒ 卡片当然不会变「已装」。**明确 SKIP**，
+      // 不能让它变成第 3 条假 FAIL（本项目规矩：连不上标 SKIP，且不当成通过）。
+      console.log("  SKIP  上面那趟安装是网络失败 ⇒ 「卡片状态跟着变成已装」这一条没验到，**不算通过**");
+    } else {
+      check("★ 卡片状态跟着变成「已装」",
+        !!(card2 && card2.tags.includes("已装")), card2 ? JSON.stringify(card2.tags) : "卡片不见了");
+    }
 
     // ══════════════════════════════════════════════════════════════
     // ⑧ 「检查内核更新」（0.2.9）：真点那个按钮，看它真的做事

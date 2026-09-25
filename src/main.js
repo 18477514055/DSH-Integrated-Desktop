@@ -1732,6 +1732,14 @@ async function pluginState({ force = false } = {}) {
   const cat = await PC.fetchIndex({ force });
   const rows = cat.ok ? PC.mergeInstalled(cat.groups, inst.plugins) : [];
 
+  // ★★ 2026-09-26（用户报的"界面是静态的吗，装了那么多还是 4 个"）：
+  //   仓库清单**之外**、但本机确实装着的那些，单独算一列 `offIndex`。
+  //   以前 `rows = mergeInstalled(...)` 只遍历远端清单 ⇒ 清单里 4 条就只画 4 条，
+  //   本机装着十几个（dev 联接 / 本地 tgz / npm）却一个都不显示。
+  //   ★ 单独一列而**不并进 `rows`**：`rows` 还被**首启向导**当"可勾选要装的"清单用。
+  //   ★ 清单取不到（断网且没缓存）时也照列 —— 那正是最该看见"本机有什么"的时候。
+  const offIndex = PC.offIndexRows(rows, inst.plugins);
+
   // ── 本地插件包（断网也能装的那条路，见 src/plugin-pack.js）──────────
   // ★ 只有在**网络来源没给出清单**时才拿它兜底。
   //   为什么不让它覆盖网络清单：网络那份是权威（能反映下架、新版本），
@@ -1751,6 +1759,7 @@ async function pluginState({ force = false } = {}) {
     warnings: cat.index ? cat.index.warnings : [],
     skipped: cat.index ? cat.index.skipped : [],
     rows,
+    offIndex,
     installed: inst.plugins,
     installErrors: inst.errors,
     repo: PC.HUB_REPO,
@@ -1777,10 +1786,15 @@ async function pluginState({ force = false } = {}) {
       total: rows.length,
       // ★ "已装"要把**本地装的**也算进去（dev 联接 / 本地 tgz / npm）——
       //   第一版只数我们装的那些，于是真机上显示「已装 0」而实际装着 11 个。
-      installed: rows.filter((r) => ["installed", "update", "disabled", "local"].includes(r.state)).length,
+      //   ★ 2026-09-26：清单之外的那些**本来就已经装着**，一并计入，
+      //   并单独给一个 offIndex 计数（界面上要能说清"有几个不在仓库清单里"）。
+      installed: rows.filter((r) => ["installed", "update", "disabled", "local"].includes(r.state)).length
+        + offIndex.length,
+      offIndex: offIndex.length,
       updatable: rows.filter((r) => r.state === "update").length,
       local: rows.filter((r) => r.state === "local").length,
-      broken: rows.filter((r) => r.state === "broken").length,
+      broken: rows.filter((r) => r.state === "broken").length
+        + offIndex.filter((r) => r.state === "broken").length,
     },
   };
 }

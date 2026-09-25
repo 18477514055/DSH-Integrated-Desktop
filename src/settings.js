@@ -741,7 +741,12 @@
       case "update": return '<span class="tag up">可更新</span>';
       case "disabled": return '<span class="tag up">没启用</span>';
       case "broken": return '<span class="tag bad">落点丢了</span>';
-      case "local": return '<span class="tag on">已装（本地装的）</span>';
+      case "local":
+        // ★ 2026-09-26：清单里"本地来源装的"与"仓库里根本没有它"要分开说 ——
+        //   后者是 offIndex 那一列（本机自己有，仓库不知道）。
+        return r.inRepo === false
+          ? '<span class="tag dev">本机装的</span>'
+          : '<span class="tag on">已装（本地装的）</span>';
       default: return "";
     }
   }
@@ -749,25 +754,34 @@
   function cardHtml(r) {
     const e = ShellUI.esc;
     const latest = r.latest || {};
+    // 说明的取法：仓库索引 > 本机那份 package.json > 明说没有。
+    // （仓库索引里我们这些条目的 description 是空的，以前整片显示「未填说明」）
     const desc = latest.description
       ? e(latest.description)
-      : '<i style="color:var(--fg-faint)">（发布者未填说明）</i>';
+      : (r.local && r.local.description)
+        ? e(r.local.description)
+        : (r.inRepo === false
+          ? '<i style="color:var(--fg-faint)">（本机装的，仓库清单里没有它的条目）</i>'
+          : '<i style="color:var(--fg-faint)">（发布者未填说明）</i>');
 
     const tags = [stateTag(r)];
     if (r.devOnly) tags.push('<span class="tag dev">开发者工具</span>');
     if (!r.compatible) tags.push('<span class="tag bad">不适用于本外壳</span>');
 
     const meta = [];
-    meta.push(`线上 v${latest.version}`);
+    // ★ 只有仓库清单里真有条目时才写"线上 v…"：off-index 那些 latest 是 null，
+    //   照旧写会印出「线上 vundefined」。
+    if (latest.version) meta.push(`线上 v${latest.version}`);
     if (r.local) {
       meta.push(`本机 v${r.local.version}`);
       meta.push(`装在：${sourceLabel(r.localSource)}`);
       if (r.local.target) meta.push(`→ ${r.local.target}`);
     }
+    if (r.inRepo === false) meta.push("仓库清单里没有它");
     if (latest.repo) meta.push(`来自 ${latest.repo}`);
     if (latest.bytes) meta.push(fmtBytes(latest.bytes));
     if (latest.sha256) meta.push(`sha256 ${latest.sha256.slice(0, 12)}…`);
-    else meta.push("这条没有 sha256，装上不校验内容");
+    else if (latest.version) meta.push("这条没有 sha256，装上不校验内容");
 
     const ops = [];
     if (r.canInstall) {
@@ -792,7 +806,7 @@
     }
     if (!ops.length) ops.push('<span class="note">已是最新</span>');
 
-    return `<div class="pl-card">
+    return `<div class="pl-card" data-in-repo="${r.inRepo === false ? "0" : "1"}">
       <div class="hd"><span class="nm">${e(r.name)}</span>${tags.join("")}</div>
       <p class="ds">${desc}</p>
       <div class="meta">${meta.map(e).join(" · ")}</div>
@@ -802,19 +816,36 @@
 
   function renderPlugins(st) {
     const list = $("pl-list");
+    // ★★ 2026-09-26：**本机装着的都要画出来** —— 清单里那几条 + 清单之外的那些
+    //   （`offIndex`，见 main.js 的 pluginState）。用户原话：
+    //   「我们现在安装了大量本地插件，那里还是 4 个」—— 以前只画清单里的。
+    const all = ((st && st.rows) || []).concat((st && st.offIndex) || []);
+
     if (!st || !st.ok) {
       plStatus(`取清单失败：${(st && st.error) || "未知原因"}`);
       plProg("");
-      list.innerHTML = '<div class="pl-empty">拿不到插件清单（连不上插件仓库，本机也没有缓存）。</div>';
+      // 清单取不到 ≠ 本机什么都没有：本机装着的照样列出来
+      if (!all.length) {
+        list.innerHTML = '<div class="pl-empty">拿不到插件清单（连不上插件仓库，本机也没有缓存）。</div>';
+        return;
+      }
+      $("pl-repo").textContent = st.repo || "—";
+      $("pl-count").textContent = `本机装着 ${all.length} 个（清单这次没取到）`;
+      $("pl-upd").textContent = "";
+      $("pl-notice").innerHTML = '<div class="pl-warn">这次没连上插件仓库，所以下面这些'
+        + '只反映本机现状：仓库里有没有新版、有没有新插件，要等连上才知道。</div>';
+      list.innerHTML = all.map(cardHtml).join("");
       return;
     }
 
     const c = st.counts || {};
     $("pl-repo").textContent = st.repo || "—";
-    $("pl-count").textContent = `已装 ${c.installed || 0} / 清单 ${c.total || 0}`;
+    $("pl-count").textContent = `已装 ${c.installed || 0} / 仓库清单 ${c.total || 0}`
+      + (c.offIndex ? ` · 本机另有 ${c.offIndex} 个不在清单里` : "");
     $("pl-upd").textContent = [
       c.updatable ? `${c.updatable} 个可更新` : "",
       c.local ? `${c.local} 个是本地装的` : "",
+      c.offIndex ? `${c.offIndex} 个不在仓库清单里` : "",
       c.broken ? `${c.broken} 个落点丢了` : "",
     ].filter(Boolean).join(" · ");
     plStatus(st.stale
@@ -830,11 +861,11 @@
       ? `<div class="pl-warn">${warn.map(ShellUI.esc).join("<br>")}</div>`
       : "";
 
-    if (!st.rows || !st.rows.length) {
-      list.innerHTML = '<div class="pl-empty">清单是空的 —— 仓库里还没有插件。</div>';
+    if (!all.length) {
+      list.innerHTML = '<div class="pl-empty">清单是空的 —— 仓库里还没有插件，本机也一个都没装。</div>';
       return;
     }
-    list.innerHTML = st.rows.map(cardHtml).join("");
+    list.innerHTML = all.map(cardHtml).join("");
   }
 
   async function loadPlugins(force) {

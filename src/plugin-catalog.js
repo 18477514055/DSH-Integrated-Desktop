@@ -615,6 +615,7 @@ function mergeInstalled(groups, installed) {
     return {
       ...g,
       state,
+      inRepo: true,          // ★ 这一条在仓库清单里（清单之外的那些见 offIndexRows）
       localSource: local ? local.source : "",
       local: local ? {
         version: local.version,
@@ -623,6 +624,7 @@ function mergeInstalled(groups, installed) {
         enabled: local.enabled,
         junctionOk: local.junctionOk,
         dirExists: local.dirExists,
+        description: local.description || "",
       } : null,
       remoteVersion,
       canInstall: state === "not-installed" || state === "broken",
@@ -632,6 +634,61 @@ function mergeInstalled(groups, installed) {
       canUninstall: !!local,
     };
   });
+}
+
+/**
+ * 仓库清单**之外**、但本机确实装着的那些插件。
+ *
+ * ★★ 为什么要有它（2026-09-26 用户报的）：`mergeInstalled` 是
+ *   `groups.map(...)` —— **只遍历远端清单**，`installed` 仅用来给清单里已有的条目
+ *   打状态。于是仓库索引里只有 4 条时，界面上就只有 4 条，而本机可能装着十几个
+ *   （dev 联接 / 本地 tgz / 从 npm 装的 / 别处发布的）—— 用户原话
+ *   「我们现在安装了大量本地插件，那里还是4个」，看着像界面是静态的。
+ *
+ * ★ 单独一列而**不是并进 `rows`**：`rows` 还被**首启向导**用（那是"可勾选要装的"
+ *   清单），并进去会让"已经装着的插件"出现在向导的勾选列表里。
+ *
+ * @param {Array} merged      mergeInstalled 的结果（用来算"哪些名字已经在清单里"）
+ * @param {Array} installed   plugin-install.js 的 listInstalled().plugins
+ * @returns {Array} 形状与 mergeInstalled 的每条一致（多一个 inRepo:false / description）
+ */
+function offIndexRows(merged, installed) {
+  const known = new Set((merged || []).map((r) => r.name));
+  const rows = (installed || [])
+    .filter((p) => !known.has(p.name))
+    .map((p) => {
+      // 落点没了 ⇒ 报"落点丢了"，而不是假装它好好的
+      const state = !p.dirExists ? "broken" : (p.enabled === false ? "disabled" : "local");
+      return {
+        name: p.name,
+        // ★ 刻意**不编造** latest/versions：仓库里没有它，就不该画出"线上 v…"这种字样
+        latest: null,
+        versions: [],
+        newestAt: "",
+        devOnly: false,
+        compatible: true,
+        inRepo: false,
+        description: p.description || "",
+        state,
+        localSource: p.source,
+        local: {
+          version: p.version,
+          target: p.target,
+          source: p.source,
+          enabled: p.enabled,
+          junctionOk: p.junctionOk,
+          dirExists: p.dirExists,
+          description: p.description || "",
+        },
+        remoteVersion: "",
+        canInstall: false,
+        canReplace: false,
+        canUpdate: false,
+        canUninstall: true,
+      };
+    });
+  rows.sort((a, b) => a.name.localeCompare(b.name));
+  return rows;
 }
 
 // ── 网络与缓存（这几个要用 Electron 的 net ⇒ 走系统代理）──────────────
@@ -906,7 +963,7 @@ module.exports = {
   NPM_PAGE_BASE, NPM_REGISTRY, SEED_PACKAGES, SEED_ALIASES,
   // 纯函数（可在普通 node 里单测）
   indexUrl, repoOf, isAllowedDownloadUrl, normalizeEntry, normalizeIndex,
-  groupByName, mergeInstalled, isDevOnly, npmPageOf,
+  groupByName, mergeInstalled, offIndexRows, isDevOnly, npmPageOf,
   npmLatestUrl, normalizeNpmLatest, mergeSources,
   // 需要 Electron 的
   fetchIndex, fetchNpmLatest, downloadArchive, cleanupArchive,

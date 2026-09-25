@@ -651,7 +651,7 @@ function resolveDep(profileDir, nmDir, name, spec) {
 /** 它在磁盘上到底在不在、版本多少、**是不是一个 DSH 插件**。 */
 function probePackage(dir) {
   const pj = readJson(path.join(dir, "package.json"));
-  if (!pj) return { exists: false, version: null, isPlugin: false };
+  if (!pj) return { exists: false, version: null, isPlugin: false, description: "" };
   const dsh = pj.dsh || {};
   return {
     exists: true,
@@ -659,6 +659,10 @@ function probePackage(dir) {
     // ★ 与内核认插件的规矩一致：声明了 dsh.bundle 或 dsh.client 才叫插件。
     //   否则 dsh-base 这类框架包、以及一大堆普通依赖全会混进来。
     isPlugin: !!(dsh.bundle || dsh.client),
+    // ★ 2026-09-26：顺手把**本机那份**的说明带出来。
+    //   仓库索引里我们这些条目的 `description` 是空的（索引由插件清单生成），
+    //   界面于是整片显示「（发布者未填说明）」—— 本机既然已经装着，就读本机这份。
+    description: typeof pj.description === "string" ? pj.description : "",
   };
 }
 
@@ -713,6 +717,7 @@ function listInstalled(opts = {}) {
       dirExists: probe.exists,
       junctionOk,
       enabled: bundles.includes(name),
+      description: probe.description || "",
     });
   }
   out.plugins.sort((a, b) => a.name.localeCompare(b.name));
