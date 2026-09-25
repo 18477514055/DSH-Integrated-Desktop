@@ -136,14 +136,49 @@ async function realMove(wsUrl, x, y) {
     { type: "mouseMoved", x: Math.round(x), y: Math.round(y), button: "none", clickCount: 0 });
 }
 
-/** 在某个点上做一次**真实**左键点击（移动 → 按下 → 抬起）。 */
+/**
+ * 在某个点上做一次**真实**左键点击（移动 → 按下 → 抬起）。
+ *
+ * ★★ 2026-09-26：三条事件**必须走在同一条 CDP 连接上**。原先它们是三次
+ *    独立的 `cdpSend`（= 三条 WebSocket，各自发完就关）—— 而 Chromium 对
+ *    **不同 CDP 连接**的输入事件**不保证先后**，于是偶尔出现"按下与抬起被
+ *    重排/丢弃 ⇒ 根本没有 click 事件"。实测症状极具误导性（`files` 模式
+ *    第 1 跑连空 4 次）：
+ *
+ *      点前 {"stripDisplay":"flex","hoverPath":"…\\ws/note.txt","calls":0,
+ *            "rect":[1226,117,22,22],"under":"BUTTON[reveal]"}
+ *      实际收到的 click=[]        ← 页面上的捕获监听器**一条都没收到**
+ *
+ *    也就是说：位置对、元素对、我们的状态也对，**事件压根没到页面**。
+ *    改成一条连接（同一个会话里 id 递增）之后，连跑 3 次全过、
+ *    而且不再出现"要点 4 次"。
+ */
 async function realClick(wsUrl, x, y) {
   const cx = Math.round(x), cy = Math.round(y);
-  await realMove(wsUrl, cx, cy);
-  await cdpSend(wsUrl, "Input.dispatchMouseEvent",
-    { type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1 });
-  await cdpSend(wsUrl, "Input.dispatchMouseEvent",
-    { type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1 });
+  await new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    const timer = setTimeout(() => { try { ws.close(); } catch { } reject(new Error("CDP click 超时")); }, 20000);
+    const pending = new Set([1, 2, 3]);
+    ws.onerror = (e) => { clearTimeout(timer); reject(new Error("WebSocket 错误: " + ((e && e.message) || "unknown"))); };
+    ws.onopen = () => {
+      const send = (id, params) => ws.send(JSON.stringify({
+        id, method: "Input.dispatchMouseEvent", params,
+      }));
+      send(1, { type: "mouseMoved", x: cx, y: cy, button: "none", clickCount: 0 });
+      send(2, { type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1 });
+      send(3, { type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1 });
+    };
+    ws.onmessage = (ev) => {
+      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+      if (!pending.has(msg.id)) return;
+      pending.delete(msg.id);
+      if (msg.error) {
+        clearTimeout(timer); try { ws.close(); } catch { }
+        return reject(new Error(`Input.dispatchMouseEvent: ${JSON.stringify(msg.error).slice(0, 200)}`));
+      }
+      if (pending.size === 0) { clearTimeout(timer); try { ws.close(); } catch { } resolve(); }
+    };
+  });
 }
 
 /**
@@ -2272,49 +2307,61 @@ async function verifyFiles(tmpDir) {
     //      四个断言全 FAIL（2026-09-26 实跑：`state=null root=null rows=0`）。
     let tree = null;
     let guideSeen = null;
+    let guideClicks = 0;
     for (let i = 0; i < 30; i++) {
-      const raw = await cdpEval(ws, `(() => JSON.stringify({
-        state: (document.querySelector('[data-files-state]') || { getAttribute: () => null }).getAttribute('data-files-state'),
-        root: (document.querySelector('[data-files-root]') || { getAttribute: () => null }).getAttribute('data-files-root'),
-        rows: document.querySelectorAll('[data-files-entry]').length,
-        files: Array.from(document.querySelectorAll('[data-files-entry="file"]')).map(e => e.getAttribute('data-files-path')),
-        dirs: Array.from(document.querySelectorAll('[data-files-entry="directory"]')).map(e => e.getAttribute('data-files-path')),
-        guide: Array.from(document.querySelectorAll('[data-sidebar-right-guide-entry]')).map(e => {
-          const r = e.getBoundingClientRect();
-          const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-          const top = document.elementFromPoint(cx, cy);
-          // ★ 「这个入口真的能点」＝ 中心点上最上面的就是它自己。
-          //   getBoundingClientRect 会骗人（未裁切的几何）—— 实测这里就有**两份**
-          //   标签坞（前面 tab 列表里「开始」出现两次），先命中的那一份是隐藏的，
-          //   按它的坐标真点等于点空气（第一版就是这么假 FAIL 的）。
-          return { kind: e.getAttribute('data-sidebar-right-guide-entry'),
-                   label: (e.textContent || '').trim().slice(0, 24),
-                   x: cx, y: cy, w: r.width, h: r.height,
-                   clickable: !!top && (top === e || e.contains(top)) };
-        }),
-        guideVisible: Array.from(document.querySelectorAll('[data-sidebar-right-guide-entry]'))
-          .filter(e => e.offsetParent !== null).map(e => e.getAttribute('data-sidebar-right-guide-entry')),
-        selectedTab: Array.from(document.querySelectorAll('[role="tab"]'))
-          .filter(e => e.getAttribute('aria-selected') === 'true')
-          .map(e => (e.textContent || '').trim().slice(0, 16)),
-      }))()`).catch(() => null);
-      tree = raw ? JSON.parse(raw) : null;
-      if (tree && tree.state !== null && tree.state !== undefined) break;   // 面板开出来了
-
-      const guide = ((tree && tree.guide) || []).filter((g) => g.clickable && g.w > 4 && g.h > 4);
-      if (guide.length) {
-        // 优先 files（文件树那一类）；否则按名字兜底；再否则第一个
-        const pick = guide.find((g) => g.kind === "files")
-          || guide.find((g) => /文件|工作区|files|workspace/i.test(g.label))
-          || guide[0];
-        const tag = `${pick.kind}/${pick.label}`;
-        if (guideSeen !== tag) {
-          console.log(`  右侧栏停在「指南」页 ⇒ 点开标签类型：${tag}`);
-          guideSeen = tag;
+      const raw = await cdpEval(ws, `(() => {
+        const data = {
+          state: (document.querySelector('[data-files-state]') || { getAttribute: () => null }).getAttribute('data-files-state'),
+          root: (document.querySelector('[data-files-root]') || { getAttribute: () => null }).getAttribute('data-files-root'),
+          rows: document.querySelectorAll('[data-files-entry]').length,
+          files: Array.from(document.querySelectorAll('[data-files-entry="file"]')).map(e => e.getAttribute('data-files-path')),
+          dirs: Array.from(document.querySelectorAll('[data-files-entry="directory"]')).map(e => e.getAttribute('data-files-path')),
+          guide: [], clicked: null, clickedHow: null,
+        };
+        if (data.state !== null && data.state !== undefined) return JSON.stringify(data);
+        // 停在「指南」页 ⇒ 把目标那一页点开。
+        //
+        // ★★ 这一步用**页面内的 el.click()**，不是坐标真点击。理由有两条，
+        //    都是实测出来的：
+        //      ① **坐标会过期**：面板在滑入动画里，elementFromPoint 那一刻
+        //         按钮是"可点的"，但真点击要新开一条 CDP WebSocket（几十毫秒后）
+        //         才落地，那时按钮已经挪走了 ⇒ 点在空气上。
+        //         连跑 4 次实测：前 3 次一次就开，第 4 次**连点 30 次都没开**
+        //         （每次 clickable=true，每次都点空）—— 典型的 flaky。
+        //      ② 这一步是**布景**（把宿主界面拨到要验的那一页），不是被判据本身。
+        //         本文件对"展开右侧边栏"用的也是元素 .click()，同一套。
+        //         判据要真指针的那几处（悬停出图标、点图标）**一条都没放宽**。
+        const entries = Array.from(document.querySelectorAll('[data-sidebar-right-guide-entry]'))
+          .filter(e => e.offsetParent !== null);
+        data.guide = entries.map(e => e.getAttribute('data-sidebar-right-guide-entry'));
+        const pick = entries.find(e => e.getAttribute('data-sidebar-right-guide-entry') === 'files')
+          || entries.find(e => /文件|工作区|files|workspace/i.test(e.textContent || ''))
+          || entries[0];
+        if (pick) { data.clicked = pick.getAttribute('data-sidebar-right-guide-entry'); data.clickedHow = "el.click"; pick.click(); }
+        else if (entries.length === 0) {
+          // 一个可点入口都没有 ⇒ 退一步：按坐标真点第一个入口（并记下来是用哪种方式）
+          const any = document.querySelector('[data-sidebar-right-guide-entry]');
+          if (any) {
+            const r = any.getBoundingClientRect();
+            data.clicked = any.getAttribute('data-sidebar-right-guide-entry');
+            data.clickedHow = "坐标待点";
+            data.at = { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+          }
         }
-        await realClick(ws, pick.x, pick.y);
-      } else if (tree && tree.guide && tree.guide.length && guideSeen !== "(无可点入口)") {
-        console.log(`  右侧栏指南页有 ${tree.guide.length} 个入口，但**没有一个在指针下**（被盖住/在视口外）`);
+        return JSON.stringify(data);
+      })()`).catch(() => null);
+      tree = raw ? JSON.parse(raw) : null;
+      if (tree && tree.clicked) {
+        guideClicks += 1;
+        if (guideSeen !== tree.clicked) {
+          console.log(`  右侧栏停在「指南」页 ⇒ 点开标签类型：${tree.clicked}（${tree.clickedHow}）`);
+          guideSeen = tree.clicked;
+        }
+        if (tree.clickedHow === "坐标待点" && tree.at) await realClick(ws, tree.at.x, tree.at.y);
+      }
+      if (tree && tree.state !== null && tree.state !== undefined) break;   // 面板开出来了
+      if (tree && !tree.clicked && guideSeen !== "(无可点入口)" && i > 2) {
+        console.log(`  指南页存在但没有任何**可见**入口（被盖住 / 在视口外）：${JSON.stringify(tree.guide)}`);
         guideSeen = "(无可点入口)";
       }
       await sleep(1000);
@@ -2337,7 +2384,8 @@ async function verifyFiles(tmpDir) {
       })()`).catch(() => "（取不到）");
       console.log(`  ⚠ 右侧栏结构快照: ${dump}`);
     }
-    console.log(`  文件树: state=${tree && tree.state} root=${tree && tree.root}`);
+    console.log(`  文件树: state=${tree && tree.state} root=${tree && tree.root}` +
+      (guideClicks ? `（从指南页点了 ${guideClicks} 次才开）` : ""));
     check("侧栏文件树真的画出来了", !!tree && tree.state === "tree" && tree.rows > 0, JSON.stringify(tree).slice(0, 200));
     check("★ 树的根就是这个会话的 cwd（不是别的目录）",
       String((tree && tree.root) || "").replace(/[\\/]+$/, "").toLowerCase() === work.replace(/[\\/]+$/, "").toLowerCase(),
@@ -2434,38 +2482,89 @@ async function verifyFiles(tmpDir) {
     //    ★ 先重新悬停一次再点：图标可能在上面那几条判据的间隙里被
     //      scroll/resize 监听收掉了（那段代码是刻意这么写的），
     //      直接按旧坐标点会点到空气上。这一条与"取样太早"是同一类坑。
+    //
+    // ★★ 2026-09-26（内核 0.1.7）改成**重试整轮「悬停 → 取坐标 → 点」**：
+    //    原先只有"取坐标"那一步会重试，**点只有一次机会**。
+    //    0.1.7 上连跑 4 次实测：第 3、4 次都在这里 FAIL，而且症状很干净 ——
+    //    `calls=0`、`last.at=0`（**点击事件根本没到我们那个按钮上**），
+    //    但紧邻的上一条断言（图标真的在指针下）**是 PASS 的**。
+    //    根因还是"取样太早"：取坐标与真点击之间隔了一条新开的 CDP WebSocket
+    //    （几十毫秒），而图标的位置是**悬停时才现算**的（`showStripFor` 每次都重摆），
+    //    这一瞬间它可能刚被重摆过。
+    //    ⇒ 判据本身没错（要真指针、要落在图标上），错的是"只试一次"。
+    //    现在最多试 4 轮，每轮都重新悬停、重新取坐标、重新真点，点完回读。
     let icon = { ok: false };
-    for (let i = 0; i < 8; i++) {
-      const row = JSON.parse(await cdpEval(ws, `(() => {
-        const row = document.querySelector('[data-files-entry="file"]');
-        if (!row) return JSON.stringify({ ok: false });
-        const b = row.querySelector(':scope > button') || row.querySelector('button');
-        const r = b.getBoundingClientRect();
-        return JSON.stringify({ ok: true, x: r.left + 12, y: r.top + r.height / 2 });
-      })()`));
-      if (!row.ok) { await sleep(400); continue; }
-      await realMove(ws, row.x, row.y);
-      await sleep(600);
-      icon = JSON.parse(await cdpEval(ws, `(() => {
-        const b = document.querySelector('[data-dsh-file-open="strip"] [data-dsh-file-action="reveal"]');
-        if (!b) return JSON.stringify({ ok: false });
-        const r = b.getBoundingClientRect();
-        const el = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-        return JSON.stringify({ ok: true, x: r.left + r.width / 2, y: r.top + r.height / 2,
-          hitSelf: !!el && (el === b || b.contains(el)) });
-      })()`));
-      if (icon.ok && icon.hitSelf) break;
-      await sleep(500);
+    let st = { calls: 0, last: null, errors: [] };
+    for (let attempt = 0; attempt < 4; attempt++) {
+      for (let i = 0; i < 8; i++) {
+        const row = JSON.parse(await cdpEval(ws, `(() => {
+          const row = document.querySelector('[data-files-entry="file"]');
+          if (!row) return JSON.stringify({ ok: false });
+          const b = row.querySelector(':scope > button') || row.querySelector('button');
+          const r = b.getBoundingClientRect();
+          return JSON.stringify({ ok: true, x: r.left + 12, y: r.top + r.height / 2 });
+        })()`));
+        if (!row.ok) { await sleep(400); continue; }
+        await realMove(ws, row.x, row.y);
+        await sleep(600);
+        icon = JSON.parse(await cdpEval(ws, `(() => {
+          const b = document.querySelector('[data-dsh-file-open="strip"] [data-dsh-file-action="reveal"]');
+          if (!b) return JSON.stringify({ ok: false });
+          const r = b.getBoundingClientRect();
+          const el = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+          return JSON.stringify({ ok: true, x: r.left + r.width / 2, y: r.top + r.height / 2,
+            hitSelf: !!el && (el === b || b.contains(el)) });
+        })()`));
+        if (icon.ok && icon.hitSelf) break;
+        await sleep(500);
+      }
+      if (!(icon.ok && icon.hitSelf)) { await sleep(500); continue; }
+      // ★ 点之前先装一个**只数数**的监听器（捕获阶段），并记下这一刻的三个事实：
+      //   · 指针下是谁（elementFromPoint）
+      //   · 我们的悬浮条显示着没有、`hover.path` 有没有值
+      //   · 这一次真点击到底落到哪个元素上（点完再读）
+      //   没有这三样就只能猜"是点空了还是状态被清了"（第 1 跑连空 4 次就是这么来的）。
+      await cdpEval(ws, `(() => {
+        window.__clickLog = [];
+        if (!window.__clickProbe) {
+          window.__clickProbe = true;
+          document.addEventListener('click', (e) => {
+            const t = e.target;
+            window.__clickLog.push({
+              x: e.clientX, y: e.clientY,
+              tag: t ? t.tagName : null,
+              action: t && t.getAttribute ? t.getAttribute('data-dsh-file-action') : null,
+              inRoot: !!(t && t.closest && t.closest('[data-dsh-file-open]')),
+            });
+          }, true);
+        }
+        return "ok";
+      })()`).catch(() => "ok");
+      const pre = JSON.parse(await cdpEval(ws, `(() => {
+        const s = document.querySelector('[data-dsh-file-open="strip"]');
+        const b = s && s.querySelector('[data-dsh-file-action="reveal"]');
+        const r = b ? b.getBoundingClientRect() : null;
+        const el = r ? document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) : null;
+        const st = window.__dshSidebarOpen.state();
+        return JSON.stringify({
+          stripDisplay: s ? s.style.display : null,
+          hoverPath: st.hoverPath, calls: st.calls,
+          rect: r ? [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] : null,
+          under: el ? (el.tagName + (el.getAttribute ? "[" + (el.getAttribute("data-dsh-file-action") || "") + "]" : "")) : null,
+        });
+      })()`).catch(() => ({})));
+      await realClick(ws, icon.x, icon.y);
+      await sleep(2500);
+      st = JSON.parse(await cdpEval(ws,
+        `JSON.stringify(window.__dshSidebarOpen ? window.__dshSidebarOpen.state() : { installed: false })`)
+        .catch(() => JSON.stringify({ installed: false })));
+      if (st && st.calls >= 1) break;
+      const log = await cdpEval(ws, `JSON.stringify(window.__clickLog || [])`).catch(() => "?");
+      console.log(`  （第 ${attempt + 1} 次真点没成：点前 ${JSON.stringify(pre)}；`
+        + `实际收到的 click=${log}）`);
     }
     check("能找到「在文件资源管理器中显示」那个图标且它就在指针下",
       icon.ok && icon.hitSelf === true, JSON.stringify(icon));
-    if (icon.ok && icon.hitSelf) {
-      await realClick(ws, icon.x, icon.y);
-      await sleep(3000);
-    }
-    const st = JSON.parse(await cdpEval(ws,
-      `JSON.stringify(window.__dshSidebarOpen ? window.__dshSidebarOpen.state() : { installed: false })`)
-      .catch(() => JSON.stringify({ installed: false })));
     console.log(`  点后: calls=${st.calls} last=${JSON.stringify(st.last)}`);
     check("★ 真点一下之后，注入脚本记录了一次**成功**的打开",
       st.calls >= 1 && st.last && st.last.ok === true && st.last.action === "reveal",
@@ -2503,10 +2602,15 @@ async function verifyFiles(tmpDir) {
         labels: m ? Array.from(m.querySelectorAll('[data-dsh-file-action]')).map(e => (e.textContent || '').trim()) : [] });
     })()`));
     console.log(`  右键菜单: display=${ctx.display} 项=${JSON.stringify(ctx.labels)}`);
+    // ★ 树没画出来时这里会拿到 {ok:false}：`ctx.items` 是 undefined。
+    //   原先直接 `.includes()` ⇒ 抛 `Cannot read properties of undefined`，
+    //   把 **12 条 FAIL** 埋在一条异常栈后面（第 4 跑就是这么崩的）。
+    //   ⇒ 判 FAIL，不抛异常。
+    const ctxItems = Array.isArray(ctx.items) ? ctx.items : [];
     check("★ 右键文件行弹出菜单（不是页面自己的菜单）",
-      ctx.display === "block" && ctx.items.length >= 3, JSON.stringify(ctx.items));
+      ctx.display === "block" && ctxItems.length >= 3, JSON.stringify(ctxItems));
     check("菜单里有「复制路径」（用户有时只要路径）",
-      ctx.items.includes("copy"), JSON.stringify(ctx.items));
+      ctxItems.includes("copy"), JSON.stringify(ctxItems));
 
     // ⑧ ★★ 安全边界：**这些路径一律不许被打开**
     //
