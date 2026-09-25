@@ -358,7 +358,18 @@ function readAppLog(tmpDir, maxLines = 40) {
 }
 
 async function stopApp(child) {
-  try { child.kill(); } catch { }
+  // ★ 2026-09-26 改：**连进程树一起杀**。
+  //   原先这里是 `child.kill()` —— 在 Windows 上只杀外壳本身，**它拉起来的那个内核会变成孤儿**
+  //   （内核是外壳的子进程）。正常退出时外壳自己会收尾，所以一直没暴露；
+  //   但**验收脚本中途抛异常**时走的正是这条硬杀路径（0.1.7 那次 files 模式就崩了）
+  //   ⇒ 那一次在端口 3181 上真留了一个跑着的内核。
+  //   `quit:check` 早就在用 `taskkill /T`，这里与它对齐。
+  if (process.platform === "win32" && child && child.pid) {
+    try { spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }); }
+    catch { /* 已经没了 */ }
+  } else {
+    try { child.kill(); } catch { }
+  }
   await sleep(700);
   try { child.kill("SIGKILL"); } catch { }
 }
