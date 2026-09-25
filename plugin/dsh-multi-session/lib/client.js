@@ -654,12 +654,52 @@ window.__ModuleLoader__.load({
       }
 
       // ③ 拿到会话面
+      //
+      // ★★ 2026-09-26（内核 0.1.7）：官方**改了契约** —— `create()` 只保证"会话进了目录"，
+      //    要借 binding **必须先 retain 身份**：
+      //      · `sessions/service.d.ts:172-179`
+      //        「Create a Host Session and publish its catalog row before resolving.
+      //          **Callers retain the returned identity before borrowing its binding.**」
+      //      · `sessions/service.d.ts:234-238`
+      //        `binding(id)`「Borrow an **already-retained** binding without extending its
+      //        lifetime … or undefined **without a retained generation**」
+      //    0.1.5 那代直接 `binding(id)` 就能拿到 ⇒ 旧写法在 0.1.7 上**必然返回空**，
+      //    表现正是"会话已创建，但拿不到它的会话面（binding 为空）"，于是两条提示词与附件
+      //    一条都发不出去（`plugin:check` 那 3 条 FAIL 的真因，不是发送逻辑坏了）。
+      //
+      //    官方标准姿势（`dsh-client-ui-workspace/lib/client.js:970`、
+      //    `dsh-client-ui-sidebar-right/lib/client.js:5922`）：
+      //      const reference = sessions.retain(id, { source: "…" });
+      //      … 用 reference.binding …        ← 释放之后 `binding` getter 会**抛** "is released"
+      //      reference.release();            ← 用完必须释放（引用计数，最后一位触发收尾）
+      //    `source` 只是引用计数标签（`SessionReferenceSourceMap`，声明合并可扩展、运行时无校验）：
+      //    官方内置 controllerOperation / gateway，两个 UI 各自扩了 mainView / sidebarView；
+      //    这里用 `multiSessionSend`，出问题时能在 `retainedBy` 里认出是我们借的。
       let face = null;
+      let reference = null;
       try {
-        const b = ctx.sessions.binding(sessionId);
-        face = b ? b.session : null;
-      } catch { /* 下面报错 */ }
+        const S = ctx.sessions;
+        if (S && typeof S.retain === "function") {
+          reference = S.retain(sessionId, { source: "multiSessionSend" });
+          // retain() 同时**启动**这个会话的初次打开；等它就绪再借 binding。
+          // ★ 有界等待：打开慢不该把整趟发送卡死（prompt 是"宿主受理"语义，
+          //   拿不到 ready 也照样试着发）。10 秒是上限，不是期望值。
+          if (reference && reference.ready && typeof reference.ready.then === "function") {
+            await Promise.race([
+              reference.ready.then(() => null, () => null),
+              new Promise((r) => setTimeout(r, 10000)),
+            ]);
+          }
+          face = reference && reference.binding ? reference.binding.session : null;
+        }
+        if (!face) {
+          // 0.1.5 那代的退路（那时还没有 retain 这一步）
+          const b = S && typeof S.binding === "function" ? S.binding(sessionId) : null;
+          face = b ? b.session : null;
+        }
+      } catch (e) { /* 下面统一报错 */ }
       if (!face) {
+        if (reference) { try { reference.release(); } catch (e2) { } }
         return { index, key: row.key, sessionId, modelNote, error: "会话已创建，但拿不到它的会话面（binding 为空）" };
       }
 
@@ -694,6 +734,12 @@ window.__ModuleLoader__.load({
         return { index, key: row.key, sessionId, modelNote, via };
       } catch (e) {
         return { index, key: row.key, sessionId, modelNote, error: errText(e) };
+      } finally {
+        // ★ 释放必须在**发送完成之后**：`SessionReference.binding` 一旦释放就抛
+        //   "is released"，提前释放等于自己把会话面掐掉。
+        //   释放只是解除我们这次借用的引用计数（最后一个引用会触发本地作用域收尾），
+        //   提示词早已被**宿主**受理，回合在宿主那边继续跑，不受影响。
+        if (reference) { try { reference.release(); } catch (e2) { } }
       }
     }
 
