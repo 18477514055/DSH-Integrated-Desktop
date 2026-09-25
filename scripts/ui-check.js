@@ -751,6 +751,230 @@ async function verifyInject(tmpDir) {
     } else {
       console.log("  （该内核当前没有可用模型目录，跳过打字过滤测试）");
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // ★★ 逐颗「提供方胶囊」真点击（2026-09-26 新增）
+    //
+    // 为什么必须补这一段：本模式原先**只数胶囊个数**（上面那条断言），一颗都没点过。
+    // 于是"点胶囊 ⇒ 整张模型列表被藏空"这个 bug 从 0.2.0 一直活到 0.2.16
+    // 都没被任何测试碰到 —— 用户 2026-09-26 报的正是它（"只有全部和 DeepSeek
+    // 两个标签能用，其他的一点就列表消失"）。
+    //
+    // 本机的临时家里通常只有 **1 个提供方**（`names.length > 1` 不成立 ⇒ 胶囊压根
+    // 不出现），所以这里用**夹具**补一个分组，结构逐条照抄官方：
+    //   `section[role=group][aria-labelledby]` → 标题 div（带 id）
+    //   + `button[role=menuitemradio][title]` × N
+    // （官方形状：`dsh-client-ui-model-selection/lib/client.js:820-858`）
+    //
+    // ④ 那一步是这条断言的灵魂：把分组标题**原地改名** —— 只产生 `characterData`
+    // 变更、不换元素。这正是 React 更新 `group.name` 的方式，也正是真实环境里
+    // 「提供方重新注册 / 名册刷新」的样子（`buildModelCatalog` 取的就是
+    // `provider.name`，见 `dsh-api-session-controller/lib/index.js:526`）。
+    // 旧实现把**分组名字符串**存在胶囊上，而 MutationObserver 只观察 childList
+    // ⇒ 名字变了它不知道 ⇒ 点下去一个分组都匹配不上 ⇒ 整张列表被 GHIDE 藏空。
+    // ★ 为什么用户只看到"全部"和"DeepSeek"能用：官方把 deepseek-account 那组的
+    //   标题渲染成 i18n 常量 `t("provider.account")`（官方 client.js:829），
+    //   **根本不读 group.name** ⇒ 那一颗胶囊天然免疫这个 bug。
+    // ══════════════════════════════════════════════════════════════════
+    {
+      const ws = after.webSocketDebuggerUrl;
+      // 按**真实渲染结果**数（`getClientRects()` 对 display:none 子树返回空），
+      // 不是读我们自己的属性 —— 属性对不代表屏幕上看得见。
+      const DUMP = `(() => {
+        const menu = document.querySelector('div[role="menu"]');
+        const secs = Array.from(document.querySelectorAll('div[role="menu"] section[role="group"][aria-labelledby]'));
+        return JSON.stringify({
+          menuOpen: !!menu,
+          pills: Array.from(document.querySelectorAll('.dsh-ms-pill')).map(b => b.textContent),
+          groups: secs.map(s => {
+            const t = s.querySelector('div[id]');
+            const rows = Array.from(s.querySelectorAll('button[role="menuitemradio"]'));
+            return { name: t ? (t.textContent||'').trim() : '?', rows: rows.length,
+              rendered: rows.filter(r => r.getClientRects().length > 0).length };
+          })
+        });
+      })()`;
+      const fixName = "\u5939\u5177\u63d0\u4f9b\u65b9";                 // 夹具提供方
+      const fixName2 = fixName + "\uFF08\u6539\u540d\uFF09";            // 夹具提供方（改名）
+      const fixModel = "\u5939\u5177\u6a21\u578b";                     // 夹具模型
+
+      const fixRows = Number(await cdpEval(ws, `(() => {
+        const menu = document.querySelector('div[role="menu"]');
+        if (!menu) return "-1";
+        const real = menu.querySelector('section[role="group"][aria-labelledby]');
+        if (!real) return "-1";
+        const old = document.getElementById("dsh-ms-fixsec");
+        if (old) old.remove();
+        const sec = real.cloneNode(true);
+        sec.id = "dsh-ms-fixsec";
+        sec.removeAttribute("data-dsh-ms-group-hide");
+        const title = sec.querySelector("div[id]");
+        if (!title) return "-1";
+        title.id = "dsh-ms-fixsec-title";
+        title.textContent = ${JSON.stringify(fixName)};
+        sec.setAttribute("aria-labelledby", "dsh-ms-fixsec-title");
+        Array.from(sec.querySelectorAll('button[role="menuitemradio"]')).forEach((b, i) => {
+          const nm = ${JSON.stringify(fixModel)} + (i + 1);
+          b.setAttribute("title", nm);
+          b.removeAttribute("data-dsh-ms-hide");
+          b.setAttribute("aria-checked", "false");
+          const span = b.querySelector("span span");
+          if (span) span.textContent = nm;
+        });
+        real.parentElement.appendChild(sec);
+        return String(sec.querySelectorAll('button[role="menuitemradio"]').length);
+      })()`));
+      check("（夹具）能造出第二个提供方分组，让胶囊出现", fixRows > 0, `夹具行数=${fixRows}`);
+
+      // ★ 注入脚本自己的状态（为什么胶囊可能没出现，只有它能说清）
+      const STATE = `JSON.stringify((() => {
+        const bars = Array.from(document.querySelectorAll('.dsh-ms-bar'));
+        const menus = Array.from(document.querySelectorAll('div[role="menu"]'));
+        const inMenu = bars.filter(b => menus.some(m => m.contains(b))).length;
+        const st = bars.map(b => {
+          const m = (() => { let n = b.parentElement; while (n && n.getAttribute && n.getAttribute("role") !== "menu") n = n.parentElement; return n; })();
+          const s = m && m.__dshMs;
+          return s ? { want: s.pills.__dshWant || null, n: s.pills.children.length,
+            display: s.pills.style.display, group: s.group, query: s.query, applying: s.applying } : null;
+        });
+        return { menus: menus.length, bars: bars.length, barsInMenu: inMenu,
+          pillEls: document.querySelectorAll('.dsh-ms-pill').length, st };
+      })())`;
+
+      let d0 = null, st0 = null;
+      for (let i = 0; i < 8; i++) {
+        await sleep(500);
+        st0 = await cdpEval(ws, STATE);
+        d0 = JSON.parse(await cdpEval(ws, DUMP));
+        if (d0.pills.length > 0) break;
+      }
+      console.log(`  注入脚本状态: ${st0}`);
+      console.log(`  胶囊: ${d0.pills.join(" | ")}`);
+      console.log(`  分组: ${d0.groups.map((g) => `${g.name}(${g.rendered}/${g.rows} 可见)`).join("  ")}`);
+      check("（夹具）胶囊数 = 分组数 + 1（改前那条只数个数，不点）",
+        d0.pills.length === d0.groups.length + 1, `${d0.pills.length} 颗 / ${d0.groups.length} 组`);
+
+      // ★ 事件级探针：真鼠标点击会在官方菜单上产生 mousedown/focusout/click 三连，
+      //   而 `el.click()` **一个都不产生** —— 这就是这段 bug 能躲过所有测试的原因。
+      //   把这三类事件（含 relatedTarget 与"在不在菜单里"）记下来，才知道是谁关的菜单。
+      await cdpEval(ws, `(() => {
+        if (window.__msDiag) { window.__msLog = []; return "already"; }
+        window.__msDiag = true;
+        window.__msLog = [];
+        const nm = (el) => !el ? null : (typeof el.className === "string" && el.className ? el.className : el.tagName);
+        const inMenu = (el) => { const m = document.querySelector('div[role="menu"]'); return !!(m && el && m.contains(el)); };
+        const rec = (type) => (e) => window.__msLog.push({
+          type,
+          target: nm(e.target),
+          targetIsPill: !!(e.target && e.target.classList && e.target.classList.contains("dsh-ms-pill")),
+          inMenu: inMenu(e.target),
+          related: nm(e.relatedTarget),
+          relatedInMenu: inMenu(e.relatedTarget),
+          active: nm(document.activeElement)
+        });
+        for (const t of ["mousedown", "mouseup", "click", "focusout", "focusin"]) {
+          document.addEventListener(t, rec(t), true);
+        }
+        return "installed";
+      })()`);
+
+      // 真鼠标点第 idx 颗；元素不在指针下（被裁/被盖）时退回 el.click() 并记下来
+      const clickPill = async (idx) => {
+        const raw = await cdpEval(ws, `(() => {
+          const bs = Array.from(document.querySelectorAll('.dsh-ms-pill'));
+          const b = bs[${idx}];
+          if (!b) return JSON.stringify({ ok: false });
+          const r = b.getBoundingClientRect();
+          const x = Math.round(r.left + r.width / 2), y = Math.round(r.top + r.height / 2);
+          const hit = document.elementFromPoint(x, y);
+          return JSON.stringify({ ok: true, x, y, label: b.textContent, hitSelf: hit === b,
+            hit: hit ? (hit.className || hit.tagName) : null,
+            rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+            vp: [window.innerWidth, window.innerHeight], focus: document.hasFocus() });
+        })()`);
+        const p = JSON.parse(raw);
+        if (!p.ok) return p;
+        // 事件真到了页面才算点到：以 __msLog 里出现 mousedown 为准（最多试 2 次）
+        let got = false;
+        for (let attempt = 0; attempt < 2 && !got; attempt++) {
+          await cdpEval(ws, `(() => { if (window.__msLog) window.__msLog.length = 0; return true; })()`);
+          if (p.hitSelf) await realClick(ws, p.x, p.y);
+          await sleep(300);
+          const log = await cdpEval(ws, `JSON.stringify(window.__msLog || [])`);
+          got = log.includes('"mousedown"');
+          p.log = log;
+          if (!got && attempt === 0) await sleep(200);
+        }
+        p.realHit = got;
+        if (!got) {
+          // 真实点击没进页面（本机实测会偶发）——退回 el.click()，并在断言文案里标出来
+          await cdpEval(ws, `Array.from(document.querySelectorAll('.dsh-ms-pill'))[${idx}].click()`);
+        }
+        await sleep(450);
+        return p;
+      };
+
+      if (fixRows > 0 && d0.pills.length >= 3) {
+        // ② 点夹具那一颗（最后一颗）⇒ 只应剩它的行
+        const pFix = await clickPill(d0.pills.length - 1);
+        const d1 = JSON.parse(await cdpEval(ws, DUMP));
+        const f1 = d1.groups.find((g) => g.name.includes("\u5939\u5177"));
+        const o1 = d1.groups.filter((g) => g !== f1).reduce((a, g) => a + g.rendered, 0);
+        const diag = await cdpEval(ws, `JSON.stringify(window.__msLog || [])`);
+        console.log(`  点击事件序列: ${diag}`);
+        check("点「提供方」胶囊后只剩该提供方的行（菜单不关、列表不空）",
+          !!f1 && f1.rendered === fixRows && o1 === 0 && d1.menuOpen,
+          `夹具 ${f1 ? f1.rendered : "?"}/${fixRows}，其它组共 ${o1} 行，菜单在=${d1.menuOpen}（点了「${pFix.label}」${pFix.realHit ? "，真鼠标已到页面" : "，真鼠标没进页面→el.click()"}；rect=${JSON.stringify(pFix.rect)} vp=${JSON.stringify(pFix.vp)} focus=${pFix.focus} 指针下=${pFix.hit} 事件=${pFix.log}）`);
+
+        // ③ 点「全部」⇒ 恢复全量
+        await clickPill(0);
+        const d2 = JSON.parse(await cdpEval(ws, DUMP));
+        check("点「全部」恢复全量",
+          d2.groups.length === d0.groups.length && d2.groups.every((g) => g.rendered === g.rows),
+          d2.groups.map((g) => `${g.name} ${g.rendered}/${g.rows}`).join("  ") || "（菜单已不在，拿不到分组）");
+
+        // ④ ★ 标题**原地改名**（只有 characterData 变更），再点同一颗胶囊
+        const stat0 = await cdpEval(ws, `JSON.stringify(window.__dshModelSearchStats || null)`);
+        const renamed = await cdpEval(ws, `(() => {
+          const t = document.getElementById("dsh-ms-fixsec-title");
+          if (!t) return "no-title";
+          const n = t.firstChild;
+          if (n && n.nodeType === 3) n.nodeValue = ${JSON.stringify(fixName2)};
+          else t.textContent = ${JSON.stringify(fixName2)};
+          return "ok:" + (t.textContent || "").trim();
+        })()`);
+        // 标签刷新允许有几秒延迟（注入脚本自己每秒兜底自查一次），轮询等它收敛
+        let d3 = null;
+        for (let i = 0; i < 8; i++) {
+          await sleep(400);
+          d3 = JSON.parse(await cdpEval(ws, DUMP));
+          if (d3.pills.some((p) => p.includes("\u6539\u540d"))) break;
+        }
+        const stat1 = await cdpEval(ws, `JSON.stringify(window.__dshModelSearchStats || null)`);
+        console.log(`  改名后胶囊: ${d3.pills.join(" | ")}`);
+        console.log(`  改名后分组: ${d3.groups.map((g) => `${g.name}(${g.rendered}/${g.rows})`).join("  ")}`);
+        console.log(`  自诊断: 改名前 ${stat0} → 改名后 ${stat1}（${renamed}）`);
+        check("（夹具）标题确实**原地**改掉了（只动文本节点，不换元素）",
+          d3.groups.some((g) => g.name.includes("\u6539\u540d")), `renamed=${renamed}`);
+        check("分组标题原地改名后，胶囊标签跟着更新（说明观察到了 characterData）",
+          d3.pills.some((p) => p.includes("\u6539\u540d")), `${d3.pills.join(" | ")}｜统计 ${stat0}→${stat1}`);
+
+        await clickPill(0);
+        await clickPill(d3.pills.length - 1);
+        const d4 = JSON.parse(await cdpEval(ws, DUMP));
+        const f4 = d4.groups.find((g) => g.name.includes("\u5939\u5177"));
+        const o4 = d4.groups.filter((g) => g !== f4).reduce((a, g) => a + g.rendered, 0);
+        check("★ 分组改名后再点同一颗胶囊，仍然只剩该提供方的行（用户报的「一点列表就消失」）",
+          !!f4 && f4.rendered === fixRows && o4 === 0 && d4.menuOpen,
+          `夹具 ${f4 ? f4.rendered : "?"}/${fixRows}，其它组共 ${o4} 行，菜单在=${d4.menuOpen}`);
+
+        // 收尾：复位 + 拆夹具，别把状态留给后面
+        await clickPill(0);
+        await cdpEval(ws, `(() => { const s = document.getElementById("dsh-ms-fixsec"); if (s) s.remove(); return true; })()`);
+      } else {
+        check("（夹具）胶囊齐了才能逐颗点", false, `pills=${d0.pills.length} fixRows=${fixRows}`);
+      }
+    }
   } finally {
     await stopApp(child);
   }
