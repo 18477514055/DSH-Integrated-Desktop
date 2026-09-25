@@ -64,6 +64,42 @@ window.__ModuleLoader__.load({
     const React = require("react");
     const ReactDOM = require("react-dom");
     const P = require("@deepseek-ai/dsh-client-ui-primitives");
+
+  // ───────────────────────────────────────────────────────────────────
+  // ★★ 图标跨世代适配（2026-09-26）
+  //
+  // 0.1.5 那代的图标名**带数字尺寸后缀**（`IconSendOutline16`、`IconQueueOutline14`），
+  // 0.1.7 改成了 `IconXxxRegular` / `IconXxxMedium` / `IconXxxArtwork`，尺寸走 `size` 属性。
+  // 旧名字在新内核里**一个都不存在** ⇒ `h(undefined, …)` ⇒ React #130。
+  //
+  // ★ 为什么这个 bug 表现得那么隐蔽：官方对**每个槽位条目**有独立的错误边界
+  //   （控制台只留一句 `slot entry crashed in 'conversation.input.right': … #130`），
+  //   所以现象是「插件 apply 跑了、槽位注册 ok、界面上什么都没有」——
+  //   看起来像「不兼容 / 没加载」，实际是渲染期炸了。2026-09-26 靠抓页面控制台才定位到。
+  //
+  // ★ 取不到时必须返回**一个组件**（渲染 null），绝不能返回 undefined ——
+  //   那等于把整条条目再炸一次。少一个图标可以，整个插件不见了不行。
+  function iconAcrossGenerations(stem, size) {
+    const candidates = [stem + "Regular", stem + "Medium", stem + "Artwork", stem + size, stem];
+    for (const n of candidates) if (typeof P[n] === "function") {
+      const C = P[n];
+      return (props) => h(C, Object.assign({ size }, props));
+    }
+    try { console.warn("[dsh-multi-session] 这个内核里找不到图标 " + stem + " —— 已降级为不画图标"); } catch (e) { /* 忽略 */ }
+    return () => null;
+  }
+  const IconCheck = iconAcrossGenerations("IconCheckOutline", 16);
+  const IconChevronDown = iconAcrossGenerations("IconChevronDownOutline", 14);
+  const IconClose = iconAcrossGenerations("IconCloseOutline", 16);
+  const IconFolderOpen = iconAcrossGenerations("IconFolderOpenOutline", 16);
+  const IconLoading = iconAcrossGenerations("IconLoadingOutline", 16);
+  const IconPaperclip = iconAcrossGenerations("IconPaperclipOutline", 16);
+  const IconPlus = iconAcrossGenerations("IconPlusOutline", 16);
+  const IconQuestion = iconAcrossGenerations("IconQuestionOutline", 14);
+  const IconQueue = iconAcrossGenerations("IconQueueOutline", 14);
+  const IconSend = iconAcrossGenerations("IconSendOutline", 16);
+  const IconTrash = iconAcrossGenerations("IconTrashOutline", 16);
+  const IconWarning = iconAcrossGenerations("IconWarningOutline", 16);
     const h = React.createElement;
     const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
@@ -788,7 +824,7 @@ window.__ModuleLoader__.load({
         size: "sm",
         title: "多会话同时开工（一个大弹窗里写 N 条提示词，一键发出）",
         "aria-label": "多会话同时开工",
-        icon: h(P.IconQueueOutline14, null),
+        icon: h(IconQueue, null),
         onClick: () => {
           diagnostics.clicks++;
           try {
@@ -966,7 +1002,7 @@ window.__ModuleLoader__.load({
           h("span", { className: "dshms-idx" }, "会话 " + (index + 1)),
           h("span", { className: "dshms-rhead-right" },
             total > 1 ? h(P.Button, {
-              variant: "ghost", size: "sm", icon: h(P.IconTrashOutline16, null),
+              variant: "ghost", size: "sm", icon: h(IconTrash, null),
               title: "删掉这一行（不会删掉任何会话）",
               onClick: () => removeRow(row.key),
             }) : null,
@@ -993,7 +1029,7 @@ window.__ModuleLoader__.load({
 
         row.files.length ? h("div", { className: "dshms-bar" },
           row.files.map((f, i) => h("span", { className: "dshms-chip", key: i },
-            h(P.IconPaperclipOutline16, null),
+            h(IconPaperclip, null),
             h("b", { title: f.name }, f.name),
             h("button", { title: "移除", onClick: () => setRow(row.key, { files: row.files.filter((_, j) => j !== i) }) }, "×"),
           )),
@@ -1001,7 +1037,7 @@ window.__ModuleLoader__.load({
 
         h("div", { className: "dshms-bar" },
           h("label", { className: "dshms-chip", style: { cursor: "pointer" }, title: "加附件（图片会随提示词一起发；其它文件先上传拿凭据）" },
-            h(P.IconPaperclipOutline16, null),
+            h(IconPaperclip, null),
             h("b", null, "附件"),
             h("input", {
               type: "file", multiple: true, style: { display: "none" },
@@ -1011,7 +1047,7 @@ window.__ModuleLoader__.load({
 
           h("span", { style: { position: "relative" } },
             h(P.Button, {
-              variant: "ghost", size: "sm", icon: h(P.IconFolderOpenOutline16, null),
+              variant: "ghost", size: "sm", icon: h(IconFolderOpen, null),
               title: "这一行在哪个工作区开工",
               onClick: (e) => openPop("cwd", e.currentTarget),
               children: (function () {
@@ -1043,7 +1079,7 @@ window.__ModuleLoader__.load({
 
           h("span", { style: { position: "relative" } },
             h(P.Button, {
-              variant: "ghost", size: "sm", icon: h(P.IconChevronDownOutline14, null),
+              variant: "ghost", size: "sm", icon: h(IconChevronDown, null),
               title: "这一行用哪个模型（可搜索、可按来源筛选）",
               onClick: (e) => openPop("model", e.currentTarget),
               children: modelLabel,
@@ -1130,7 +1166,7 @@ window.__ModuleLoader__.load({
           ),
 
           row.text ? h(P.Button, {
-            variant: "ghost", size: "sm", title: "清空这一行", icon: h(P.IconCloseOutline16, null),
+            variant: "ghost", size: "sm", title: "清空这一行", icon: h(IconClose, null),
             onClick: () => { setRow(row.key, { text: "", files: [] }); set({ menu: null }); },
           }) : null,
         ),
@@ -1209,7 +1245,7 @@ window.__ModuleLoader__.load({
               failed ? ` ${failed} 行失败。` : "",
             ),
             st.results.map((r, i) => h("div", { className: "dshms-res-row", key: r.key || i },
-              h("span", { style: { flex: "none" } }, r.error ? h(P.IconWarningOutline16, null) : (r.skipped ? h(P.IconQuestionOutline14, null) : h(P.IconCheckOutline16, null))),
+              h("span", { style: { flex: "none" } }, r.error ? h(IconWarning, null) : (r.skipped ? h(IconQuestion, null) : h(IconCheck, null))),
               h("div", { style: { minWidth: 0 } },
                 h("div", { className: "dshms-res-msg" }, r.error ? r.error : (r.skipped ? r.message : "已发出")),
                 r.sessionId ? h("div", { className: "dshms-mono" }, r.sessionId) : null,
@@ -1222,7 +1258,7 @@ window.__ModuleLoader__.load({
             st.rows.map((row, i) => h(RowView, { key: row.key, ctx, row, index: i, total: st.rows.length, models: models === undefined ? null : models, workspaces: st.scope.workspaces, popover: st.popover })),
             st.rows.length < MAX_ROWS
               ? h("div", null, h(P.Button, {
-                  variant: "outline", size: "sm", icon: h(P.IconPlusOutline16, null),
+                  variant: "outline", size: "sm", icon: h(IconPlus, null),
                   title: "再加一个会话输入框",
                   onClick: () => addRow(),
                   children: "新增会话",
@@ -1247,7 +1283,7 @@ window.__ModuleLoader__.load({
               h(P.Button, {
                 variant: "primary",
                 disabled: st.sending,
-                icon: st.sending ? h(P.IconLoadingOutline16, null) : h(P.IconSendOutline16, null),
+                icon: st.sending ? h(IconLoading, null) : h(IconSend, null),
                 title: "创建 N 个会话并把每行发出去（Ctrl+Enter）",
                 onClick: () => void sendAll(ctx),
                 children: st.sending ? "发送中…" : "一键发送",
@@ -1277,7 +1313,7 @@ window.__ModuleLoader__.load({
               h("h2", { className: "dshms-title" }, "多会话同时开工"),
               h("span", { className: "dshms-sub" }, "每个输入框 = 一个新会话"),
               h("span", { className: "dshms-x" },
-                h(P.Button, { variant: "ghost", size: "sm", icon: h(P.IconCloseOutline16, null), title: "关闭", onClick: () => closeModal() }),
+                h(P.Button, { variant: "ghost", size: "sm", icon: h(IconClose, null), title: "关闭", onClick: () => closeModal() }),
               ),
             ),
             h("div", { className: "dshms-body" }, body),
