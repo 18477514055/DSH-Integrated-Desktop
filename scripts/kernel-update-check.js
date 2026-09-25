@@ -89,30 +89,218 @@ async function main() {
   check(`★ 版本比较这把尺子：${rulerOk}/${cases.length} 条全对`, rulerOk === cases.length,
     rulerOk === cases.length ? "含 rc.10>rc.9、0.1.10>0.1.9 两条容易写错的" : `${cases.length - rulerOk} 条错`);
 
-  // ── ② 真连官方渠道 ───────────────────────────────────────────────
+  // ── ② 真连官方渠道：读的是**全部** dist-tags，不只 latest ──────────
+  //
+  // ★★ 这一段的来历（用户 2026-09-25 报的 bug）：
+  //   「你这个检查内核更新的功能可靠吗？我现在只检测到了一个 0.1.5 的一个小版本，
+  //     但是现在不是已经跑到 0.1.7 了吗？」
+  //   直连 registry 实测：dist-tags = { latest: 0.1.5-rc.3, next: 0.1.7-rc.2,
+  //     alpha: 0.1.7-alpha.2 } —— 检查**没撒谎**（`/latest` 确实就是 0.1.5-rc.3），
+  //   错的是它**只问了那一个标签**，于是把"正式渠道推荐的那版"说成了"官方最新"，
+  //   0.1.7 整个看不见。旧代码查的是 `…/@deepseek-ai/dsh/latest`。
   console.log("");
-  console.log("── ② 真连官方渠道（npm registry，只读）──");
+  console.log("── ② 真连官方渠道（npm registry 的全部 dist-tags，只读）──");
   const r = await KU.check();
   console.log(`  本机内核: ${r.installed && r.installed.found
     ? `v${r.installed.version}（来自：${r.installed.source}）` : "找不到"}`);
-  console.log(`  官方最新: ${r.latest || "-"}   有更新: ${r.hasUpdate}   ${r.reason || ""}`);
+  const chs = Array.isArray(r.channels) ? r.channels : [];
+  console.log(`  渠道清单: ${chs.map((c) => `${c.tag}=${c.version}`
+    + `${c.isDefault ? "(默认)" : ""}${c.newerThanDefault ? "★比默认新" : ""}`).join("  ") || "-"}`);
+  console.log(`  默认渠道: ${r.channel || "-"} = ${r.latest || "-"}`
+    + `   全部渠道里最高: ${r.newest || "-"}`);
+  if (r.skipped && r.skipped.length) console.log(`  跳过的标签: ${r.skipped.join("；")}`);
+  if (r.reason) console.log(`  失败原因: ${r.reason}`);
+
   check("真连上了官方渠道并拿到版本号", !!(r.ok && r.latest), r.reason || `latest=${r.latest}`);
-  check("★ 返回里带**可校验的**下载地址（dist.tarball + integrity/shasum）",
-    !!(r.dist && r.dist.tarball && (r.dist.integrity || r.dist.shasum)),
-    r.dist ? `tarball=${r.dist.tarball.slice(0, 60)}… integrity=${(r.dist.integrity || "").slice(0, 28)}…` : "没有 dist");
+  check("★★ 检查读的是**全部 dist-tags**（不止 latest —— 这就是那个 bug）",
+    r.ok && chs.length >= 1, chs.map((c) => `${c.tag}=${c.version}`).join(" ") || r.reason || "");
+  check("★ 请求的是 npm **精简元数据**（小得多，但 dist-tags 与各版本 dist 一个不少）",
+    /npm\.install-v1\+json/.test(String(KU.META_ACCEPT)), KU.META_ACCEPT);
+  check("★★ 查询地址**不再是 `/latest`**（旧写法只看得见一个标签）",
+    !/\/latest\/?$/.test(KU.REGISTRY), KU.REGISTRY);
+  check("★ 每个渠道都带**自己的**可校验下载地址（https + integrity/shasum）",
+    chs.length > 0 && chs.every((c) => c.dist && /^https:\/\//.test(c.dist.tarball)
+      && (c.dist.integrity || c.dist.shasum)),
+    chs.map((c) => `${c.tag}:${c.dist && c.dist.tarball
+      ? (c.dist.integrity ? "有integrity" : "只有shasum") : "★没有dist"}`).join(" ") || "一个渠道都没有");
   check("★ 下载地址是 https（不是明文 http）",
-    !!(r.dist && /^https:\/\//.test(r.dist.tarball)), r.dist && r.dist.tarball.slice(0, 40));
+    chs.length > 0 && chs.every((c) => /^https:\/\//.test(c.dist.tarball)),
+    (chs[0] && chs[0].dist && chs[0].dist.tarball.slice(0, 40)) || "-");
+  check("★ 默认渠道就是 `latest` 标签（不是「最高的那个」）",
+    !!r.channel && chs.some((c) => c.isDefault && c.tag === r.channel)
+      && (!r.tags || !r.tags.latest || r.channel === "latest"),
+    `channel=${r.channel} tags.latest=${(r.tags && r.tags.latest) || "-"}`);
+  check("★ 默认渠道永远排第一条（界面上位置不跳，哪怕它不是最新的）",
+    !!(chs[0] && chs[0].isDefault), chs.map((c) => c.tag).join(" > ") || "-");
+  check("★ 每个渠道的 hasUpdate 都与**同一把尺子**自洽（cmpVersion，不另写一套）",
+    chs.every((c) => c.hasUpdate === ((r.installed && r.installed.found)
+      ? KU.cmpVersion(c.version, r.installed.version) > 0 : null)),
+    chs.map((c) => `${c.tag}:${c.hasUpdate}`).join(" ") || "-");
+  check("★ `newest` 真的是全部渠道里版本最高的那个",
+    !!r.newest && chs.every((c) => KU.cmpVersion(r.newest, c.version) >= 0), `newest=${r.newest}`);
+  check("★ `newerThanDefault` 只在**比默认渠道新**的渠道上为真",
+    chs.every((c) => c.newerThanDefault === (!c.isDefault
+      && KU.cmpVersion(c.version, r.latest) > 0)),
+    chs.map((c) => `${c.tag}:${c.newerThanDefault}`).join(" ") || "-");
   check("本机内核是**从官方渠道**来的（不是随包带的）",
-    !!(r.installed && r.installed.found && /全局 npm|应用自带|显式/.test(r.installed.source || "")),
+    !!(r.installed && r.installed.found && /全局 npm|应用自带|显式|外壳安装/.test(r.installed.source || "")),
     (r.installed && r.installed.source) || "找不到内核");
   check("★ 本机内核**不是**外壳自带的（vendor/dsh 不存在）",
     !fs.existsSync(path.join(ROOT, "vendor", "dsh")), path.join(ROOT, "vendor", "dsh"));
 
-  // 内核版本与"官方最新"的关系必须自洽：有更新 ⇔ latest > 本机
+  // 内核版本与"默认渠道那一版"的关系必须自洽：有更新 ⇔ default > 本机
   if (r.ok && r.installed && r.installed.found) {
     const want = KU.cmpVersion(r.latest, r.installed.version) > 0;
     check("★ hasUpdate 与版本比较**自洽**（不是另写一套判据）", r.hasUpdate === want,
       `latest=${r.latest} 本机=${r.installed.version} hasUpdate=${r.hasUpdate} 期望=${want}`);
+  }
+
+  // ── ②.5 纯函数回归：上游把新版发在 next 上时，看得见吗（**不联网**）──
+  //
+  // ★ 为什么不靠 ② 那几条验这件事：它们量的是"此刻 registry 上恰好有什么" ——
+  //   上游哪天把 `latest` 提升到 0.1.7，真跑断言就自动变成"验不到"，护栏失效。
+  //   这一段喂一份**与 2026-09-25 那天完全相同**的元数据，离线且永远可复现。
+  //   ★ 旧代码在这一段会**整批 FAIL**（它只看得见 `latest` 一个标签）。
+  console.log("");
+  console.log("── ②.5 纯函数：上游把新版发在 next 上时，看得见吗（不联网）──");
+  const fakeDist = (v) => ({
+    tarball: `https://registry.npmjs.org/@deepseek-ai/dsh/-/dsh-${v}.tgz`,
+    integrity: `sha512-${Buffer.alloc(64, 7).toString("base64")}`,
+    shasum: "0".repeat(40),
+    unpackedSize: 48904,
+  });
+  const fakeVer = (v) => ({ name: KU.PKG, version: v, dist: fakeDist(v) });
+  const FIXTURE = {
+    "dist-tags": { latest: "0.1.5-rc.3", next: "0.1.7-rc.2", alpha: "0.1.7-alpha.2" },
+    versions: {
+      "0.1.5-rc.3": fakeVer("0.1.5-rc.3"),
+      "0.1.7-rc.2": fakeVer("0.1.7-rc.2"),
+      "0.1.7-alpha.2": fakeVer("0.1.7-alpha.2"),
+    },
+  };
+  const fx = KU.channelsFromMeta(FIXTURE, { found: true, version: "0.1.5-rc.2" });
+  const fxChs = Array.isArray(fx.channels) ? fx.channels : [];
+  console.log(`  渠道: ${fxChs.map((c) => `${c.tag}=${c.version}`
+    + `${c.isDefault ? "(默认)" : ""}${c.newerThanDefault ? "★比默认新" : ""}`).join("  ")}`);
+  check("★★ 三个标签**一个都没漏**（旧代码在这一条上必然 FAIL —— 它只看得见 latest）",
+    fx.ok === true && fxChs.length === 3, fxChs.map((c) => c.tag).join(" ") || fx.reason);
+  const fxNext = fxChs.find((c) => c.tag === "next");
+  check("★★ 0.1.7-rc.2 **出现在结果里**（这正是用户问「不是已经跑到 0.1.7 了吗」的那一版）",
+    !!fxNext && fxNext.version === "0.1.7-rc.2", fxNext ? `next=${fxNext.version}` : "★ next 不见了");
+  check("★★ 它被标成「比默认渠道新」（界面靠这一条把 0.1.7 指出来）",
+    !!(fxNext && fxNext.newerThanDefault === true), String(fxNext && fxNext.newerThanDefault));
+  // ★★ 光"看得见"还不够 —— 0.1.7-rc.2 在外壳上**起不来**（下面 ②.6 有完整证据）。
+  //   只报"比默认渠道更新"而不报"起不来"，等于换个姿势误导用户。
+  check("★★ 同时被标成「起不来」（2026-09-25 隔离真跑的结论，不是推断）",
+    !!(fxNext && fxNext.compat && fxNext.compat.usable === false
+      && fxNext.compat.level === "verified-bad"),
+    fxNext && fxNext.compat ? `${fxNext.compat.label} —— ${fxNext.compat.note}` : "next 不见了");
+  check("★★ 默认渠道**仍然是** latest=0.1.5-rc.3（不替用户把预览渠道当默认）",
+    fx.channel === "latest"
+      && !!(fxChs[0] && fxChs[0].isDefault && fxChs[0].tag === "latest" && fxChs[0].version === "0.1.5-rc.3"),
+    `channel=${fx.channel} 第一条=${fxChs[0] && `${fxChs[0].tag}=${fxChs[0].version}`}`);
+  check("★ 全部渠道里最高的是 0.1.7-rc.2（不是默认渠道那一版）",
+    fx.newest === "0.1.7-rc.2", `newest=${fx.newest}`);
+  check("★ alpha 也被列出来（不认识/不常用的标签一样不藏）",
+    !!fxChs.find((c) => c.tag === "alpha" && c.version === "0.1.7-alpha.2"),
+    fxChs.map((c) => c.tag).join(" "));
+  check("★★ 最高的那版**不在**正式渠道上 ⇒ 界面必须说清 `npm i -g` 装不到它",
+    fx.newest !== FIXTURE["dist-tags"].latest,
+    `newest=${fx.newest} latest=${FIXTURE["dist-tags"].latest}`);
+  check("★ 每个渠道各自的 hasUpdate 都用 cmpVersion 算对了（本机 0.1.5-rc.2）",
+    fxChs.find((c) => c.tag === "latest").hasUpdate === true
+      && fxChs.find((c) => c.tag === "next").hasUpdate === true
+      && fxChs.find((c) => c.tag === "alpha").hasUpdate === true,
+    fxChs.map((c) => `${c.tag}:${c.hasUpdate}`).join(" "));
+  // 反例：把本机换成比谁都新 ⇒ 三个渠道都必须报"没有更新"
+  const fxNew = KU.channelsFromMeta(FIXTURE, { found: true, version: "0.2.0" });
+  check("★ 反例：本机比所有渠道都新 ⇒ 三个 hasUpdate 全是 false",
+    (fxNew.channels || []).every((c) => c.hasUpdate === false),
+    (fxNew.channels || []).map((c) => `${c.tag}:${c.hasUpdate}`).join(" "));
+  const fxNoKernel = KU.channelsFromMeta(FIXTURE, { found: false, version: "" });
+  check("★ 本机找不到内核 ⇒ hasUpdate 一律 null（**不能**说「有更新」）",
+    (fxNoKernel.channels || []).every((c) => c.hasUpdate === null),
+    (fxNoKernel.channels || []).map((c) => `${c.tag}:${c.hasUpdate}`).join(" "));
+  // 坏数据：标签指着一个元数据里没有的版本 ⇒ 跳过并记下来，不编假记录
+  const fxBad = KU.channelsFromMeta(
+    { "dist-tags": { latest: "0.1.5-rc.3", ghost: "9.9.9" }, versions: { "0.1.5-rc.3": fakeVer("0.1.5-rc.3") } },
+    { found: true, version: "0.1.5-rc.2" });
+  check("★ 标签指着元数据里没有的版本 ⇒ 跳过、写进 skipped（不编一条假渠道）",
+    fxBad.ok === true && fxBad.channels.length === 1 && Array.isArray(fxBad.skipped)
+      && fxBad.skipped.some((s) => /ghost/.test(s)),
+    `channels=${(fxBad.channels || []).map((c) => c.tag).join(" ")} skipped=${(fxBad.skipped || []).join("；")}`);
+  const fxNoTags = KU.channelsFromMeta({ versions: {} }, { found: true, version: "0.1.5-rc.2" });
+  check("★ 元数据里没有 dist-tags ⇒ 明确报失败，不崩",
+    fxNoTags.ok === false && !!fxNoTags.reason, fxNoTags.reason || "(没有 reason)");
+  // 没有 latest 标签时退回"版本最高的那个" —— 上游随时可能改标签布局
+  const fxNoLatest = KU.channelsFromMeta(
+    { "dist-tags": { next: "0.1.7-rc.2", alpha: "0.1.7-alpha.2" },
+      versions: { "0.1.7-rc.2": fakeVer("0.1.7-rc.2"), "0.1.7-alpha.2": fakeVer("0.1.7-alpha.2") } },
+    { found: true, version: "0.1.5-rc.2" });
+  check("★ 万一上游没有 latest 标签 ⇒ 默认渠道退回版本最高的那个（不崩、不空）",
+    fxNoLatest.ok === true && fxNoLatest.channel === "next",
+    `channel=${fxNoLatest.channel} newest=${fxNoLatest.newest}`);
+
+  // ── ②.6 兼容性：**「有更新」不等于「能跑」** ─────────────────────
+  //
+  // ★★ 这一段才是用户那个问题的**真答案**。查清"0.1.7 发在 next 上"之后浮出来的
+  //   更要紧的一件事：**0.1.7 在外壳上根本起不来**。
+  //   真跑（`scripts/kernel-compat-check.js`，每条都是一次真启动）：
+  //     0.1.5-rc.3（latest）✅ 就绪        0.1.7-rc.2（next）❌ Unsupported/no-context
+  //     0.1.7-alpha.2（alpha）❌ 同上      0.1.7-rc.2 用**系统 node 24** 跑 ✅ 就绪
+  //   ⇒ 卡的是 **Electron**：外壳带 37，而 0.1.6 起的内核（新增了运行时拦截）
+  //     要 Electron 43/44/45。
+  console.log("");
+  console.log("── ②.6 兼容性：「有更新」不等于「能跑」──");
+  const ev = KU.shellElectron();
+  console.log(`  外壳的 Electron: ${ev}   本机系统 node: ${process.version}`);
+  console.log(`  分水岭: 内核 v${KU.KERNEL_INTERCEPTION_FROM} 起要 Electron `
+    + `${KU.LOADER_SUPPORTED_ELECTRON.join(" / ")}`);
+  console.log(`  ${(r.channels || []).map((c) => `${c.tag}=${c.version}`
+    + `（${c.compat ? c.compat.label : "-"}）`).join("  ")}`);
+
+  check("★ 拿到了外壳的 Electron 版本（判兼容性的前提）", !!ev, ev || "(空)");
+  // ★★ 这一条是**护栏的护栏**：换了 Electron 之后表里的"实测"结论全部作废。
+  //    脚本在这里 FAIL，就是逼你去跑一次 kernel-compat-check.js 重新真跑。
+  const staleEv = KU.COMPAT_EVIDENCE.filter((e) => e.electron !== ev);
+  check("★★ 兼容性证据表记的 Electron 与本机一致（换了 Electron 就必须重新真跑）",
+    staleEv.length === 0,
+    staleEv.length
+      ? `表里这些是别的 Electron 上验的：${staleEv.map((e) => `${e.version}@${e.electron}`).join(" ")}`
+        + " —— 跑 node scripts/kernel-compat-check.js --version=<版本> 重新真跑"
+      : `全部 ${KU.COMPAT_EVIDENCE.length} 条记录都是 Electron ${ev}`);
+  // 尺子自检：分水岭两边各判一次 + 真跑过的那一版
+  const c155 = KU.compatOf("0.1.5-rc.9", ev);       // 0.1.5 世代、**没逐版验过**
+  const c160 = KU.compatOf("0.1.6", ev);           // 新增拦截的那一代
+  const c170 = KU.compatOf("0.1.7-rc.2", ev);      // **真跑验过**
+  check("★ 分水岭：0.1.5 世代的版本判「能跑」", c155.usable === true,
+    `${c155.label} —— ${c155.note}`);
+  check("★ 分水岭：0.1.6（新增运行时拦截的那一代）判「起不来」", c160.usable === false,
+    `${c160.label} —— ${c160.note}`);
+  check("★★ 真跑验过的 0.1.7-rc.2 判「起不来」，且证据等级是「实测」",
+    c170.usable === false && c170.level === "verified-bad", `${c170.label} —— ${c170.note}`);
+  check("★ 没逐版验过的版本**不许**写成「实测」（只给世代结论）",
+    c155.level === "gen-ok" && c160.level === "gen-bad", `${c155.level} / ${c160.level}`);
+  check("★ 换了不在加载器白名单里的 Electron ⇒ 只按白名单判，不靠猜",
+    KU.LOADER_SUPPORTED_ELECTRON.length >= 1, `白名单 = ${KU.LOADER_SUPPORTED_ELECTRON.join(" / ")}`);
+  // ★ 反例：把 Electron 换成加载器白名单里那一版 ⇒ 同一版内核应改判「预计能跑」。
+  //   （这一条保证"外壳哪天换了 Electron"时规则会跟着走，而不是永远说 0.1.7 起不来。）
+  const c160New = KU.compatOf("0.1.6", KU.LOADER_SUPPORTED_ELECTRON[0]);
+  check("★ 反例：换成白名单里的 Electron ⇒ 0.1.6 那一代改判「预计能跑」",
+    c160New.usable === true && c160New.level === "gen-ok",
+    `${KU.LOADER_SUPPORTED_ELECTRON[0]} 上：${c160New.label}`);
+  check("★ 兼容性表里的版本号结构完整（不是随手写的字符串）",
+    KU.COMPAT_EVIDENCE.every((e) => /^\d+\.\d+\.\d+/.test(e.version) && /^\d+\.\d+\.\d+$/.test(e.electron)),
+    KU.COMPAT_EVIDENCE.map((e) => `${e.version}@${e.electron}=${e.ok ? "ok" : "bad"}`).join(" "));
+  if (r.ok) {
+    const defCh = (r.channels || []).find((c) => c.isDefault);
+    check("★★ 默认渠道（`latest`）那一版在**这台机器的 Electron 上实测能跑**"
+      + "（否则界面就是在劝人装一个起不来的东西）",
+      !!(defCh && defCh.compat && defCh.compat.usable === true),
+      defCh ? `${defCh.version} → ${defCh.compat.label}` : "没有默认渠道");
+    check("★ 每个渠道都带了 compat 判定（界面不自己猜「能不能跑」）",
+      (r.channels || []).every((c) => c.compat && typeof c.compat.usable === "boolean" && c.compat.label),
+      (r.channels || []).map((c) => `${c.tag}:${c.compat && c.compat.label}`).join(" "));
   }
 
   // ── ③ 校验函数真的会拒绝坏数据 ──────────────────────────────────

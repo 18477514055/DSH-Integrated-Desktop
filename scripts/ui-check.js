@@ -334,6 +334,45 @@ async function stopApp(child) {
   try { child.kill("SIGKILL"); } catch { }
 }
 
+/**
+ * `--kernel=<版本>`：把一个**指定版本**的官方内核预装进这次运行的临时 userData。
+ *
+ * ══════════════════════════════════════════════════════════════════
+ * 为什么要有这个开关（2026-09-25）
+ * ══════════════════════════════════════════════════════════════════
+ * 用户问「检查内核更新可靠吗？不是已经跑到 0.1.7 了吗」之后浮出来的真问题：
+ * **外壳跟 0.1.7 到底能不能一起用？** 而 `src/inject/*.js` 是对着 0.1.5-rc.2 的
+ * 官方前端 DOM 写的、会话格式是 0.1.5 世代、`profiles\node_modules` 的镜像世代
+ * 也要跟宿主内核一致 —— 所以这句话**不能靠推断**，只能真跑。
+ *
+ * 做法上是**复用外壳自己那条装内核的路**（`src/kernel-provision.js` 的 `provision`，
+ * 用随包 npm + Electron 自带的 Node，装进 `<userData>\kernel\<版本>\`），
+ * 于是 `kernel.js` 的发现链 **②.5 级「外壳安装」** 会优先选中它
+ * （②.5 排在**全局 npm 之前**，见 kernel.js:53-85）——
+ * ⇒ **既有的每一个模式**（loading / pages / plugins / files）都能原地在那一版内核上真跑一遍，
+ * 不用另写一套验收。
+ *
+ * ★ 全程只写这个临时目录：不碰用户正在用的内核、不碰全局 npm、不碰 B / A。
+ */
+async function provisionKernelInto(tmpDir, version) {
+  const KP = require("../src/kernel-provision");
+  const electronExe = path.join(ROOT, "node_modules", "electron", "dist",
+    process.platform === "win32" ? "electron.exe" : "electron");
+  console.log(`  预装内核 ${version} → ${path.join(tmpDir, "kernel", version)}`);
+  console.log("  （用**随包的 npm + Electron 自带的 Node**，与外壳「下载并安装内核」同一条代码路径）");
+  const t0 = Date.now();
+  const r = await KP.provision({
+    userDataDir: tmpDir,
+    version,
+    electronPath: electronExe,
+    onLine: (s) => console.log(`    [npm] ${s}`),
+  });
+  if (!r.ok) throw new Error(`预装内核 ${version} 失败：${r.reason}`);
+  console.log(`  ✓ 预装完成 v${r.version} → ${r.dir}`
+    + `${r.reused ? "（本来就装过，一个字节都没下）" : `（${((Date.now() - t0) / 1000).toFixed(1)}s）`}`);
+  return r;
+}
+
 // ── 模式一：加载页 ────────────────────────────────────────────────
 async function verifyLoading(tmpDir) {
   const { child } = launch("loading", tmpDir, FREE_PORT);
@@ -1652,18 +1691,55 @@ async function verifyPlugins(tmpDir) {
         latest: (document.getElementById('kn-latest')||{}).textContent||'',
         rowShown: (() => { const r=document.getElementById('kn-row-new'); return !!r && r.style.display !== 'none'; })(),
         disabled: !!(document.getElementById('btn-kn-check')||{}).disabled,
+        chCount: document.querySelectorAll('#kn-channels button[data-kn-tag]').length,
+        chTags: Array.from(document.querySelectorAll('#kn-channels button[data-kn-tag]')).map((b)=>b.dataset.knTag),
+        chText: (document.getElementById('kn-channels')||{}).textContent||'',
+        chRows: document.querySelectorAll('#kn-channels .kn-ch').length,
+        hint: (document.getElementById('kn-channel-hint')||{}).textContent||'',
       })`, 20000));
       // 出现"带版本号"的结论就算有结果了
       if (/v\d/.test(kn.status) && !kn.disabled) break;
     }
     console.log(`  点「检查内核更新」后: status="${kn && kn.status}" latest="${kn && kn.latest}"`);
+    console.log(`  渠道行: ${kn && kn.chRows} 行 / ${kn && kn.chCount} 个下载按钮 → ${((kn && kn.chTags) || []).join(" ")}`);
     if (kn && /失败/.test(kn.status) && /连不上|HTTP|超时/.test(kn.status)) {
       console.log("  SKIP  官方渠道此刻连不上（这一条没验到，**不算通过**）");
     } else {
       check("★★ 真点之后给出了**带版本号**的结论（不是停在「正在查」）",
         /v\d/.test(kn.status), `status="${kn.status}"`);
-      check("★ 结论里说清了官方最新版是多少", /v\d/.test(kn.latest), `latest="${kn.latest}"`);
+      check("★ 结论里说清了**默认（正式）渠道**的版本是多少", /v\d/.test(kn.latest), `latest="${kn.latest}"`);
       check("★ 检查完按钮**恢复可用**（不是永久卡在 disabled）", kn.disabled === false, String(kn.disabled));
+
+      // ★★ 2026-09-25 新增。用户原话：「我现在只检测到了一个 0.1.5 的一个小版本，
+      //   但是现在不是已经跑到 0.1.7 了吗？」——真因是旧代码只查 npm 的 `latest` 标签，
+      //   而上游把 0.1.7 系列发在 `next`/`alpha` 上。所以界面这一段的硬判据变成：
+      //   **渠道清单真的画出来了**，而不是只有一个"官方最新"的版本号。
+      check("★★ 渠道清单真的画出来了（不是只报一个版本号）",
+        kn.rowShown && kn.chRows >= 1 && kn.chCount >= 1,
+        `rowShown=${kn.rowShown} 行数=${kn.chRows} 按钮数=${kn.chCount}`);
+      check("★ 每一行都带**自己的**版本号（是清单，不是一行说明）",
+        /v\d/.test(kn.chText), (kn.chText || "").replace(/\s+/g, " ").slice(0, 140));
+      check("★★ 每个渠道**各占一行、各有一个下载按钮**（没有哪一行被藏起来）",
+        kn.chRows === kn.chCount && kn.chCount >= 1,
+        `行数=${kn.chRows} 按钮数=${kn.chCount} 标签=${kn.chTags.join(" ")}`);
+      check("★★ 说明里点破了那件事：`npm i -g` 装的只是**正式渠道**那一版",
+        /npm i -g/.test(kn.hint) && /正式渠道/.test(kn.hint),
+        (kn.hint || "").replace(/\s+/g, " ").slice(0, 160));
+
+      // ★ 把**两份互相独立的证据**对起来：主进程日志里记下的渠道清单
+      //   vs 页面 DOM 里画出来的标签与版本号。对不上就说明有一边在自说自话。
+      //   ★ 注意别拿 DOM 文本去找**标签名**（`latest`）—— 界面上显示的是中文标签
+      //     （「正式渠道」），标签名只活在 `data-kn-tag` 里。第一版就是这么假 FAIL 的。
+      const chanLog = readAppLog(tmpDir, 900).filter((l) => /渠道：/.test(l)).slice(-1)[0] || "";
+      const pairs = (chanLog.match(/渠道：([^]*?) 默认渠道=/) || [, ""])[1]
+        .trim().split(/\s+/).filter(Boolean).map((s) => s.split("="));
+      check("★★ 每个渠道**各自那一行的版本号**都画出来了（DOM 与主进程日志逐个对上）",
+        pairs.length >= 1 && pairs.every(([, v]) => v && kn.chText.includes(v)),
+        `日志=${pairs.map((p) => p.join("=")).join(" ")}`);
+      check("★★ 页面上的渠道标签与**主进程日志里的渠道**完全一致（两份独立证据对得上）",
+        pairs.length > 0 && pairs.every(([t]) => kn.chTags.includes(t))
+          && kn.chTags.every((t) => pairs.some(([x]) => x === t)),
+        `日志=${pairs.map((p) => p[0]).join(" ")} 页面=${kn.chTags.join(" ")}`);
     }
 
     const knLog = readAppLog(tmpDir, 900).filter((l) => /检查内核更新：/.test(l));
@@ -2355,6 +2431,8 @@ async function verifyFiles(tmpDir) {
   }
   if (!["loading", "inject", "probe", "reuse", "pages", "plugins", "firstrun", "files"].includes(MODE)) {
     console.error("用法: node scripts/ui-check.js <loading|inject|probe|reuse|pages|plugins|firstrun|files>");
+    console.error("     可选: --kernel=<版本>  把该版本官方内核预装进临时家，让外壳真的用它跑"
+      + "（例：--kernel=0.1.7-rc.2）");
     process.exit(1);
   }
 
@@ -2362,6 +2440,17 @@ async function verifyFiles(tmpDir) {
   console.log(`ui-check [${MODE}]`);
   console.log(`  临时 userData: ${tmpDir}`);
   console.log("  （DSH_HOME 落临时目录，不碰 B / A；inject 模式复用正在跑的内核，不起第二个）");
+  // ★ `--kernel=<版本>`：预装指定版本的内核，让**既有模式**原地在那一版上真跑一遍。
+  //   判据落在"外壳**真的用了**那一版"（读 shell.log），不是"我们把它装上了"。
+  const kernelArg = (process.argv.find((a) => a.startsWith("--kernel=")) || "").slice("--kernel=".length).trim();
+  if (kernelArg) {
+    try {
+      await provisionKernelInto(tmpDir, kernelArg);
+    } catch (e) {
+      console.error(`[ui-check] ${(e && e.message) || e}`);
+      process.exit(1);
+    }
+  }
   console.log("");
 
   try {
@@ -2377,6 +2466,18 @@ async function verifyFiles(tmpDir) {
     console.error(`\n[ui-check] 无法完成检查: ${(e && e.stack) || e}`);
     failures.push("执行异常: " + ((e && e.message) || e));
   } finally {
+    // ★ `--kernel=<版本>` 的硬判据：外壳**真的选中并跑起了**那一版内核，
+    //   而不是"我们把它装上了"。文件存在 / 目录里有 ≠ 能跑（$DSH_HOME/AGENTS.md 第二条）。
+    //   证据是应用自己写的 shell.log（与脚本自述互相独立）。
+    if (kernelArg) {
+      const used = readAppLog(tmpDir, 600).filter((l) => /使用内核:/.test(l));
+      check(`★★ 外壳**真的选中并跑起了**内核 ${kernelArg}（不是「我们把它装上了」）`,
+        used.length > 0 && used.every((l) => l.includes(kernelArg)),
+        used.slice(-1)[0] || "日志里没有「使用内核」这一行");
+      const ready = readAppLog(tmpDir, 600).filter((l) => /内核就绪:/.test(l));
+      check(`★★ 内核 ${kernelArg} 真的起来了（拿到了本机地址）`,
+        ready.length > 0, ready.slice(-1)[0] || "没有「内核就绪」");
+    }
     if (failures.length) {
       const tail = readAppLog(tmpDir, 40);
       if (tail.length) {

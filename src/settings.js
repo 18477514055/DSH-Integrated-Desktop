@@ -276,6 +276,8 @@
   //    所以流程到「下载 + 按官方 sha512 校验 + 给你命令」为止；
   //    **那条命令由用户自己在终端里敲**。
   let lastKernel = null;
+  /** renderKernelChannels 返回的「整体启停渠道按钮」函数（按钮是 innerHTML 画的，没有固定引用）。 */
+  let knSetChButtons = null;
 
   const knStatus = (t) => { $("kn-status").textContent = t; };
   const knProg = (t) => { $("kn-prog").textContent = t; };
@@ -286,8 +288,93 @@
     $("kn-dir").textContent = (k && k.dir) || "";
   }
 
+  /**
+   * 把「官方渠道」清单画出来（0.2.15 起）。
+   *
+   * ★ 清单**完全来自 registry** —— 有几个渠道、每个标签叫什么、各自是几版，
+   *   一个都不写死。上游把 `latest` 提升到 0.1.7（或再加一个标签）时，
+   *   界面自动跟上，不用改代码。
+   * ★ 默认渠道（`latest`）永远第一条并标出「★ 默认推荐」；其余渠道也照列，
+   *   各自标「比本机新 / 旧 / 同版本」，并在**比默认渠道还新**时点名出来。
+   *   ——这正是用户 2026-09-25 问的那件事（"不是已经跑到 0.1.7 了吗"）。
+   */
+  function renderKernelChannels(r) {
+    const box = $("kn-channels");
+    if (!box) return;
+    const list = Array.isArray(r.channels) ? r.channels : [];
+    const cur = (r.installed && r.installed.found) ? r.installed.version : "";
+    box.innerHTML = list.map((c) => {
+      const bits = [];
+      if (c.isDefault) bits.push("★ 默认推荐");
+      if (!cur) bits.push("本机没有内核，没法比");
+      else if (c.version === cur) bits.push(`与你本机 v${ShellUI.esc(cur)} 同版本`);
+      else if (c.hasUpdate) bits.push(`比本机 v${ShellUI.esc(cur)} 新`);
+      else bits.push(`比本机 v${ShellUI.esc(cur)} 旧`);
+      if (c.newerThanDefault) {
+        const d = list.find((x) => x.isDefault);
+        bits.push(`★★ 比默认渠道的 v${ShellUI.esc(d ? d.version : "")} 更新`);
+      }
+      const size = (c.dist && c.dist.unpackedSize)
+        ? ` · 官方包 ${(c.dist.unpackedSize / 1024).toFixed(0)} KB`
+        : "";
+      // ★ 兼容性单独占一行、单独上色 —— "能不能跑"比"新不新"重要得多。
+      //   `compat` 由主进程算（`src/kernel-update.js` 的 compatOf），渲染进程不自己判。
+      const cp = c.compat || null;
+      const bad = cp && cp.usable === false;
+      const compatLine = cp
+        ? `<span class="note" style="flex:1 1 100%;color:${bad ? "#a4341f" : "inherit"}">`
+          + `${bad ? "⚠ " : "· "}${ShellUI.esc(cp.label)}：${ShellUI.esc(cp.note)}</span>`
+        : "";
+      return `<div class="kn-ch" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;`
+        + `border:1px solid ${bad ? "#f3d3ca" : "var(--line-soft)"};border-radius:6px;padding:6px 8px"`
+        + `${bad ? ";background:#fdf1ee" : ""}">`
+        + `<b>${ShellUI.esc(c.label)}</b>`
+        + `<span class="mono" style="font-weight:600">v${ShellUI.esc(c.version)}</span>`
+        + `<span class="note">${bits.join(" · ")}</span>`
+        + `<button class="btn" data-kn-tag="${ShellUI.esc(c.tag)}" style="margin-left:auto">下载这个</button>`
+        + `<span class="note" style="flex:1 1 100%">`
+        + `${ShellUI.esc(c.note || c.tag)}${size}</span>`
+        + compatLine
+        + `</div>`;
+    }).join("");
+
+    const def = list.find((c) => c.isDefault);
+    const skipped = Array.isArray(r.skipped) ? r.skipped : [];
+    // ★ 只要清单里有"实测起不来"的渠道，就在说明里点破 —— 这正是用户会问的那件事
+    //   （"不是已经跑到 0.1.7 了吗"）。答案不是"预览渠道有风险"，而是**它根本起不来**。
+    const badOnes = list.filter((c) => c.compat && c.compat.usable === false);
+    const lines = [
+      `<span class="mono">npm i -g @deepseek-ai/dsh</span> 只会装<b>正式渠道</b>那一版`
+      + `${def ? `（v${ShellUI.esc(def.version)}）` : ""}。`,
+      "要装别的渠道，就用点「下载这个」拿到的那份 .tgz —— 版本钉在文件名上，装的是哪一个不含糊。",
+      (r.newest && def && r.newest !== def.version)
+        ? `★ 全部渠道里最高的是 <b>v${ShellUI.esc(r.newest)}</b>，它<b>不在</b>正式渠道上 ——`
+          + `所以命令行 <span class="mono">npm i -g</span> 装不到它。`
+        : "",
+      badOnes.length
+        ? `<span style="color:#a4341f">⚠ <b>${badOnes.map((c) => `v${ShellUI.esc(c.version)}（${ShellUI.esc(c.label)}）`).join("、")}`
+          + ` 实测在外壳上起不来</b>：外壳带的是 Electron <span class="mono">${ShellUI.esc(r.shellElectron || "?")}</span>，`
+          + `而 v${ShellUI.esc(r.kernelInterceptionFrom || "0.1.6")} 起的内核要 Electron `
+          + `<span class="mono">${ShellUI.esc((r.loaderSupportedElectron || []).join(" / ") || "43+")}</span>。`
+          + `装了会让客户端起不来 —— 想拿文件可以下，<b>别装</b>。</span>`
+        : "",
+      skipped.length
+        ? `<span style="color:#b8860b">官方源里有 ${skipped.length} 个标签这次没列出来：`
+          + `${ShellUI.esc(skipped.join("；"))}</span>`
+        : "",
+      r.checkedAt ? `本次检查时间：${ShellUI.esc(new Date(r.checkedAt).toLocaleString())}` : "",
+    ].filter(Boolean);
+    $("kn-channel-hint").innerHTML = lines.join("<br>");
+
+    // 下载中要能整体禁掉这一排按钮（它们是 innerHTML 画的，拿不到固定引用）
+    const setChButtons = (off) => {
+      box.querySelectorAll("button[data-kn-tag]").forEach((b) => { b.disabled = !!off; });
+    };
+    return setChButtons;
+  }
+
   async function doKernelCheck() {
-    knStatus("正在查官方渠道（npm registry）…");
+    knStatus("正在查官方渠道（npm registry 的全部发行标签）…");
     $("btn-kn-check").disabled = true;
     try {
       const r = await S.checkKernel();
@@ -296,26 +383,42 @@
       if (!r || !r.ok) {
         knStatus(`检查失败：${(r && r.reason) || "未知原因"}`);
         $("kn-row-new").style.display = "none";
+        $("kn-row-dl").style.display = "none";
+        // 渠道按钮是上一次检查画出来的，现在已经不显示了 ⇒ 别留着一个指向旧 DOM 的闭包
+        knSetChButtons = null;
         return;
       }
       const cur = r.installed && r.installed.version;
-      $("kn-latest").textContent = `v${r.latest}`;
-      $("kn-meta").textContent = r.dist && r.dist.unpackedSize
-        ? `官方包 ${(r.dist.unpackedSize / 1024 / 1024).toFixed(1)} MB（解压后）`
-        : "官方包";
-      if (r.hasUpdate === null) {
-        // 本机内核都找不到 ⇒ **不能**断言"有更新"，说清楚
-        knStatus(`官方最新是 v${r.latest}，但本机没找到内核，没法比 · 下面可以直接下载`);
-        $("kn-row-new").style.display = "";
-        return;
-      }
-      if (!r.hasUpdate) {
-        knStatus(`已是最新（v${cur}）`);
-        $("kn-row-new").style.display = "none";
-        return;
-      }
-      knStatus(`发现新内核 v${r.latest}（本机 v${cur}）`);
+      const list = Array.isArray(r.channels) ? r.channels : [];
+      const def = list.find((c) => c.isDefault) || list[0] || null;
+      $("kn-latest").textContent = def ? `v${def.version}` : `v${r.latest}`;
+      $("kn-meta").textContent = cur ? `（本机 v${cur}）` : "（本机没找到内核，没法比）";
+      knSetChButtons = renderKernelChannels(r);
       $("kn-row-new").style.display = "";
+      // 下载区先收起：等用户点了某个渠道的「下载这个」再露出来
+      $("kn-row-dl").style.display = "none";
+      $("kn-cmd-box").style.display = "none";
+      $("kn-prog").textContent = "";
+
+      if (!cur) {
+        // 本机内核都找不到 ⇒ **不能**断言"有更新"，说清楚
+        knStatus(`官方渠道查到了${def ? `（正式渠道 v${def.version}）` : ""}；`
+          + "但本机没找到内核，没法比 · 下面按渠道直接下载");
+        return;
+      }
+      // 别的渠道有更新而正式渠道没有 —— 这正是"看不见 0.1.7"那件事，
+      // 必须在状态行里点名，不能只写一句"已是最新"。
+      const others = list.filter((c) => !c.isDefault && c.hasUpdate);
+      const cp = def && def.compat ? ` · ${def.compat.label}` : "";
+      if (r.hasUpdate) {
+        knStatus(`发现新内核 v${def.version}（正式渠道，本机 v${cur}${cp}）`);
+      } else if (others.length) {
+        knStatus(`正式渠道没有更新（v${def.version}${cp}）；但 `
+          + others.map((c) => `${c.label}有 v${c.version}`).join("、")
+          + " —— 见下面的渠道清单");
+      } else {
+        knStatus(`已是最新（本机 v${cur}，正式渠道 v${def ? def.version : "-"}${cp}）`);
+      }
     } catch (e) {
       knStatus(`检查出错：${(e && e.message) || e}`);
     } finally {
@@ -323,17 +426,43 @@
     }
   }
 
-  async function doKernelDownload() {
+  /**
+   * 下载**指定渠道**的官方内核包。
+   *
+   * ★ 从 0.2.15 起改成按渠道下载：调用方把那一行渠道对象整个递进来
+   *   （含它自己的 `dist`），不再"下载上次检查的那一个"。
+   *   主进程那一侧仍然只认**它自己刚查到的地址表**（src/main.js 的 lastKernelDists），
+   *   所以这个改动没有放松"从任意地址下载"那道闸门。
+   */
+  async function doKernelDownload(ch) {
     const r = lastKernel;
-    if (!r || !r.ok || !r.dist) return;
-    $("btn-kn-go").disabled = true;
+    if (!r || !r.ok || !ch || !ch.dist) return;
+    $("kn-row-dl").style.display = "";
+    $("kn-cmd-box").style.display = "none";
     $("kn-bar").style.display = "";
-    knStatus(`正在下载官方内核包 v${r.latest}…`);
+    $("kn-prog").textContent = "";
+    $("kn-latest").textContent = `v${ch.version}（${ch.label}）`;
+    $("kn-meta").textContent = ch.compat ? ` · ${ch.compat.label}` : "";
+    // ★ 选中"实测起不来"的渠道时，把话说明白放在最上面 —— 下载本身无害，
+    //   但**装上去会让客户端起不来**，而下载完之后正好就是那条安装命令。
+    const w = $("kn-warn");
+    if (ch.compat && ch.compat.usable === false) {
+      w.style.display = "";
+      w.innerHTML = `⚠ <b>这一版实测在外壳上起不来 —— 别装。</b><br>`
+        + `${ShellUI.esc(ch.compat.note)}<br>`
+        + "下面的命令只用来【把文件拿到手】（存着，等外壳换了 Electron 再装）；"
+        + "现在装上去，这个客户端会停在「正在等待内核就绪…」。";
+    } else {
+      w.style.display = "none";
+      w.innerHTML = "";
+    }
+    if (knSetChButtons) knSetChButtons(true);
+    knStatus(`正在下载${ch.label}的内核包 v${ch.version}…`);
     try {
-      const d = await S.downloadKernel(r.dist, r.latest);
+      const d = await S.downloadKernel(ch.dist, ch.version);
       if (!d || !d.ok) {
         knStatus(`下载失败：${(d && d.reason) || "未知"}`);
-        $("btn-kn-go").disabled = false;
+        if (knSetChButtons) knSetChButtons(false);
         return;
       }
       const mb = d.bytes ? `${(d.bytes / 1024 / 1024).toFixed(1)} MB` : "";
@@ -349,7 +478,8 @@
       }
     } catch (e) {
       knStatus(`出错：${(e && e.message) || e}`);
-      $("btn-kn-go").disabled = false;
+    } finally {
+      if (knSetChButtons) knSetChButtons(false);
     }
   }
 
@@ -371,10 +501,36 @@
     renderKernelInstalled(k);
 
     $("btn-kn-check").addEventListener("click", doKernelCheck);
-    $("btn-kn-go").addEventListener("click", doKernelDownload);
     $("btn-kn-dir").addEventListener("click", () => S.openKernelDir().catch(() => { }));
     $("btn-kn-page").addEventListener("click", () => S.openKernelPage().catch(() => { }));
     $("btn-kn-copy").addEventListener("click", doKernelCopy);
+
+    // ★ 事件委托：渠道行是 innerHTML 画出来的（而且每次检查都会重画），
+    //   逐行挂监听会在重画后丢掉 —— 与插件卡片那边同一个理由（见 §pl-list）。
+    $("kn-channels").addEventListener("click", (ev) => {
+      const btn = ev.target && ev.target.closest ? ev.target.closest("button[data-kn-tag]") : null;
+      if (!btn || btn.disabled) return;
+      const tag = btn.dataset.knTag;
+      const list = (lastKernel && Array.isArray(lastKernel.channels)) ? lastKernel.channels : [];
+      const ch = list.find((c) => c.tag === tag);
+      if (!ch) { knStatus(`找不到渠道 ${tag} —— 请重新检查一次`); return; }
+      // 预览/实验渠道不是正式推荐的那一个 ⇒ 让用户明确点过一次确认
+      if (!ch.isDefault) {
+        const bad = ch.compat && ch.compat.usable === false;
+        const go = window.confirm(
+          `「${ch.label}」v${ch.version} 不是正式渠道那一版`
+          + `${ch.newerThanDefault ? "（它比正式渠道还新）" : ""}。\n\n`
+          + (bad
+            ? "⚠ 而且这一版在外壳上【实测起不来】（要更高的 Electron 版本）。\n"
+              + "   装了之后客户端会停在「正在等待内核就绪…」。\n"
+              + "   建议只把文件下下来存着，先别装。\n\n"
+            : "官方把它发在这个标签上，就意味着还没提升成正式版。\n")
+          + "装内核会换掉这个客户端正在用的内核（要重启客户端才生效），继续吗？"
+        );
+        if (!go) return;
+      }
+      doKernelDownload(ch);
+    });
 
     S.onKernelProgress((p) => {
       if (!p) return;
@@ -452,7 +608,7 @@
       } else {
         // ★ 用户要的那句说明："如果没有的话就勾上给他加一句说明就可以了"
         state.textContent = "没有找到内核 ⇒ 建议勾上。外壳会自己下载安装"
-          + "（约 214 MB，只这一次），**不需要你装 Node.js**，也不需要敲命令行。";
+          + "（约 214 MB，只这一次），不需要你装 Node.js，也不需要敲命令行。";
         dir.textContent = "";
         want.checked = true;
         btn.disabled = false;
@@ -523,7 +679,7 @@
       if (r.discovered) {
         envProg(`✓ 装好了 v${r.discovered.version}（${r.discovered.source}）—— 点「重启内核」即可生效`);
       } else {
-        envProg("⚠ 装完了但外壳**仍然找不到**它 —— 请看日志，或到「诊断与修复」里反馈");
+        envProg("⚠ 装完了但外壳仍然找不到它 —— 请看日志，或到「诊断与修复」里反馈");
       }
       await loadKernelEnv();
     } catch (e) {

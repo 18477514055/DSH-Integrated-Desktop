@@ -37,6 +37,33 @@
 > 想升级**已有**的内核仍然走「设置 → 更新 → 内核 → 检查内核更新」：
 > 那一条只给命令、由你自己执行（理由见 `release-notes/0.2.9.md`）。
 
+#### ★★ 内核有多个**发行渠道**，而且「更新」不等于「能跑」（0.2.15 起）
+
+npm 上同一个包有多个标签，**`latest` 不等于最新**。2026-09-25 实测：
+
+```
+dist-tags = { latest: "0.1.5-rc.3", next: "0.1.7-rc.2", alpha: "0.1.7-alpha.2" }
+```
+
+官方把 `latest` 停在 0.1.5，把 0.1.7 系列发在 `next` / `alpha` 上。
+所以「检查内核更新」现在会**把全部渠道都列出来**，并且**逐条标出能不能跑**：
+
+| 内核版本 | 渠道 | 在这台机器的 Electron 上 |
+|---|---|---|
+| `0.1.5-rc.3` | `latest` | ✅ **实测能跑** |
+| `0.1.7-rc.2` | `next` | ❌ **实测起不来**（要 Electron 43+，外壳带的是 37） |
+| `0.1.7-alpha.2` | `alpha` | ❌ 同上 |
+
+> 卡点是 **Electron 版本**：`0.1.6` 起内核新增了运行时拦截，
+> 要 hook V8 内部，而加载器只认 Electron 43/44/45。用**系统 node** 跑同一版内核是好的
+> ⇒ 内核本身没问题，是外壳的 Electron 太旧。
+>
+> 界面上会把「实测起不来」的渠道那行标红，并写明**别装**（想存文件可以下）。
+> 自己验一版：`node scripts/kernel-compat-check.js --version=<版本>`。
+> 详见 `docs/下载与安装渠道.md` 与 `release-notes/0.2.15.md`。
+>
+> ★ 重要：`npm i -g @deepseek-ai/dsh` **只会装 `latest`** —— 命令行装不到 0.1.7。
+
 ### 已经装了旧版？
 
 客户端里 **外壳设置 → 更新 → 检查更新** 就能升。它会**同时看线上与本机**
@@ -184,6 +211,8 @@ npm run dist         # 出 NSIS 安装包 + 便携版
 | `check-kernel.js` | 检查机器上有没有可用内核 |
 | `probe-diag.js` | 真起内核，打印带/不带 token 的原始响应，模拟探活循环 |
 | `boot-inspect.js` | 真起内核 → 跟 303 拿 Cookie → 读 `__DSH_BOOT__`，看插件是否真被加载 |
+| `kernel-compat-check.js` | **某一版官方内核能不能跟外壳一起跑**（真装 + 真启动，判据是"拿到本机地址"）。见上文「内核有多个发行渠道」 |
+| `kernel-update-check.js` | 「检查内核更新」的验收（渠道清单、纯函数回归、兼容性表、校验函数拒绝坏数据） |
 | `check-plugin-manifests.js` | 读各插件的 `dsh.bundle` / `dsh.client` 声明 |
 | `ui-inspect.js` | 经 CDP 读**真实渲染界面**的文本（要先带 `--remote-debugging-port=9222` 启动应用） |
 
@@ -212,6 +241,8 @@ npm run dist         # 出 NSIS 安装包 + 便携版
 ├── src/
 │   ├── main.js             Electron 主进程（窗口 / 托盘 / 生命周期 / IPC / 注入）
 │   ├── kernel.js           内核发现、启动、探活、自愈
+│   ├── kernel-update.js     检查内核更新（读 npm **全部 dist-tags** + 判"能不能跑"）
+│   ├── kernel-provision.js  替用户装内核（随包 npm + Electron 自带的 Node）
 │   ├── sites.js            三页切换的视图层（WebContentsView 覆盖 + PAGES 单一出处）
 │   ├── plugins.js          内置插件落位（随包分发 → 首次启动装进 profile）
 │   ├── preload.js          外壳页面 ↔ 主进程的唯一通道（只暴露动作 id）
@@ -231,6 +262,8 @@ npm run dist         # 出 NSIS 安装包 + 便携版
 │       └── README.md       能力表 / 架构依据 / 装验退 / 踩过的坑
 ├── scripts/
 │   ├── check-kernel.js     内核可用性检查
+│   ├── kernel-compat-check.js ★ 某版内核能不能跟外壳一起跑（真装 + 真启动）
+│   ├── kernel-update-check.js 「检查内核更新」的验收（渠道清单 / 纯函数 / 兼容性表）
 │   ├── make-icon.js        生成白底黑鲸鱼图标（多尺寸 PNG + 真 ICO）
 │   ├── verify-icon.js      逐像素验证图标（自带 PNG 解码，零依赖）
 │   ├── ensure-icon.js      打包前补齐并验证图标

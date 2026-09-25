@@ -33,6 +33,32 @@
  *     顺带提醒：`npm i -g` 会冲掉 `dsh` 的守卫 shim，装完要重跑 `dsh-guard-install.ps1`。
  *
  * 这也是全局规矩里那条判据：*这条命令跑下去之后，如果用户就看不见我了，那我不该跑它。*
+ *
+ * ══════════════════════════════════════════════════════════════════
+ * ★★ 2026-09-25 修：只查 `/latest` 会**漏掉整个 0.1.7 系列**
+ * ══════════════════════════════════════════════════════════════════
+ * 用户报：「我现在只检测到了一个 0.1.5 的一个小版本，但是现在不是已经跑到 0.1.7 了吗？」
+ *
+ * 直连 `registry.npmjs.org` 实测（不经外壳、不经代理工具）：
+ *
+ *     dist-tags = { latest: "0.1.5-rc.3", next: "0.1.7-rc.2", alpha: "0.1.7-alpha.2" }
+ *     最新发布的一个 = 0.1.7-rc.2（2026-09-24T14:18Z）
+ *     0.1.5-rc.3    = 2026-09-22T05:55Z
+ *
+ * ⇒ 检查本身**没撒谎**（`/latest` 确实就是 0.1.5-rc.3），错的是**只问了那一个标签**：
+ *   上游把 `latest` 停在 0.1.5 之后，继续把 0.1.7 系列发在 `next` / `alpha` 上。
+ *   于是界面把「正式渠道推荐的那个」说成了「官方最新」，而真正的更新看不见。
+ *
+ * ⇒ 现在改成**读整份元数据、把全部 dist-tags 都列出来**，并且：
+ *   · **默认渠道仍然是 `latest`** —— 不替用户把预览渠道当默认（那等于劝人踩
+ *     「内核换代把注入 UI 弄哑」的坑，见 project AGENTS §5：没真跑证据不下兼容性结论）；
+ *   · 每个渠道**各自**算 `hasUpdate`，界面上分别标出来；
+ *   · 说明白一件事：`npm i -g @deepseek-ai/dsh` 装的是 `latest`，**不是**最新那个版本 ——
+ *     所以要装别的渠道，只能靠**本地已下载的那个 .tgz**（版本钉死在文件名上）。
+ *
+ * 请求的是 npm 的**精简元数据**（`application/vnd.npm.install-v1+json`，实测 ~145 KB，
+ * 含全部 dist-tags 与每个版本的 `dist`），并带缓存破坏参数 —— 元数据带
+ * `cache-control: max-age=300`，而用户点这个按钮就是想**现在**知道真相。
  */
 
 const { app, net, shell } = require("electron");
@@ -44,11 +70,117 @@ const K = require("./kernel");
 
 /** 官方渠道：npm registry 上这个包就是内核本体。 */
 const PKG = "@deepseek-ai/dsh";
+/** 整份元数据（**含全部 dist-tags**）。★ 不要退回 `…/latest` —— 那正是漏掉 0.1.7 的原因。 */
 const REGISTRY = `https://registry.npmjs.org/${PKG}`;
-const REGISTRY_LATEST = `${REGISTRY}/latest`;
+/** npm 的"精简元数据"：体积小得多，但 `dist-tags` 与各版本 `dist` 一个不少。 */
+const META_ACCEPT = "application/vnd.npm.install-v1+json, application/json";
 /** 给人看的官方页面（不是下载地址，只是让用户能自己去看版本历史）。 */
 const OFFICIAL_PAGE = `https://www.npmjs.com/package/${PKG}`;
 const UA = "dsh-integrated-desktop-kernel-updater";
+
+/**
+ * 已知的 npm dist-tag 各自是什么意思（**只解释语义，不写死版本号**）。
+ *
+ * 版本号永远从 registry 现读；这里只是把 `next` 这种标签翻译成人话。
+ * 没登记过的标签照原样显示 —— 上游随时可能加标签，别让界面因为不认识就把它藏起来
+ * （那又会变成同一个 bug：**看得见的比实际存在的少**）。
+ */
+const CHANNELS = {
+  latest: { label: "正式渠道", note: "npm i -g @deepseek-ai/dsh 默认装的就是它" },
+  next: { label: "预览渠道", note: "官方把更新的版本先发在这里，还没提升成正式" },
+  alpha: { label: "实验渠道", note: "更早的试验版，官方不保证完整" },
+};
+
+/** 把一个 dist-tag 翻译成界面能直接用的 {label, note}。 */
+function channelInfo(tag) {
+  const k = CHANNELS[tag];
+  return { label: (k && k.label) || tag, note: (k && k.note) || "" };
+}
+
+// ── ★★ 兼容性：新版内核**能不能在外壳上跑**（2026-09-25 真跑查明的）──────────
+//
+// 这一节回答的问题比"哪个版本更新"更要紧，而且**答案跟渠道无关**：
+// `0.1.5` 世代的预览版能跑，`0.1.7` 世代的正式版照样跑不起来。
+//
+// 真跑记录（`scripts/kernel-compat-check.js`，每条都是一次真启动）：
+//
+//   | 内核版本      | 渠道      | 结果 |
+//   |---------------|-----------|------|
+//   | 0.1.5-rc.2    | （在用）  | ✅ 就绪 |
+//   | 0.1.5-rc.3    | `latest`  | ✅ 就绪 |
+//   | 0.1.7-rc.2    | `next`    | ❌ `Unsupported/no-context` |
+//   | 0.1.7-alpha.2 | `alpha`   | ❌ `Unsupported/no-context` |
+//   | 0.1.7-rc.2    | 系统 node 24（对照） | ✅ 就绪 ⇒ **卡的是 Electron，不是内核本身** |
+//
+// 机制（逐文件数出来的，不是猜的）：`0.1.6` 起 `dsh-app-boot` 新增
+// `installRuntimeInterception`（0.1.5-rc.3 里 **0 处**、0.1.7-rc.2 里 **3 处**），
+// 它要 hook V8 内部去 `require` 内置模块，而依赖的
+// `node-addon-native-custom-loader@0.1.6` 只认 **Electron 43/44/45** 的运行时指纹
+// （两个内核带的是**同一个** 0.1.6 版加载器 ⇒ 差别在调用方）。
+// 外壳带的是 **Electron 37** ⇒ 那一代内核**连启动都过不去**。
+
+/** 内核世代的**分水岭**：这个版本起新增了运行时拦截。 */
+const KERNEL_INTERCEPTION_FROM = "0.1.6";
+/** 加载器那句错误原文里自报的"支持的 Electron 版本"（照抄，不改写）。 */
+const LOADER_SUPPORTED_ELECTRON = ["43.0.0", "44.0.0", "45.0.0-alpha.6"];
+
+/** 外壳这一版用的 Electron。★ 取 `process.versions.electron` —— 只有真在 Electron 里才准。 */
+function shellElectron() {
+  return String((process.versions && process.versions.electron) || "");
+}
+
+/**
+ * **真跑验过**的兼容性记录。★ 这是"证据"，不是"规则"：
+ *   没验过的版本**不许**写成"实测"（本项目记过两次"拿代理证据当通过凭据"的教训）。
+ * ★ 换了 Electron 之后这些记录**全部作废** —— `scripts/kernel-update-check.js`
+ *   里有一条断言盯着这件事（它会在 Electron 与记录不符时 FAIL，逼你重新真跑）。
+ */
+const COMPAT_EVIDENCE = [
+  { version: "0.1.5-rc.2", electron: "37.10.3", ok: true, note: "外壳日常在用的那一版" },
+  { version: "0.1.5-rc.3", electron: "37.10.3", ok: true, note: "隔离真跑：拿到了本机地址" },
+  { version: "0.1.7-rc.2", electron: "37.10.3", ok: false, note: "隔离真跑：Unsupported/no-context" },
+  { version: "0.1.7-alpha.2", electron: "37.10.3", ok: false, note: "隔离真跑：Unsupported/no-context" },
+];
+
+/**
+ * 判"外壳这一版的 Electron 能不能跑这一版内核"。
+ *
+ * 四档，**证据等级写在脸上**（不许把"同世代"说成"实测"）：
+ *   · `verified-ok` / `verified-bad` —— 这一版**真跑过**；
+ *   · `gen-ok` / `gen-bad`           —— 没逐版跑过，只给**世代**结论，并注明是推断；
+ *   · 换了 Electron 就退回世代判断（新的 Electron 可能在白名单里）。
+ *
+ * @param {string} version 内核版本
+ * @param {string} [electron] 外壳的 Electron 版本；不给就用 `shellElectron()`
+ * @returns {{level:string, usable:boolean|null, label:string, note:string}}
+ */
+function compatOf(version, electron) {
+  const ev = String(electron || shellElectron() || "").trim();
+  const exact = COMPAT_EVIDENCE.find((e) => e.version === version && e.electron === ev);
+  const need = LOADER_SUPPORTED_ELECTRON.join(" / ");
+  if (exact) {
+    return exact.ok
+      ? { level: "verified-ok", usable: true, label: "实测能跑",
+        note: `真跑验过（Electron ${ev}）：${exact.note}` }
+      : { level: "verified-bad", usable: false, label: "实测起不来",
+        note: `真跑验过（Electron ${ev}）：${exact.note}。它要 Electron ${need}。` };
+  }
+  const evMajor = parseInt(ev.split(".")[0], 10);
+  const loaderOk = LOADER_SUPPORTED_ELECTRON.includes(ev) || (Number.isFinite(evMajor) && evMajor >= 43);
+  if (cmpVersion(version, KERNEL_INTERCEPTION_FROM) >= 0) {
+    return loaderOk
+      ? { level: "gen-ok", usable: true, label: "预计能跑（新 Electron）",
+        note: `外壳的 Electron ${ev} 在加载器支持列表（${need}）里 ⇒ 这一代内核应该能跑，`
+          + "但**这一版没逐版真跑验过**。" }
+      : { level: "gen-bad", usable: false, label: "同世代起不来",
+        note: `${KERNEL_INTERCEPTION_FROM} 起内核新增了运行时拦截，要 Electron ${need}，`
+          + `而外壳带的是 Electron ${ev || "?"}。同世代的 0.1.7-rc.2 与 0.1.7-alpha.2 都真跑验过起不来；`
+          + "**这一版本身没逐版验过**。" };
+  }
+  return { level: "gen-ok", usable: true, label: "同世代能跑",
+    note: `0.1.5 世代的 0.1.5-rc.3 真跑验过能跑（Electron ${ev || "?"}）；`
+      + "**这一版本身没逐版验过**。" };
+}
 
 /**
  * 版本比较（比 `update.js` 的 `cmpVersion` 更严：预发布标识按 semver 逐段比）。
@@ -139,19 +271,105 @@ function readDist(meta) {
 }
 
 /**
- * 查官方渠道上内核的最新版本。**只读**，不写任何东西。
+ * 查官方渠道上内核的**全部发行渠道**（npm 的 dist-tags）。**只读**，不写任何东西。
  *
- * @returns {Promise<{ok:boolean, reason?:string, installed:object, latest?:string,
- *                    hasUpdate?:boolean, dist?:object, page?:string, publishedAt?:string}>}
+ * ★ 返回里的 `channels` 是**完整**的一份；`latest`/`hasUpdate`/`dist` 三个旧字段
+ *   保留下来，含义收窄成「**默认渠道**（`latest` 标签）的那一个」——
+ *   调用方的语义没变，但界面必须把 `channels` 也画出来，否则又会退回到
+ *   "看得见 0.1.5、看不见 0.1.7" 那个 bug。
+ *
+ * @returns {Promise<{ok:boolean, reason?:string, installed:object, page:string,
+ *   channel?:string, channels?:Array<{tag:string,label:string,note:string,version:string,
+ *     dist:object, hasUpdate:boolean|null}>, latest?:string, hasUpdate?:boolean|null,
+ *   dist?:object, newest?:string, tags?:object, modifiedAt?:string, checkedAt?:string}>}
  */
+/**
+ * 从一份 npm 元数据里算出**全部渠道**。**纯函数**：不联网、不读磁盘、不看时钟。
+ *
+ * ★ 为什么单独拆出来：用户 2026-09-25 报的那个 bug（"只看得见 0.1.5、看不见 0.1.7"）
+ *   **不该靠"此刻 registry 上恰好有什么"去验** —— 上游哪天把 `latest` 提升到 0.1.7，
+ *   真跑那条断言就自动变成"验不到"，等于没有护栏。
+ *   拆成纯函数之后，验收脚本可以喂一份**与那天完全相同**的元数据
+ *   （`latest=0.1.5-rc.3` / `next=0.1.7-rc.2`），离线、确定性地断言 0.1.7 会被列出来。
+ *
+ * 规则（每一条都能被断言）：
+ *   · 每个 dist-tag 一条；标签指着元数据里没有的版本、或没给可校验下载地址的 ⇒
+ *     **跳过并写进 `skipped`**（不编一条假记录，也不假装它不存在）；
+ *   · 默认渠道 = `latest`；万一上游没给这个标签，退回**版本最高**的那个；
+ *   · 默认渠道永远排第一条（界面上的位置不跳）；
+ *   · `hasUpdate` / `newerThanDefault` 全部用**同一把尺子** `cmpVersion` 算。
+ *
+ * @param {object} meta npm 元数据（精简版或全量版都吃）
+ * @param {{found?:boolean, version?:string}} cur 本机内核
+ * @param {{electron?:string}} [opts] 外壳的 Electron 版本（判兼容性用；不给就用 `shellElectron()`）
+ * @returns {{ok:boolean, reason?:string, channels?:Array, channel?:string,
+ *            newest?:string, tags?:object, skipped?:string[]}}
+ */
+function channelsFromMeta(meta, cur, opts) {
+  const electron = String((opts && opts.electron) || shellElectron() || "").trim();
+  const tags = (meta && (meta["dist-tags"] || meta.distTags)) || null;
+  if (!tags || typeof tags !== "object" || Array.isArray(tags)) {
+    return { ok: false, reason: "官方源的返回里没有 dist-tags" };
+  }
+  const versions = (meta && meta.versions) || {};
+  const found = !!(cur && cur.found);
+  const curVer = (cur && cur.version) || "";
+
+  const channels = [];
+  const skipped = [];
+  for (const tag of Object.keys(tags)) {
+    const version = String(tags[tag] || "").trim();
+    if (!version) { skipped.push(`${tag}=空`); continue; }
+    const vm = versions[version];
+    if (!vm) { skipped.push(`${tag}→${version}（元数据里没有这个版本）`); continue; }
+    const dist = readDist(vm);
+    if (!dist) { skipped.push(`${tag}→${version}（没有可校验的下载地址）`); continue; }
+    channels.push({
+      ...channelInfo(tag),
+      tag,
+      version,
+      dist,
+      // 本机内核找不到时**不能**断言"有更新" —— 置 null 说清楚，别编
+      hasUpdate: found ? cmpVersion(version, curVer) > 0 : null,
+      // ★ 比"有没有更新"更要紧：这一版在外壳这一版的 Electron 上**跑不跑得起来**
+      compat: compatOf(version, electron),
+    });
+  }
+  if (!channels.length) {
+    return {
+      ok: false,
+      reason: `官方源的 dist-tags 里没有一个可下载的版本`
+        + `${skipped.length ? `（${skipped.join("；")}）` : ""}`,
+      skipped, tags: { ...tags },
+    };
+  }
+
+  const byVerDesc = (a, b) => cmpVersion(b.version, a.version);
+  const def = channels.find((c) => c.tag === "latest") || channels.slice().sort(byVerDesc)[0];
+  const newest = channels.slice().sort(byVerDesc)[0];
+  // 排序：默认渠道永远第一条（界面上不跳），其余按版本从新到旧。
+  channels.sort((a, b) => (a === def ? -1 : b === def ? 1 : byVerDesc(a, b)));
+  // ★ 这两条由**主进程**算好给界面用 —— 版本比较的尺子只有一把（cmpVersion），
+  //   渲染进程自己再写一套"谁更新"迟早会与这把尺子分叉。
+  for (const c of channels) {
+    c.isDefault = c === def;
+    c.newerThanDefault = c !== def && cmpVersion(c.version, def.version) > 0;
+  }
+  return { ok: true, channels, channel: def.tag, newest: newest.version, tags: { ...tags }, skipped };
+}
+
 async function check() {
   const cur = installed();
   const withCur = (o) => ({ ...o, installed: cur, page: OFFICIAL_PAGE });
 
   let res;
   try {
-    res = await net.fetch(REGISTRY_LATEST, {
-      headers: { "User-Agent": UA, Accept: "application/vnd.npm.install-v1+json, application/json" },
+    // ★ 缓存破坏参数 + cache:"no-store"：元数据带 `cache-control: max-age=300`，
+    //   而用户点这个按钮就是想**现在**知道真相。
+    //   （本项目在 GitHub 的 contents API 上已经吃过一次"读到缓存还当成真的"的亏。）
+    res = await net.fetch(`${REGISTRY}?t=${Date.now()}`, {
+      headers: { "User-Agent": UA, Accept: META_ACCEPT },
+      cache: "no-store",
     });
   } catch (e) {
     return withCur({ ok: false, reason: `连不上 npm 官方源：${(e && e.message) || e}` });
@@ -168,21 +386,27 @@ async function check() {
     return withCur({ ok: false, reason: `返回内容不是 JSON：${(e && e.message) || e}` });
   }
 
-  const latest = String((meta && meta.version) || "").trim();
-  if (!latest) return withCur({ ok: false, reason: "官方源的返回里没有 version 字段" });
+  const parsed = channelsFromMeta(meta, cur, { electron: shellElectron() });
+  if (!parsed.ok) return withCur({ ok: false, reason: parsed.reason });
 
-  const dist = readDist(meta);
-  if (!dist) return withCur({ ok: false, reason: "官方源的返回里没有可校验的下载地址（dist.tarball/integrity）" });
-
-  // 本机内核找不到时不能断言"有更新" —— 说清楚，别编
-  const hasUpdate = cur.found ? cmpVersion(latest, cur.version) > 0 : null;
+  const def = parsed.channels.find((c) => c.isDefault) || parsed.channels[0];
   return withCur({
     ok: true,
-    latest,
-    hasUpdate,
-    dist,
-    publishedAt: (meta && meta.publishedAt) || "",
-    homepage: (meta && meta.homepage) || "",
+    channel: parsed.channel,
+    channels: parsed.channels,
+    // 这三个旧字段保留下来，含义收窄成「**默认渠道**（latest 标签）的那一个」
+    latest: def.version,
+    hasUpdate: def.hasUpdate,
+    dist: def.dist,
+    newest: parsed.newest,
+    tags: parsed.tags,
+    skipped: parsed.skipped,
+    modifiedAt: String((meta && meta.modified) || ""),
+    checkedAt: new Date().toISOString(),
+    // ★ 界面要告诉用户"外壳带的是哪个 Electron" —— 兼容性就是卡在它上面
+    shellElectron: shellElectron(),
+    kernelInterceptionFrom: KERNEL_INTERCEPTION_FROM,
+    loaderSupportedElectron: LOADER_SUPPORTED_ELECTRON.slice(),
   });
 }
 
@@ -353,6 +577,8 @@ async function openDownloadDir() {
 
 module.exports = {
   check, download, installHint, openOfficialPage, openDownloadDir,
-  cmpVersion, verifyDigest, tarballName, installed, downloadDir,
-  PKG, REGISTRY, OFFICIAL_PAGE,
+  cmpVersion, verifyDigest, tarballName, installed, downloadDir, channelInfo,
+  channelsFromMeta, compatOf, shellElectron,
+  PKG, REGISTRY, OFFICIAL_PAGE, META_ACCEPT, CHANNELS,
+  KERNEL_INTERCEPTION_FROM, LOADER_SUPPORTED_ELECTRON, COMPAT_EVIDENCE,
 };

@@ -165,7 +165,17 @@ function provision(opts = {}) {
   const npmCli = path.join(npmDir, "bin", "npm-cli.js");
   const electron = opts.electronPath || process.execPath;
 
-  // ★ 版本：不指定就查 registry 的 latest（走 Chromium 网络栈之外的一条轻量路）
+    // ★ 版本：不指定就查 registry 的 latest（走 Chromium 网络栈之外的一条轻量路）
+    //
+    // ★★ 2026-09-25 说明为什么这里**故意仍然只查 `/latest`**（同一个项目里
+    //   `src/kernel-update.js` 刚刚因为"只看 latest"被修过，别以为是漏了）：
+    //   · 这一段的语义是「**新装一个能用的内核**」，装官方**正式渠道**发的那一版是对的；
+    //   · 「**看得见有哪些版本**」以及"每个渠道各是几版"是另一件事，那在
+    //     `kernel-update.js` 的渠道清单里（它读整份 dist-tags）。
+    //   · 上游把 `latest` 停在 0.1.5、把 0.1.7 发在 `next` 上 —— 默认装 latest
+    //     **正是"不把预览渠道塞给新用户"**。
+    //   ⇒ 要装非默认渠道，走 `provision({version})` 显式指定（接口早就支持），
+    //     或者用「检查内核更新」下载 .tgz 那条路。**别把这里改成"挑最高的那个"。**
   const wantVersion = String(opts.version || "").trim();
 
   return new Promise((resolve) => {

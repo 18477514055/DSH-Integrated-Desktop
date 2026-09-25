@@ -41,13 +41,17 @@ const CHECKS = [
     file: "src/settings.html",
     marks: ['data-pane="update"', 'data-pane="plugins"', 'data-pane="diag"',
       'data-pane="welcome"', "up-current", "pl-list", "btn-pl-check", "up-row-local", "btn-up-local",
-      "btn-pl-wizard", "fr-list", "btn-fr-install", "fr-done"],
+      "btn-pl-wizard", "fr-list", "btn-fr-install", "fr-done",
+      // ★ 2026-09-25：内核那一段从"一行官方最新"改成**渠道清单**（见下）
+      "kn-channels", "kn-channel-hint", "kn-row-dl"],
   },
   {
     file: "src/settings.js",
     marks: ["wireUpdate()", "wirePlugins()", "loadPlugins(false)", "doInstallPlugin",
       "doUninstallPlugin", "ShellUI.esc", "doInstallLocal", "localNewer", "sourceLabel",
-      "wireWizard()", "loadWizard", "doInstallSelected", "frInstallable", "firstRunDone"],
+      "wireWizard()", "loadWizard", "doInstallSelected", "frInstallable", "firstRunDone",
+      // ★ 2026-09-25：渠道清单由这个函数现画（有几个渠道、各是几版全来自 registry）
+      "renderKernelChannels", "data-kn-tag", "newerThanDefault", "isDefault"],
   },
   {
     file: "src/sites.js",
@@ -70,6 +74,10 @@ const CHECKS = [
       // ★ 0.2.14：运行环境那三条 IPC + 缺内核时的标记（加载页据此自动拉开抽屉）
       "dsh:kernel:env", "dsh:kernel:provision", "dsh:kernel:remove",
       "DSH_KERNEL_MISSING", "openDiag",
+      // ★ 2026-09-25：下载那一步从"只认一个地址"改成"只认本次检查发现的那张地址表"
+      //   （上游把 0.1.7 发在 next 上，只记一个地址会让选预览渠道的下载被自己拒掉）。
+      //   `渠道：` 是主进程那条日志的标记 —— ui-check 会拿它和页面 DOM 逐个对账。
+      "lastKernelDists", "渠道：",
     ],
   },
   {
@@ -107,6 +115,14 @@ const CHECKS = [
     //   而且症状是"点了按钮报 is not a function"（只有在全新机器上才暴露）。
     file: "src/kernel-provision.js",
     marks: ["npm-cli.js", "bundledNpmDir", "--ignore-scripts", "kernelDirFor", "provision"],
+  },
+  {
+    // ★ 2026-09-25：检查内核更新从"只查 /latest"改成读**全部 dist-tags**。
+    //   成因是用户报的「只看得见 0.1.5、看不见 0.1.7」——上游把 0.1.7 发在 `next` 上。
+    //   这几个标记在产物里缺一个，界面就会退回"只有一个版本号"的样子。
+    file: "src/kernel-update.js",
+    marks: ["channelsFromMeta", "dist-tags", "newerThanDefault", "isDefault",
+      "npm.install-v1+json", "skipped"],
   },
   {
     file: "src/diagnostics.js",

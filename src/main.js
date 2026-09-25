@@ -1631,11 +1631,16 @@ function localInstallerDirs() {
 let localInstallerFound = null;
 
 /**
- * 上一次「检查内核更新」查到的那个官方 dist（tarball + 校验值）。
- * ★ 同理：下载那一步只认**主进程自己查到的这个地址**，
+ * 上一次「检查内核更新」查到的**全部渠道**：`tarball 地址 → {dist, version, tag}`。
+ * ★ 同理：下载那一步只认**主进程自己查到的那些地址**，
  *   渲染进程递进来的任意 URL 一律拒 —— 否则就成了"从任意地址下任意文件"的通道。
+ * ★ 2026-09-25：从"只记一个 latest"改成**一张表**。原因是上游把 `latest` 停在 0.1.5、
+ *   把 0.1.7 发在 `next` 上；如果仍然只记一个地址，用户选了预览渠道就会被这里拒掉。
+ *   表里的 `version` 也是**主进程自己的**——渲染进程递进来的版本号只用来找条目，
+ *   真正写进文件名的是这一份（少一个可被渲染进程影响的输入）。
  */
-let lastKernelDist = null;
+let lastKernelDists = new Map();
+/** 默认渠道（`latest` 标签）的版本号 —— 只用于日志与兜底。 */
 let lastKernelVersion = null;
 
 /** 内核包下载进度只推给外壳自有窗口（设置页）。 */
@@ -2143,30 +2148,47 @@ function registerIpc() {
   // ★ **这里没有「安装内核」这个通道** —— 装内核是往外壳此刻正在运行的目录里
   //   换代码（2026-09-19 那次事故就是这么来的），所以命令交给用户自己执行。
   //   本模块能做到的最大程度是「下载 + 按官方 sha512 校验 + 给命令」。
+  // ★ 2026-09-25：「检查」现在读**全部 dist-tags**（上游把 latest 停在 0.1.5、
+  //   把 0.1.7 发在 next 上，只查 /latest 会看不见更新）。对应地，下载那一步
+  //   从"只认一个地址"改成"只认本次检查发现的那张地址表"——**边界没有放松**：
+  //   渲染进程仍然只能从主进程自己刚查到的地址里挑，不能递任意 URL。
   ipcMain.handle("dsh:kernel:check", async (e) => {
     assertShellSender(e);
-    log("检查内核更新…（官方渠道 = npm registry）");
+    log("检查内核更新…（官方渠道 = npm registry，读全部 dist-tags）");
     const r = await KU.check();
-    // ★ 记下**主进程自己查到的**那个 dist 与版本号 —— 下载那一步只认它
-    lastKernelDist = (r && r.ok && r.dist) ? r.dist : null;
+    // ★ 记下**主进程自己查到的**每一个渠道的 dist 与版本号 —— 下载那一步只认这张表
+    lastKernelDists = new Map();
+    if (r && r.ok && Array.isArray(r.channels)) {
+      for (const c of r.channels) {
+        if (c && c.dist && c.dist.tarball) {
+          lastKernelDists.set(c.dist.tarball, { dist: c.dist, version: c.version, tag: c.tag });
+        }
+      }
+    }
     lastKernelVersion = (r && r.ok && r.latest) ? r.latest : null;
+    const seen = (r && r.ok && Array.isArray(r.channels))
+      ? r.channels.map((c) => `${c.tag}=${c.version}`).join(" ") : "-";
     log(`检查内核更新：ok=${r.ok} 本机=${(r.installed && r.installed.version) || "-"}`
-      + `（${(r.installed && r.installed.source) || "-"}） 官方最新=${r.latest || "-"}`
-      + ` 有更新=${r.hasUpdate} ${r.reason || ""}`);
+      + `（${(r.installed && r.installed.source) || "-"}） 渠道：${seen}`
+      + ` 默认渠道=${(r && r.channel) || "-"}=${r.latest || "-"}`
+      + ` 全部渠道里最高=${(r && r.newest) || "-"} ${r.reason || ""}`);
     return r;
   });
 
   ipcMain.handle("dsh:kernel:download", async (e, dist, version) => {
     assertShellSender(e);
-    // ★ 只接受"主进程上一次检查拿到的那个 dist" —— 不接受渲染进程递来的任意 URL，
-    //   否则这个通道就成了"从任意地址下载任意文件"。比对 tarball 地址即可。
+    // ★ 只接受"主进程上一次检查拿到的那些 dist 之一" —— 不接受渲染进程递来的任意 URL，
+    //   否则这个通道就成了"从任意地址下载任意文件"。按 tarball 地址在表里查即可。
     const d = dist && typeof dist === "object" ? dist : null;
     if (!d || !d.tarball) return { ok: false, reason: "没有可下载的地址" };
-    if (!lastKernelDist || d.tarball !== lastKernelDist.tarball) {
+    const hit = lastKernelDists.get(d.tarball);
+    if (!hit) {
       return { ok: false, reason: "拒绝：这个下载地址不是「检查内核更新」查到的那一个" };
     }
-    log(`开始下载内核包：${d.tarball}`);
-    const r = await KU.download(lastKernelDist, String(version || lastKernelVersion || ""),
+    // ★ 版本号**一律用主进程自己记的那份**，不用渲染进程递进来的
+    const ver = hit.version || String(version || lastKernelVersion || "");
+    log(`开始下载内核包：${hit.tag || "-"} → v${ver} ${hit.dist.tarball}`);
+    const r = await KU.download(hit.dist, ver,
       (p) => kernelUpdateEmit({ kind: "progress", ...p }));
     log(`下载内核包结果：ok=${r.ok} ${r.reason || r.path}`
       + `${r.verified ? ` 校验=${r.verified}` : ""}`);

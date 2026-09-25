@@ -298,15 +298,34 @@
         </div>
       </div>
 
+      <!-- ── 官方渠道清单（0.2.15 起）─────────────────────────────
+           ★ 为什么不是一行"官方最新"：上游把 npm 的 `latest` 标签停在 0.1.5-rc.3，
+             把 0.1.7 系列发在 `next` / `alpha` 上。只报一个标签 = 用户看不见
+             真正在更新的那个系列（2026-09-25 用户报的正是这个）。
+             默认渠道仍然是 `latest`，但**全部渠道都列出来**。 -->
       <div class="row" id="kn-row-new" style="display:none">
-        <div class="k">官方最新</div>
+        <div class="k">官方渠道</div>
         <div class="v" style="flex-direction:column;align-items:stretch;gap:8px">
-          <div><b id="kn-latest"></b> <span class="note" id="kn-meta"></span></div>
+          <div class="note">
+            默认推荐 <b>正式渠道</b>：<b id="kn-latest"></b>
+            <span class="note" id="kn-meta"></span>
+          </div>
+          <!-- 渠道行由 settings.js 现画：标签名与版本号全部来自 registry，一个都不写死 -->
+          <div id="kn-channels" style="display:flex;flex-direction:column;gap:6px"></div>
+          <div class="note" id="kn-channel-hint" style="line-height:1.7"></div>
+        </div>
+      </div>
+
+      <div class="row" id="kn-row-dl" style="display:none">
+        <div class="k">下载</div>
+        <div class="v" style="flex-direction:column;align-items:stretch;gap:8px">
+          <!-- 选中"实测起不来"的渠道时，这里会红着脸说出来（见 settings.js 的 doKernelDownload） -->
+          <div id="kn-warn" class="note"
+               style="display:none;color:#a4341f;background:#fdf1ee;border:1px solid #f3d3ca;border-radius:6px;padding:6px 8px;line-height:1.7"></div>
           <div id="kn-bar" style="display:none;height:8px;background:var(--line-soft);border-radius:6px;overflow:hidden">
             <i id="kn-fill" style="display:block;height:100%;width:0;background:var(--accent);transition:width .15s"></i>
           </div>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-            <button class="btn" id="btn-kn-go">下载官方内核包</button>
             <button class="btn" id="btn-kn-dir">打开下载目录</button>
             <span class="note" id="kn-prog"></span>
           </div>
