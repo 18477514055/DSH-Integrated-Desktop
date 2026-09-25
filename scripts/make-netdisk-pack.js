@@ -167,12 +167,33 @@ function readZipMembers(zipPath) {
   return out;
 }
 
+/**
+ * 本脚本用到的临时目录登记表 —— **跑完必须删掉**。
+ *
+ * ★ 2026-09-25 补：这个脚本原先用 `fs.mkdtempSync` 造了 `dsh-pack-*` 与 `dsh-netdisk-*`
+ *   两个临时目录，**从来不清**。一次跑完在 `%TEMP%` 留 ~110 MB（网盘包本体那一份）。
+ *   这天正是因为反复跑验收把 C 盘塞满（只剩 0.2 GB），`npm install` 报了个
+ *   看不出原因的「退出码 1」—— 所以这条不是洁癖，是**这台机器 C 盘长期紧张**。
+ * ★ 用 `process.on("exit")` 而不是在末尾写一句：这样**中途 process.exit(1) 也会清**。
+ */
+const TEMP_DIRS = [];
+function mkTemp(prefix) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  TEMP_DIRS.push(d);
+  return d;
+}
+process.on("exit", () => {
+  for (const d of TEMP_DIRS) {
+    try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* 删不掉就算了，别影响退出码 */ }
+  }
+});
+
 /** npm pack 一个插件目录 → 返回打出来的 tgz 绝对路径。 */
 function packPlugin(dir) {
   const nodeDir = path.dirname(process.execPath);
   const cli = path.join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js");
   if (!fs.existsSync(cli)) { problems.push(`找不到 npm-cli.js：${cli}`); return null; }
-  const dest = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-pack-"));
+  const dest = mkTemp("dsh-pack-");
   const r = spawnSync(process.execPath, [cli, "pack", "--pack-destination", dest, "--json", dir],
     { encoding: "utf8", timeout: 180000 });
   if (r.status !== 0) {
@@ -208,7 +229,7 @@ if (problems.length) {
 
 // ── ② 铺目录 ─────────────────────────────────────────────────────────
 
-const stageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-netdisk-"));
+const stageRoot = mkTemp("dsh-netdisk-");
 const packRoot = path.join(stageRoot, `DSH-集成桌面端-${VERSION}`);
 const dirInstaller = path.join(packRoot, "安装包");
 const dirPluginPack = path.join(packRoot, "插件包");
