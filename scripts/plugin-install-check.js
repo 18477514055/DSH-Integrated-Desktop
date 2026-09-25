@@ -557,7 +557,63 @@ section("⑩ listInstalled 认不认得出「本地装的」—— 真机上栽�
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-console.log(`\n${"=".repeat(64)}`);
+section("⑪ 全新 profile **没有** node_modules —— 内核 0.1.7 换布局之后的新用户路");
+// ─────────────────────────────────────────────────────────────────────────
+// 背景（实测，不是推测）：
+//   · 内核 0.1.5 那代启动时会往 `<DSH_HOME>\profiles\web\node_modules` 里装
+//     `@deepseek-ai/dsh-base` 那一套 ⇒ 这个目录**总是存在**。
+//   · 0.1.7 起模块解析改由 `<DSH_HOME>\profiles\node_modules` 那一层「拦截层」
+//     承担，**全新 profile 里根本没有 node_modules**（要等 pnpm 真跑过一次才出现）。
+//   · 旧代码一看到它不在就 `errors.push("profile 的 node_modules 不存在")` 然后返回
+//     ⇒ **新用户一个插件都装不上**，而开发机（家里早就有它）永远复现不出来。
+// 真机日志证据 + 「再起一次内核、问内核自己加载了没有」的端到端在
+// `scripts/fresh-install-check.js`；这一段守的是**两个入口的行为**与**回归护栏**。
+{
+  /** 造一个"内核刚建好、还没装过任何东西"的 profile：只有 package.json，没有 node_modules */
+  const freshHome = (name) => {
+    const H = path.join(root, name);
+    const pd = path.join(H, "profiles", "web");
+    fs.mkdirSync(pd, { recursive: true });
+    fs.writeFileSync(path.join(pd, "package.json"), JSON.stringify({
+      name: "dsh-profile-web", private: true,
+      dependencies: { "@deepseek-ai/dsh-base": "0.1.7-rc.2" },
+      dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"], patchReload: "live" } },
+    }, null, 2) + "\n", "utf8");
+    return { H, pd, nm: path.join(pd, "node_modules") };
+  };
+
+  // ① installFromDir（首启向导 / 设置页走的就是它）
+  const A = freshHome("homeFreshA");
+  chk(!fs.existsSync(A.nm), "（夹具）这个 profile 确实**没有** node_modules");
+  const a1 = I.installFromDir({ dshHome: A.H, profile: "web", dir: buildPlugin(path.join(root, "freshA"), "dsh-fresh-a", "2.0.0") });
+  chk(a1.ok === true, "★ installFromDir 在没有 node_modules 的全新 profile 上**成功**",
+    JSON.stringify({ ok: a1.ok, errors: a1.errors }));
+  chk(fs.existsSync(A.nm) && fs.statSync(A.nm).isDirectory(),
+    "★ node_modules 被**自己建出来**了（不是干等内核）");
+  chk(!!junctionTarget(path.join(A.nm, "dsh-fresh-a")), "★ 联接也真建出来了");
+  chk(!/node_modules 不存在/.test(JSON.stringify(a1.errors)),
+    "★ 回归护栏：旧那句「profile 的 node_modules 不存在」没有再出现");
+
+  // ② provision（随包分发那条路，同一种形状的家上也必须能过，且**不再有 pending**）
+  const B = freshHome("homeFreshB");
+  const srcRoot = path.join(root, "freshSrc");
+  buildPlugin(path.join(srcRoot, "dsh-fresh-b"), "dsh-fresh-b", "2.0.0");
+  const b1 = P.provision({ dshHome: B.H, profile: "web", srcRoot, appVersion: "test" });
+  chk(b1.ok === true && !b1.pending,
+    "★ provision 在同样形状的全新 profile 上也不再 pending（旧值 `node_modules-missing`）",
+    JSON.stringify({ ok: b1.ok, pending: b1.pending, errors: b1.errors }));
+  chk(!!junctionTarget(path.join(B.nm, "dsh-fresh-b")), "★ provision 也真把联接建出来了");
+
+  // ③ 反面：如果那个位置上是**文件**（不是目录），必须拒绝动手，不许覆盖
+  const C = freshHome("homeFreshC");
+  fs.writeFileSync(C.nm, "not a directory\n", "utf8");
+  const c1 = I.installFromDir({ dshHome: C.H, profile: "web", dir: buildPlugin(path.join(root, "freshC"), "dsh-fresh-c", "2.0.0") });
+  chk(c1.ok === false && c1.errors.some((e) => /不是目录/.test(e)),
+    "★ node_modules 位置上是文件时**拒绝动手**（不覆盖别人的东西）", JSON.stringify(c1.errors));
+  chk(fs.readFileSync(C.nm, "utf8") === "not a directory\n", "★ 那个文件一个字节没被改");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 console.log(`plugin-install-check：${OK} OK / ${FAILS.length} FAIL`);
 if (FAILS.length) {
   console.log("失败项：");

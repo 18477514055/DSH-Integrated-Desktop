@@ -69,6 +69,50 @@ function isFile(p) {
   try { return fs.statSync(p).isFile(); } catch { return false; }
 }
 
+/**
+ * 保证 profile 的 `node_modules` 目录存在（不存在就建一个空的）。
+ * 返回 true = 这次真的建了。
+ *
+ * ══════════════════════════════════════════════════════════════════
+ * ★★ 为什么必须自己建（2026-09-26 实测，内核 0.1.7-rc.2）
+ * ══════════════════════════════════════════════════════════════════
+ *   内核 0.1.5 那代**每次都会**给 profile 建一个 `node_modules`（启动时装
+ *   `@deepseek-ai/dsh-base` 那一套），所以我们的落位逻辑（写 `link:` 依赖 +
+ *   在 `node_modules` 里建目录联接）**总有地方可写**。
+ *
+ *   0.1.7 换了布局：模块解析改由 `<DSH_HOME>\profiles\node_modules` 那一层
+ *   「拦截层」承担，**全新 profile 里根本没有 `node_modules`** ——
+ *   它要等你第一次装插件、pnpm 真正跑起来才会出现。
+ *   实测（全新家 + 0.1.7，外壳自己的 shell.log）：
+ *
+ *     安装插件 dsh-int-archive-manager@0.2.0：ok=false changed=[…]
+ *       profile 的 node_modules 不存在：…\dsh-home\profiles\web\node_modules
+ *
+ *   ⇒ 表现是「**新用户一个插件都装不上**」，而老用户（家里早就有
+ *   `node_modules`）完全正常 —— 所以这个 bug 在开发机上永远看不到。
+ *
+ * ★ 为什么"建一个空目录"是**对的**，不是绕过：
+ *   我们走的本来就是 pnpm 的等价物（`dsh-plugin-manager` 的 `addBundle` →
+ *   `pnpm add`，pnpm 建的就是这个目录；profile 的 `pnpm-workspace.yaml` 里
+ *   `nodeLinker: hoisted`）。Node 的解析顺序是
+ *   `<profile>\node_modules` → `<DSH_HOME>\profiles\node_modules`，
+ *   空目录不影响第二层；而 pnpm 之后跑起来会自己接管/补 `.modules.yaml`。
+ *   实测：真家里那个 `profiles\web\node_modules` 就是**实体目录**（不是联接），
+ *   里面既有 pnpm 装的包，也有我们建的联接 —— 两者本来就共存。
+ *
+ * ⚠️ 只建**这一层**。绝不碰 `<DSH_HOME>\profiles\node_modules`（那是内核的
+ *   世代拦截层，内核启动时自己 heal；见 `$DSH_HOME/AGENTS.md` 第一条硬规矩）。
+ */
+function ensureProfileModules(nmDir) {
+  if (isDir(nmDir)) return false;
+  // 存在但不是目录 ⇒ 绝不覆盖（可能是文件、也可能是别人放的东西）
+  if (fs.existsSync(nmDir)) {
+    throw new Error(`profile 的 node_modules 存在但不是目录，拒绝覆盖：${nmDir}`);
+  }
+  fs.mkdirSync(nmDir, { recursive: true });
+  return true;
+}
+
 function readJson(p) {
   try {
     let raw = fs.readFileSync(p, "utf8");
@@ -360,8 +404,13 @@ function provision(opts = {}) {
     result.pending = "profile-missing";
     return result;
   }
-  if (!isDir(nmDir)) {
-    result.pending = "node_modules-missing";
+  // ★ 0.1.7 起全新 profile **没有** node_modules（见 ensureProfileModules 的注释）。
+  //   这里从"报 pending 等内核"改成"自己建一个" —— 否则新用户永远等不到那一刻
+  //   （内核只在真正跑 pnpm 时才建它，而我们在那之前就要把插件挂上去）。
+  try {
+    if (ensureProfileModules(nmDir)) log(`profile 还没有 node_modules，已建空目录：${nmDir}`);
+  } catch (e) {
+    result.errors.push(`准备 profile 的 node_modules 失败：${(e && e.message) || e}`);
     return result;
   }
 
@@ -495,6 +544,6 @@ function provision(opts = {}) {
 }
 
 module.exports = {
-  provision, listBundledPlugins, fingerprint, ensureJunction,
+  provision, listBundledPlugins, fingerprint, ensureJunction, ensureProfileModules,
   materializePlugins, isExcluded, DEFAULT_EXCLUDES, STATE_FILE,
 };

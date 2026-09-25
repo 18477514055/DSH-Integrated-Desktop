@@ -325,6 +325,8 @@ function backupProfile(dshHome, name, action, log = () => {}, profile = "web") {
 /**
  * 把某几个**已经落在磁盘上**的插件目录接进 profile（三处契约）。
  *
+ *   ⓪ <profile>\node_modules 不存在时**先建一个空目录**（内核 0.1.7 起全新 profile
+ *      没有它 —— 见下面 connectIntoProfile 里的长注释）
  *   ① profile\package.json → dependencies[name] = "link:<dest>"
  *   ② profile\package.json → dsh.profile.bundles 里有 name
  *   ③ profile\node_modules\<name> → 目录联接指向 <dest>
@@ -343,7 +345,17 @@ function connectIntoProfile(opts = {}) {
 
   const { pkgFile, nmDir } = profilePaths(dshHome, profile);
   if (!isFile(pkgFile)) { result.errors.push(`profile 还不存在（内核尚未第一次启动）：${pkgFile}`); return result; }
-  if (!isDir(nmDir)) { result.errors.push(`profile 的 node_modules 不存在：${nmDir}`); return result; }
+  // ★ 0.1.7 起**全新 profile 没有 node_modules**（它改由 <DSH_HOME>\profiles\node_modules
+  //   那一层拦截层承担解析，profile 自己那一层要等 pnpm 真跑过一次才出现）。
+  //   原先这里直接报错返回 ⇒ 新用户「一个插件都装不上」，而开发机（家里早就有
+  //   node_modules）完全看不到这个 bug。现在改成**自己建一个空目录**
+  //   —— 与 pnpm 的行为一致。详见 plugins.js 的 ensureProfileModules。
+  try {
+    if (P.ensureProfileModules(nmDir)) log(`profile 还没有 node_modules，已建空目录：${nmDir}`);
+  } catch (e) {
+    result.errors.push(`准备 profile 的 node_modules 失败：${(e && e.message) || e}`);
+    return result;
+  }
 
   const json = readJson(pkgFile);
   if (!json) { result.errors.push(`profile package.json 解析失败：${pkgFile}`); return result; }

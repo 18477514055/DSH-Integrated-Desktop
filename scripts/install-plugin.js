@@ -181,7 +181,18 @@ if (REVERT) {
   const { raw, json } = readPkg();
 
   // 预检 1：profile 目录要在
-  if (!fs.existsSync(path.join(profileDir, "node_modules"))) fail(`profile 的 node_modules 不存在：${path.join(profileDir, "node_modules")}`, 3);
+  //
+  // ★ 2026-09-26：内核 0.1.7 起**全新 profile 没有 node_modules**（模块解析改由
+  //   <DSH_HOME>\profiles\node_modules 那一层拦截层承担），所以"没有就报错退出"
+  //   会把新机器上的开发安装整条路堵死。改成**自己建一个空目录**（与 pnpm、
+  //   与 src/plugins.js 的 ensureProfileModules 行为一致）。
+  const nmPath = path.join(profileDir, "node_modules");
+  if (!fs.existsSync(nmPath)) {
+    try {
+      fs.mkdirSync(nmPath, { recursive: true });
+      say(`  · profile 还没有 node_modules，已建空目录：${nmPath}`);
+    } catch (e) { fail(`建 profile 的 node_modules 失败：${e.message}`, 3); }
+  }
 
   // 预检 2：不许踩到别的插件
   const bundles = ((json.dsh || {}).profile || {}).bundles;

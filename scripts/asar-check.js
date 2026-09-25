@@ -102,7 +102,17 @@ const CHECKS = [
   },
   {
     file: "src/plugin-install.js",
-    marks: ["validatePluginDir", "installFromArchive", "assertNotCommunityHome", "connectIntoProfile", "detectPluginRoot"],
+    marks: ["validatePluginDir", "installFromArchive", "assertNotCommunityHome", "connectIntoProfile", "detectPluginRoot",
+      // ★ 2026-09-26：内核 0.1.7 起全新 profile **没有** node_modules，
+      //   这里必须能自己建出来 —— 少了它，**新用户一个插件都装不上**
+      //   （老用户家里早就有那个目录，所以这个洞只有在全新机器上才暴露）。
+      "ensureProfileModules"],
+  },
+  {
+    // ★ 2026-09-26：随包分发的落位（`provision`）与上面那条共用同一个
+    //   「node_modules 不存在就自己建」的动作，所以一起盯着。
+    file: "src/plugins.js",
+    marks: ["ensureProfileModules", "provision", "ensureJunction", "listBundledPlugins", "fingerprint"],
   },
   {
     file: "src/kernel.js",

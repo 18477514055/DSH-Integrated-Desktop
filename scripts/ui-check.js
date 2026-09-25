@@ -2251,23 +2251,101 @@ async function verifyFiles(tmpDir) {
     check("右侧边栏真的展开了（面板 data-sidebar-right-open=true）", panelOpen, String(panelOpen));
     await sleep(1500);
 
-    // ④ 文件树出来了没有 —— 根必须是**这个会话的 cwd**，路径必须是**绝对路径**
-    const tree = JSON.parse(await cdpEval(ws, `(() => JSON.stringify({
-      state: (document.querySelector('[data-files-state]') || { getAttribute: () => null }).getAttribute('data-files-state'),
-      root: (document.querySelector('[data-files-root]') || { getAttribute: () => null }).getAttribute('data-files-root'),
-      rows: document.querySelectorAll('[data-files-entry]').length,
-      files: Array.from(document.querySelectorAll('[data-files-entry="file"]')).map(e => e.getAttribute('data-files-path')),
-      dirs: Array.from(document.querySelectorAll('[data-files-entry="directory"]')).map(e => e.getAttribute('data-files-path')),
-    }))()`));
-    console.log(`  文件树: state=${tree.state} root=${tree.root}`);
-    check("侧栏文件树真的画出来了", tree.state === "tree" && tree.rows > 0, JSON.stringify(tree).slice(0, 200));
+    // ③.5 ★★ 0.1.7：右侧栏从「就是文件面板」变成了**可停靠的标签坞**（dock）。
+    //
+    //   实测证据（`dsh-client-ui-sidebar-right/lib/client.js`）：
+    //     · `defaultSeed(tabs)`（第 584-593 行）：注册的标签类型**只有一个**时
+    //       默认就打开它；**否则默认落在「指南」页** —— 一个罗盘 ＋ 每个已注册
+    //       类型一个入口胶囊（`data-sidebar-right-guide-entry="<kind>"`），
+    //       点胶囊才 `tab.actions.openTab(kind, { replaceTab: true })`（第 530 行）。
+    //     · 文件树是其中一个**类型**（`dsh-client-ui-sidebar-files` 的
+    //       `sidebarRightTabs.register({ id: "workspace", … })`，第 995 行），
+    //       它的正文只有在**那个标签真的打开着**时才渲染
+    //       （`FilesBody` 第 635-715 行；标签不开 ⇒ 连 `[data-files-state]` 都没有）。
+    //
+    //   0.1.5 那代右侧栏**就是**文件树 ⇒ 展开即见；0.1.7 至少注册了
+    //   workspace 与 documentpreview 两类 ⇒ 默认是**指南**。
+    //   ⇒ 不点这一下，`[data-files-*]` 永远不会出现（这不是注入脚本坏了，
+    //     是**面板没被打开** —— 判据必须跟着官方的新交互走）。
+    //
+    //   ⚠️ 原先这里是「睡 1.5 秒然后读一次」，在 0.1.5 上够用，在 0.1.7 上
+    //      四个断言全 FAIL（2026-09-26 实跑：`state=null root=null rows=0`）。
+    let tree = null;
+    let guideSeen = null;
+    for (let i = 0; i < 30; i++) {
+      const raw = await cdpEval(ws, `(() => JSON.stringify({
+        state: (document.querySelector('[data-files-state]') || { getAttribute: () => null }).getAttribute('data-files-state'),
+        root: (document.querySelector('[data-files-root]') || { getAttribute: () => null }).getAttribute('data-files-root'),
+        rows: document.querySelectorAll('[data-files-entry]').length,
+        files: Array.from(document.querySelectorAll('[data-files-entry="file"]')).map(e => e.getAttribute('data-files-path')),
+        dirs: Array.from(document.querySelectorAll('[data-files-entry="directory"]')).map(e => e.getAttribute('data-files-path')),
+        guide: Array.from(document.querySelectorAll('[data-sidebar-right-guide-entry]')).map(e => {
+          const r = e.getBoundingClientRect();
+          const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+          const top = document.elementFromPoint(cx, cy);
+          // ★ 「这个入口真的能点」＝ 中心点上最上面的就是它自己。
+          //   getBoundingClientRect 会骗人（未裁切的几何）—— 实测这里就有**两份**
+          //   标签坞（前面 tab 列表里「开始」出现两次），先命中的那一份是隐藏的，
+          //   按它的坐标真点等于点空气（第一版就是这么假 FAIL 的）。
+          return { kind: e.getAttribute('data-sidebar-right-guide-entry'),
+                   label: (e.textContent || '').trim().slice(0, 24),
+                   x: cx, y: cy, w: r.width, h: r.height,
+                   clickable: !!top && (top === e || e.contains(top)) };
+        }),
+        guideVisible: Array.from(document.querySelectorAll('[data-sidebar-right-guide-entry]'))
+          .filter(e => e.offsetParent !== null).map(e => e.getAttribute('data-sidebar-right-guide-entry')),
+        selectedTab: Array.from(document.querySelectorAll('[role="tab"]'))
+          .filter(e => e.getAttribute('aria-selected') === 'true')
+          .map(e => (e.textContent || '').trim().slice(0, 16)),
+      }))()`).catch(() => null);
+      tree = raw ? JSON.parse(raw) : null;
+      if (tree && tree.state !== null && tree.state !== undefined) break;   // 面板开出来了
+
+      const guide = ((tree && tree.guide) || []).filter((g) => g.clickable && g.w > 4 && g.h > 4);
+      if (guide.length) {
+        // 优先 files（文件树那一类）；否则按名字兜底；再否则第一个
+        const pick = guide.find((g) => g.kind === "files")
+          || guide.find((g) => /文件|工作区|files|workspace/i.test(g.label))
+          || guide[0];
+        const tag = `${pick.kind}/${pick.label}`;
+        if (guideSeen !== tag) {
+          console.log(`  右侧栏停在「指南」页 ⇒ 点开标签类型：${tag}`);
+          guideSeen = tag;
+        }
+        await realClick(ws, pick.x, pick.y);
+      } else if (tree && tree.guide && tree.guide.length && guideSeen !== "(无可点入口)") {
+        console.log(`  右侧栏指南页有 ${tree.guide.length} 个入口，但**没有一个在指针下**（被盖住/在视口外）`);
+        guideSeen = "(无可点入口)";
+      }
+      await sleep(1000);
+    }
+    if (!tree || tree.state === null || tree.state === undefined) {
+      // 失败时把右边那一列的结构打出来 —— 否则下次升级又只能靠猜
+      const dump = await cdpEval(ws, `(() => {
+        const panel = document.querySelector('[data-sidebar-right-panel]');
+        return JSON.stringify({
+          panelOpen: panel ? panel.getAttribute('data-sidebar-right-open') : null,
+          panels: document.querySelectorAll('[data-sidebar-right-panel]').length,
+          selectedTabs: Array.from(document.querySelectorAll('[role="tab"]'))
+            .filter(e => e.getAttribute('aria-selected') === 'true')
+            .map(e => (e.textContent || '').trim().slice(0, 16)),
+          guideEntries: Array.from(document.querySelectorAll('[data-sidebar-right-guide-entry]'))
+            .map(e => e.getAttribute('data-sidebar-right-guide-entry')),
+          hasFilesState: !!document.querySelector('[data-files-state]'),
+          bodyText: ((panel && panel.innerText) || '').replace(/\\s+/g, ' ').slice(0, 200),
+        });
+      })()`).catch(() => "（取不到）");
+      console.log(`  ⚠ 右侧栏结构快照: ${dump}`);
+    }
+    console.log(`  文件树: state=${tree && tree.state} root=${tree && tree.root}`);
+    check("侧栏文件树真的画出来了", !!tree && tree.state === "tree" && tree.rows > 0, JSON.stringify(tree).slice(0, 200));
     check("★ 树的根就是这个会话的 cwd（不是别的目录）",
-      String(tree.root || "").replace(/[\\/]+$/, "").toLowerCase() === work.replace(/[\\/]+$/, "").toLowerCase(),
-      `root=${tree.root} 期望=${work}`);
+      String((tree && tree.root) || "").replace(/[\\/]+$/, "").toLowerCase() === work.replace(/[\\/]+$/, "").toLowerCase(),
+      `root=${tree && tree.root} 期望=${work}`);
     check("★ 每一行带的 `data-files-path` 是**绝对路径**（外壳据此打开）",
-      tree.files.length + tree.dirs.length >= 3
+      !!tree && tree.files.length + tree.dirs.length >= 3
       && [...tree.files, ...tree.dirs].every((p) => /^[A-Za-z]:[\\/]/.test(String(p))),
-      JSON.stringify([...tree.files, ...tree.dirs]).slice(0, 200));
+      JSON.stringify(tree ? [...tree.files, ...tree.dirs] : []).slice(0, 200));
     check("注入脚本真的装上了（窗口上有了钩子）",
       await cdpEval(ws, `!!window.__dshSidebarOpen`));
 
@@ -2299,7 +2377,7 @@ async function verifyFiles(tmpDir) {
     }
     console.log(`  文件行已就位且矩形稳定: ${ready || "（没等到，后面会 FAIL）"}`);
 
-    let hov = null;
+    let hov = { display: null, icons: [], labels: [], state: null };
     let hit0 = null;
     for (let i = 0; i < 10; i++) {
       const hit = JSON.parse(await cdpEval(ws, `(() => {
@@ -2385,7 +2463,9 @@ async function verifyFiles(tmpDir) {
       await realClick(ws, icon.x, icon.y);
       await sleep(3000);
     }
-    const st = JSON.parse(await cdpEval(ws, `JSON.stringify(window.__dshSidebarOpen.state())`));
+    const st = JSON.parse(await cdpEval(ws,
+      `JSON.stringify(window.__dshSidebarOpen ? window.__dshSidebarOpen.state() : { installed: false })`)
+      .catch(() => JSON.stringify({ installed: false })));
     console.log(`  点后: calls=${st.calls} last=${JSON.stringify(st.last)}`);
     check("★ 真点一下之后，注入脚本记录了一次**成功**的打开",
       st.calls >= 1 && st.last && st.last.ok === true && st.last.action === "reveal",
