@@ -598,15 +598,45 @@ function injectInto(key, wc, note) {
  * ★ `--no-inject` 只关**模型搜索框**（它就是为"模型搜索框出问题不想改代码"准备的开关）；
  *   **页面切换把手一定会注入** —— 它是用户从 DeepSeek 网站回到本机界面的路，
  *   关掉它等于把人锁在网站页里（虽然托盘与 Ctrl+1 还能救，但没必要冒这个险）。
+ *
+ * ★★ 2026-09-29：两条注入已经**移植成独立客户端插件**（`dsh-int-model-search` /
+ *   `dsh-int-sidebar-open`）—— 插件跟内核走（换成官方桌面端也还在），注入跟外壳走。
+ *   但注入**不删**：干净装机 / 没勾选插件的用户还靠它。⇒ 这里加一道**去重闸门**：
+ *   查本机 profile 里装了哪个插件，装了的那条就**不再注入**（否则同一段 UI 会出现两份，
+ *   两个 MutationObserver 互相打架）。
+ *   判据只看**本机磁盘**（`PI.listInstalled` 是纯本地扫描），不联网。
  */
+function installedPluginNames() {
+  try {
+    const inst = PI.listInstalled({ dshHome: getDshHome(), profile: settings.profile || "web" });
+    return new Set((inst.plugins || []).map((p) => p.name));
+  } catch (e) {
+    log(`查本机插件时出错（按"没装"处理，继续注入兜底版）：${(e && e.message) || e}`);
+    return new Set();
+  }
+}
+
 function injectLocalUi() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  if (NO_INJECT) log("已按 --no-inject 跳过模型搜索框注入");
-  else injectInto("model", mainWindow.webContents, "模型搜索框");
+  const have = installedPluginNames();
+
+  if (have.has("dsh-int-model-search")) {
+    log("模型搜索框：本机已装插件 dsh-int-model-search ⇒ 跳过注入（由插件提供）");
+  } else if (NO_INJECT) {
+    log("已按 --no-inject 跳过模型搜索框注入");
+  } else {
+    injectInto("model", mainWindow.webContents, "模型搜索框");
+  }
+
   injectInto("pages", mainWindow.webContents, "页面切换把手");
+
   // ★ 侧栏文件「真打开」只注入**本机内核界面**：两个外部站点没有这个通道
   //   （主进程的 `assertLocalFileUi` 也不放行它们），注了也只是白画。
-  injectInto("files", mainWindow.webContents, "侧栏文件真打开");
+  if (have.has("dsh-int-sidebar-open")) {
+    log("侧栏文件真打开：本机已装插件 dsh-int-sidebar-open ⇒ 跳过注入（由插件提供）");
+  } else {
+    injectInto("files", mainWindow.webContents, "侧栏文件真打开");
+  }
 }
 
 // ── 快捷键（无菜单栏，替代原生菜单）──────────────────────────────

@@ -447,7 +447,9 @@
 
   try {
     build();
-    window[NS] = { refresh: refresh, state: state, rowOf: rowOf, buttonOf: buttonOf };
+    // ★ `src` 是**身份标记**：注入版 = "inject"；插件版（dsh-int-sidebar-open）的包装层会覆写成 "plugin"。
+    //   两者共用同一段 DOM 逻辑与同一个调试钩子，只有这个字段能区分"现在跑的是哪一个"（验收脚本据此断言）。
+    window[NS] = { refresh: refresh, state: state, rowOf: rowOf, buttonOf: buttonOf, src: "inject" };
   } catch (e) {
     // 注入失败不该影响页面本身：官方界面照常用，只是少了这排图标
     note("注入失败：" + ((e && e.message) || e));

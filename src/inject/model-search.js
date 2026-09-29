@@ -70,7 +70,9 @@
 
   // 轻量自诊断计数（留在 window 上，出问题时**能被问出来**，不靠猜）：
   // 例如"胶囊名字怎么没跟着变"——看 sweeps/applies/pillBuilds 哪个没涨就知道了。
-  const stats = window.__dshModelSearchStats = window.__dshModelSearchStats || { sweeps: 0, applies: 0, pillBuilds: 0 };
+  // ★ `src` 是**身份标记**：注入版 = "inject"；插件版（dsh-int-model-search）的包装层会覆写成 "plugin"。
+  //   两者共用同一段 DOM 逻辑与同一个钩子，只有这个字段能区分"现在跑的是哪一个"（验收脚本据此断言）。
+  const stats = window.__dshModelSearchStats = window.__dshModelSearchStats || { sweeps: 0, applies: 0, pillBuilds: 0, src: "inject" };
 
   // 用官方主题变量、并给每个都带上兜底色，这样换主题时跟得上、变量没了也不瞎
   const CSS = `
